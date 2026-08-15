@@ -84,40 +84,44 @@ def main() -> int:
                                      acmi_directory=str(output / "acmi"))
     rainbow_config = RainbowDQNConfig(6 + args.missiles * 3, 29, batch_size=args.batch_size,
                                       device=args.device)
-    agent = RainbowDQNAgent(rainbow_config); pool_size = min(args.parallel_envs, args.episodes)
-    event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
-    started = time.monotonic()
-    experiment = {
-        "event": "experiment_config", "device": str(agent.device), "red_count": args.missiles,
-        "blue_count": 1, "scenario_sampling": "independent_seed_per_episode",
-        "parallel_cpu_envs": pool_size, "parallel_backend": "process_spawn",
-        "env_worker_threads": args.env_worker_threads, "env_worker_timeout_s": args.env_worker_timeout_s,
-        "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
-        "training_mode": "rainbow_off_policy", "episodes": args.episodes,
-        "seed": args.seed, "decision_interval_s": args.decision_interval,
-        "updates_per_transition": args.updates_per_transition, "completed_environment_transitions": 0,
-        "completed_optimizer_updates": 0, "completed_target_updates": 0,
-        "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
-        "environment_config": asdict(environment_config),
-        "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
-    }
-    device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
-    if agent.device.type == "cuda":
-        device_row.update({"cuda_device_name": torch.cuda.get_device_name(agent.device),
-                           "cuda_device_count": torch.cuda.device_count()})
-    _emit(device_row, event_rows, jsonl_path)
-    _emit(experiment, event_rows, jsonl_path)
-
-    observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
-    reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
-    next_episode = 1; completed = 0; update_credit = 0.0
-    next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
-    window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
-    window_grad_norms: list[float] = []; window_values: list[float] = []; window_actions: Counter[int] = Counter()
-    window_started = started; window_transition_start = 0; window_update_start = 0
+    pool_size = min(args.parallel_envs, args.episodes)
+    # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
+    # starting spawned children after CUDA initialization can indefinitely stall
+    # all workers while they import PyTorch.
     with BlueProcessEnvironmentPool(environment_config, env_config, pool_size,
                                     native_threads=args.env_worker_threads,
                                     timeout_s=args.env_worker_timeout_s) as pool:
+        agent = RainbowDQNAgent(rainbow_config)
+        event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
+        started = time.monotonic()
+        experiment = {
+            "event": "experiment_config", "device": str(agent.device), "red_count": args.missiles,
+            "blue_count": 1, "scenario_sampling": "independent_seed_per_episode",
+            "parallel_cpu_envs": pool_size, "parallel_backend": "process_spawn",
+            "env_worker_threads": args.env_worker_threads, "env_worker_timeout_s": args.env_worker_timeout_s,
+            "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
+            "training_mode": "rainbow_off_policy", "episodes": args.episodes,
+            "seed": args.seed, "decision_interval_s": args.decision_interval,
+            "updates_per_transition": args.updates_per_transition, "completed_environment_transitions": 0,
+            "completed_optimizer_updates": 0, "completed_target_updates": 0,
+            "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
+            "environment_config": asdict(environment_config),
+            "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
+        }
+        device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
+        if agent.device.type == "cuda":
+            device_row.update({"cuda_device_name": torch.cuda.get_device_name(agent.device),
+                               "cuda_device_count": torch.cuda.device_count()})
+        _emit(device_row, event_rows, jsonl_path)
+        _emit(experiment, event_rows, jsonl_path)
+
+        observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
+        reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
+        next_episode = 1; completed = 0; update_credit = 0.0
+        next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
+        window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
+        window_grad_norms: list[float] = []; window_values: list[float] = []; window_actions: Counter[int] = Counter()
+        window_started = started; window_transition_start = 0; window_update_start = 0
         _emit({"event": "environment_workers", "backend": "process_spawn",
                "worker_count": pool_size, "workers": list(pool.worker_info)}, event_rows, jsonl_path)
         assignments = {}
@@ -230,23 +234,23 @@ def main() -> int:
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
                 for worker, (observation, _) in pool.reset(resets).items(): observations[worker] = observation
-    summaries.sort(key=lambda row: int(row["episode"]))
-    final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
-    elapsed = time.monotonic() - started
-    final_summary = {
-        "event": "training_complete", "episodes": args.episodes,
-        "survival_rate": _mean([float(row["blue_survived"]) for row in summaries]),
-        "reward_mean": _mean([float(row["reward"]) for row in summaries]),
-        "elapsed_s": elapsed, "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
-        "completed_environment_transitions": agent.total_steps,
-        "completed_optimizer_updates": agent.optimizer_updates,
-        "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
-        "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
-    }
-    _emit(final_summary, event_rows, jsonl_path)
-    (output / "episodes.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
-    metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],
-                                        "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
+        summaries.sort(key=lambda row: int(row["episode"]))
+        final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
+        elapsed = time.monotonic() - started
+        final_summary = {
+            "event": "training_complete", "episodes": args.episodes,
+            "survival_rate": _mean([float(row["blue_survived"]) for row in summaries]),
+            "reward_mean": _mean([float(row["reward"]) for row in summaries]),
+            "elapsed_s": elapsed, "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
+            "completed_environment_transitions": agent.total_steps,
+            "completed_optimizer_updates": agent.optimizer_updates,
+            "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
+            "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
+        }
+        _emit(final_summary, event_rows, jsonl_path)
+        (output / "episodes.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
+        metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],
+                                            "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
     return 0
 
 
