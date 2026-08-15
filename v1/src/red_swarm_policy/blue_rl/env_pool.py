@@ -5,9 +5,10 @@ import os
 import pickle
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -65,6 +66,22 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
         connection.close()
 
 
+@contextmanager
+def _worker_start_environment(native_threads: int) -> Iterator[None]:
+    """Limit native libraries while spawned children import their modules."""
+    names = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update({name: str(native_threads) for name in names})
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 class BlueProcessEnvironmentPool:
     """Persistent spawned CPU workers used by the batched blue learner."""
 
@@ -76,15 +93,21 @@ class BlueProcessEnvironmentPool:
         self._context = mp.get_context("spawn")
         self._connections: list[Connection] = []; self._processes: list[mp.Process] = []
         self._closed = False
-        for index in range(self.size):
-            parent, child = self._context.Pipe(duplex=True)
-            process = self._context.Process(
-                target=_worker, args=(child, environment, config, index, native_threads),
-                name=f"blue-env-{index:02d}", daemon=True,
-            )
-            process.start(); child.close()
-            self._connections.append(parent); self._processes.append(process)
-        self.worker_info = tuple(self._receive_many(range(self.size), "startup")[i] for i in range(self.size))
+        try:
+            with _worker_start_environment(native_threads):
+                for index in range(self.size):
+                    parent, child = self._context.Pipe(duplex=True)
+                    process = self._context.Process(
+                        target=_worker, args=(child, environment, config, index, native_threads),
+                        name=f"blue-env-{index:02d}", daemon=True,
+                    )
+                    process.start(); child.close()
+                    self._connections.append(parent); self._processes.append(process)
+            ready = self._receive_many(range(self.size), "startup")
+            self.worker_info = tuple(ready[i] for i in range(self.size))
+        except Exception:
+            self.close()
+            raise
 
     def _receive_many(self, indices: Sequence[int], phase: str) -> dict[int, Any]:
         mapping = {self._connections[i]: i for i in indices}; pending = set(mapping); results = {}
@@ -95,7 +118,14 @@ class BlueProcessEnvironmentPool:
                 raise TimeoutError(f"{phase} timed out for workers {[mapping[c] for c in pending]}")
             for connection in wait(pending, timeout=remaining):
                 pending.remove(connection); index = mapping[connection]
-                ok, payload = _receive(connection)
+                try:
+                    ok, payload = _receive(connection)
+                except (EOFError, OSError) as error:
+                    process = self._processes[index]
+                    raise RuntimeError(
+                        f"blue worker {index} disconnected during {phase}; "
+                        f"exitcode={process.exitcode}"
+                    ) from error
                 if not ok: raise RuntimeError(f"blue worker {index} failed during {phase}:\n{payload}")
                 results[index] = payload
         return results
