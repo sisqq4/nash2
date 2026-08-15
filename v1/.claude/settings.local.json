@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -)",
+      "Bash(nvidia-smi --query-gpu=index,name,memory.used,memory.total,utilization.gpu --format=csv)",
+      "Bash(timeout 900 python -m pytest tests -q)",
+      "Bash(grep -n \"^#\\\\{1,3\\\\} \\\\|^### 步骤\" STAGE2_V1_HIGH_BATCH16_REVIEW_20260811.md)",
+      "Bash(python -m py_compile src/red_swarm_policy/train_env.py)",
+      "Bash(timeout 900 python -m pytest tests/test_training_readiness.py -k \"validation_only or validation_assignment_mode_override or low_only_validation_plan\" -x -q)",
+      "Bash(timeout 1800 python -m pytest tests -q)",
+      "Bash(python *)",
+      "Bash(ps -o pid,etime,time,pcpu,comm -p 2384035,2384036,2384037)",
+      "Bash(date -Is)",
+      "Bash(grep -i \"^jq$\")",
+      "Bash(command -v jq)",
+      "Bash(conda run *)",
+      "Bash(ps -o pid,etime,time,pcpu -p 2384035,2384036,2384037)",
+      "Bash(ps -o pid,etime -p 2384035)"
+    ]
+  }
+}
