@@ -4,6 +4,7 @@ from .environment import BlueEscapeEnv, BlueEscapeEnvConfig
 from .controller import BlueRLController
 from .policy import DiscreteBluePolicy, PolicyRegistry
 from .rainbow import RainbowDQNAgent, RainbowDQNConfig
+from .env_pool import BlueProcessEnvironmentPool, BlueStepResult
 
 __all__ = [
     "BlueEscapeEnv",
@@ -13,4 +14,6 @@ __all__ = [
     "PolicyRegistry",
     "RainbowDQNAgent",
     "RainbowDQNConfig",
+    "BlueProcessEnvironmentPool",
+    "BlueStepResult",
 ]
