@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ class BlueEvasionRunSummary:
 
 def run_blue_evasion_episode(
     environment: RedBlueEngagementEnv,
-    controller: BlueEvasionController,
+    controller: Any,
     *,
     seed: int,
     duration_s: float,
@@ -130,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detection-range-m", type=float, default=60000.0)
     parser.add_argument("--critical-range-m", type=float, default=30000.0)
     parser.add_argument("--lookahead-s", type=float, default=6.0)
+    parser.add_argument("--blue-policy", choices=("rule", "rainbow"), default="rule")
+    parser.add_argument("--blue-checkpoint", default=None)
     return parser
 
 
@@ -138,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.red_count <= 0 or args.blue_count <= 0:
         parser.error("--red-count and --blue-count must be positive")
+    if args.blue_policy == "rainbow" and args.blue_checkpoint is None:
+        parser.error("--blue-checkpoint is required when --blue-policy=rainbow")
+    if args.blue_policy == "rainbow" and (args.blue_count != 1 or args.red_count > 4):
+        parser.error("Rainbow blue checkpoints support one blue aircraft and one to four missiles")
     if args.duration_s <= 0.0 or args.time_step_s <= 0.0:
         parser.error("--duration-s and --time-step-s must be positive")
     duration_ratio = args.duration_s / args.time_step_s
@@ -170,9 +176,29 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         record_replay=False,
     )
-    controller = BlueEvasionController(
-        BlueEvasionRuleMachine(environment_config, evasion_config)
-    )
+    if args.blue_policy == "rule":
+        controller = BlueEvasionController(
+            BlueEvasionRuleMachine(environment_config, evasion_config)
+        )
+    else:
+        from .blue_rl import BlueEscapeEnvConfig, BlueRLController, RainbowDQNAgent
+
+        agent = RainbowDQNAgent.load(args.blue_checkpoint, str(device))
+        expected_observation_dim = 6 + 3 * args.red_count
+        if agent.config.observation_dim != expected_observation_dim:
+            parser.error(
+                f"checkpoint expects observation_dim={agent.config.observation_dim}, "
+                f"but --red-count={args.red_count} requires {expected_observation_dim}"
+            )
+        controller = BlueRLController(
+            agent,
+            environment_config,
+            BlueEscapeEnvConfig(
+                missile_count=args.red_count,
+                decision_interval_s=args.decision_interval_s,
+                record_acmi=False,
+            ),
+        )
 
     def emit(record: dict[str, object]) -> None:
         print(json.dumps(record, ensure_ascii=True, separators=(",", ":")), flush=True)
