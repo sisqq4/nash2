@@ -3,8 +3,16 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
-from red_swarm_policy.blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig, BlueRLController
+from red_swarm_policy.blue_rl import (
+    BlueEscapeEnv,
+    BlueEscapeEnvConfig,
+    BlueProcessEnvironmentPool,
+    BlueRLController,
+    RainbowDQNAgent,
+    RainbowDQNConfig,
+)
 from red_swarm_policy.env import EnvironmentConfig
 
 
@@ -60,5 +68,58 @@ def test_acmi_interval_skips_unscheduled_episodes(tmp_path) -> None:
         _, _, terminated, truncated, info = env.step(0)
         assert terminated or truncated
         assert ("acmi_path" in info) is (episode == 2)
+    assert not (tmp_path / "episode_000001.acmi").exists()
+    assert (tmp_path / "episode_000002.acmi").is_file()
+
+
+def test_rainbow_select_actions_batches_observations() -> None:
+    agent = RainbowDQNAgent(RainbowDQNConfig(9, 29, hidden_dim=16))
+    observations = np.zeros((4, 9), dtype=np.float32)
+
+    actions = agent.select_actions(observations, evaluation=True)
+
+    assert actions.shape == (4,)
+    assert actions.dtype == np.int64
+    assert np.all((0 <= actions) & (actions < 29))
+
+
+def test_parallel_observations_keep_independent_n_step_sequences() -> None:
+    agent = RainbowDQNAgent(RainbowDQNConfig(2, 2, n_step=2, learning_starts=100))
+    zero = np.zeros(2, dtype=np.float32)
+
+    agent.observe_for_env(0, zero, 0, 1.0, zero, False)
+    agent.observe_for_env(1, zero, 1, 10.0, zero, False)
+    agent.observe_for_env(0, zero, 0, 2.0, zero, True)
+
+    assert agent.replay.size == 2
+    assert agent.replay.actions[:2].tolist() == [0, 0]
+    assert agent.replay.rewards[0] == pytest.approx(1.0 + agent.config.gamma * 2.0)
+
+
+def test_parallel_updates_sync_target_only_once_per_step_threshold() -> None:
+    agent = RainbowDQNAgent(
+        RainbowDQNConfig(2, 2, batch_size=1, learning_starts=1, n_step=1,
+                         target_update_interval=2, hidden_dim=16)
+    )
+    zero = np.zeros(2, dtype=np.float32)
+    agent.observe_for_env(0, zero, 0, 0.0, zero, False)
+    agent.observe_for_env(1, zero, 1, 0.0, zero, False)
+
+    assert agent.update() is not None
+    assert agent.update() is not None
+    assert agent.optimizer_updates == 2
+    assert agent.target_updates == 1
+    assert agent.last_update_metrics["replay_size"] == 2.0
+
+
+def test_process_blue_pool_uses_global_episode_numbers(tmp_path) -> None:
+    cfg = short_config()
+    blue = BlueEscapeEnvConfig(missile_count=1, decision_interval_s=cfg.time_step_s,
+                               acmi_episode_interval=2, acmi_directory=str(tmp_path))
+    with BlueProcessEnvironmentPool(cfg, blue, 2, timeout_s=30.0) as pool:
+        reset = pool.reset({0: (11, 1), 1: (12, 2)})
+        assert sorted(reset) == [0, 1]
+        results = pool.step({0: 0, 1: 0})
+        assert all(result.terminated or result.truncated for result in results.values())
     assert not (tmp_path / "episode_000001.acmi").exists()
     assert (tmp_path / "episode_000002.acmi").is_file()

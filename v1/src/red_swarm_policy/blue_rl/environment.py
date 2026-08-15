@@ -58,8 +58,11 @@ class BlueEscapeEnv:
         self.recorder = AcmiRecorder(); self.episode = 0; self._previous_min_range = 0.0
         self._record_current_episode = False
 
-    def reset(self, seed: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
-        self.episode += 1; self.recorder = AcmiRecorder()
+    def reset(self, seed: int | None = None, *, episode_index: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+        self.episode = self.episode + 1 if episode_index is None else int(episode_index)
+        if self.episode < 1:
+            raise ValueError("episode_index must be positive")
+        self.recorder = AcmiRecorder()
         self._record_current_episode = bool(
             self.config.record_acmi
             and self.config.acmi_episode_interval > 0

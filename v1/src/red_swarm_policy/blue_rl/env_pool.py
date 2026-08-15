@@ -1,0 +1,133 @@
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import pickle
+import time
+import traceback
+from dataclasses import dataclass
+from multiprocessing.connection import Connection, wait
+from typing import Any, Sequence
+
+import numpy as np
+import torch
+
+from ..env.types import EnvironmentConfig
+from .environment import BlueEscapeEnv, BlueEscapeEnvConfig
+
+
+@dataclass(frozen=True)
+class BlueStepResult:
+    observation: np.ndarray
+    reward: float
+    terminated: bool
+    truncated: bool
+    info: dict[str, object]
+
+
+def _send(connection: Connection, value: Any) -> None:
+    connection.send_bytes(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _receive(connection: Connection) -> Any:
+    return pickle.loads(connection.recv_bytes())
+
+
+def _worker(connection: Connection, environment: EnvironmentConfig,
+            config: BlueEscapeEnvConfig, worker_index: int, native_threads: int) -> None:
+    try:
+        for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+            os.environ[name] = str(native_threads)
+        torch.set_num_threads(native_threads)
+        env = BlueEscapeEnv(environment, config)
+        _send(connection, (True, {"index": worker_index, "pid": os.getpid()}))
+        while True:
+            operation, payload = _receive(connection)
+            if operation == "close":
+                _send(connection, (True, None)); break
+            try:
+                if operation == "reset":
+                    result = env.reset(payload["seed"], episode_index=payload["episode_index"])
+                elif operation == "step":
+                    observation, reward, terminated, truncated, info = env.step(payload)
+                    result = BlueStepResult(observation, reward, terminated, truncated, info)
+                else:
+                    raise ValueError(f"unknown blue environment operation: {operation}")
+                _send(connection, (True, result))
+            except Exception:
+                _send(connection, (False, traceback.format_exc()))
+    except EOFError:
+        pass
+    except Exception:
+        try: _send(connection, (False, traceback.format_exc()))
+        except Exception: pass
+    finally:
+        connection.close()
+
+
+class BlueProcessEnvironmentPool:
+    """Persistent spawned CPU workers used by the batched blue learner."""
+
+    def __init__(self, environment: EnvironmentConfig, config: BlueEscapeEnvConfig,
+                 size: int, *, native_threads: int = 1, timeout_s: float = 300.0) -> None:
+        if size < 1 or native_threads < 1 or timeout_s <= 0:
+            raise ValueError("size, native_threads and timeout_s must be positive")
+        self.size, self.timeout_s = int(size), float(timeout_s)
+        self._context = mp.get_context("spawn")
+        self._connections: list[Connection] = []; self._processes: list[mp.Process] = []
+        self._closed = False
+        for index in range(self.size):
+            parent, child = self._context.Pipe(duplex=True)
+            process = self._context.Process(
+                target=_worker, args=(child, environment, config, index, native_threads),
+                name=f"blue-env-{index:02d}", daemon=True,
+            )
+            process.start(); child.close()
+            self._connections.append(parent); self._processes.append(process)
+        self.worker_info = tuple(self._receive_many(range(self.size), "startup")[i] for i in range(self.size))
+
+    def _receive_many(self, indices: Sequence[int], phase: str) -> dict[int, Any]:
+        mapping = {self._connections[i]: i for i in indices}; pending = set(mapping); results = {}
+        deadline = time.monotonic() + self.timeout_s
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"{phase} timed out for workers {[mapping[c] for c in pending]}")
+            for connection in wait(pending, timeout=remaining):
+                pending.remove(connection); index = mapping[connection]
+                ok, payload = _receive(connection)
+                if not ok: raise RuntimeError(f"blue worker {index} failed during {phase}:\n{payload}")
+                results[index] = payload
+        return results
+
+    def _request(self, requests: dict[int, tuple[str, Any]], phase: str) -> dict[int, Any]:
+        for index, request in requests.items():
+            if not self._processes[index].is_alive():
+                raise RuntimeError(f"blue worker {index} exited with {self._processes[index].exitcode}")
+            _send(self._connections[index], request)
+        return self._receive_many(list(requests), phase)
+
+    def reset(self, assignments: dict[int, tuple[int, int]]) -> dict[int, tuple[np.ndarray, dict[str, object]]]:
+        return self._request({i: ("reset", {"seed": seed, "episode_index": episode})
+                              for i, (seed, episode) in assignments.items()}, "reset")
+
+    def step(self, actions: dict[int, int]) -> dict[int, BlueStepResult]:
+        return self._request({i: ("step", int(action)) for i, action in actions.items()}, "step")
+
+    def close(self) -> None:
+        if self._closed: return
+        self._closed = True
+        for index, connection in enumerate(self._connections):
+            if self._processes[index].is_alive():
+                try: _send(connection, ("close", None))
+                except OSError: pass
+        for process in self._processes:
+            process.join(timeout=5)
+            if process.is_alive(): process.terminate(); process.join(timeout=5)
+        for connection in self._connections: connection.close()
+
+    def __enter__(self) -> "BlueProcessEnvironmentPool": return self
+    def __exit__(self, *_: object) -> None: self.close()
+    def __del__(self) -> None:
+        try: self.close()
+        except Exception: pass
