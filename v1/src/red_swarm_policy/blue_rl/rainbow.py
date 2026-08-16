@@ -60,16 +60,18 @@ class RainbowDQNConfig:
     observation_dim: int
     action_dim: int
     hidden_dim: int = 128
-    learning_rate: float = 1e-3
-    gamma: float = 0.99
+    learning_rate: float = 2.5e-4
+    gamma: float = 0.999
     batch_size: int = 64
     replay_size: int = 50_000
     learning_starts: int = 1_000
     target_update_interval: int = 1_000
-    n_step: int = 3
+    n_step: int = 20
     atoms: int = 51
-    value_min: float = -10.0
-    value_max: float = 10.0
+    # Covers the bounded tactical potential plus terminal/time bonuses.  Keep
+    # these under review using projection clamp metrics on full training runs.
+    value_min: float = -12.0
+    value_max: float = 12.0
     noisy_std: float = 0.5
     per_alpha: float = 0.6
     per_beta_start: float = 0.4
@@ -144,8 +146,10 @@ class RainbowDQNAgent:
         with torch.no_grad():
             next_action = (self.online(next_t).softmax(-1) * self.support).sum(-1).argmax(1)
             next_prob = self.target(next_t).softmax(-1)[torch.arange(c.batch_size, device=self.device), next_action]
-            target_z = rewards_t[:, None] + (1 - dones_t[:, None]) * (c.gamma ** c.n_step) * self.support
-            target_z = target_z.clamp(c.value_min, c.value_max)
+            target_z_unclamped = rewards_t[:, None] + (1 - dones_t[:, None]) * (c.gamma ** c.n_step) * self.support
+            clamp_low_fraction = (target_z_unclamped < c.value_min).float().mean()
+            clamp_high_fraction = (target_z_unclamped > c.value_max).float().mean()
+            target_z = target_z_unclamped.clamp(c.value_min, c.value_max)
             b = (target_z - c.value_min) / self.delta; lower, upper = b.floor().long(), b.ceil().long()
             projected = torch.zeros_like(next_prob)
             offset = torch.arange(c.batch_size, device=self.device)[:, None] * c.atoms
@@ -175,6 +179,8 @@ class RainbowDQNAgent:
             "optimizer_updates": float(self.optimizer_updates),
             "target_updates": float(self.target_updates),
             "target_synced": float(target_synced),
+            "c51_clamp_low_fraction": float(clamp_low_fraction.item()),
+            "c51_clamp_high_fraction": float(clamp_high_fraction.item()),
         }
         return loss_value
 

@@ -13,6 +13,7 @@ from red_swarm_policy.blue_rl import (
     RainbowDQNAgent,
     RainbowDQNConfig,
 )
+from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
 from red_swarm_policy.env import EnvironmentConfig
 
 
@@ -28,6 +29,18 @@ class FixedPolicy:
 def short_config() -> EnvironmentConfig:
     base = EnvironmentConfig()
     return replace(base, max_steps=base.policy_entry_steps + 2)
+
+
+def test_blue_cli_duration_sets_mission_and_guidance_to_200_seconds() -> None:
+    config = configure_blue_mission_duration(EnvironmentConfig())
+    assert config.max_steps * config.time_step_s == pytest.approx(200.0)
+    assert config.missile.max_guidance_time_s == pytest.approx(200.0)
+
+
+def test_rainbow_defaults_match_long_decision_horizon() -> None:
+    config = RainbowDQNConfig(9, 29)
+    assert config.gamma == pytest.approx(0.999)
+    assert config.n_step == 20
 
 
 def test_blue_env_is_fixed_shape_and_uses_pure_pn(tmp_path) -> None:
@@ -70,6 +83,44 @@ def test_acmi_interval_skips_unscheduled_episodes(tmp_path) -> None:
         assert ("acmi_path" in info) is (episode == 2)
     assert not (tmp_path / "episode_000001.acmi").exists()
     assert (tmp_path / "episode_000002.acmi").is_file()
+
+
+def test_blue_reward_prefers_away_far_and_tangent_dive_near() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(missile_count=1, record_acmi=False))
+    env.reset(seed=7)
+    assert env.inner.state is not None
+    blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
+    missile.position_m = blue.position_m + np.array([100000.0, 0.0, 0.0])
+    blue.velocity_mps = np.array([-350.0, 0.0, 0.0])
+    far_away = env._threat_potential()["total"]
+    blue.velocity_mps = np.array([350.0, 0.0, 0.0])
+    assert far_away > env._threat_potential()["total"]
+
+    missile.position_m = blue.position_m + np.array([10000.0, 0.0, 0.0])
+    blue.velocity_mps = np.array([0.0, -247.5, 247.5])
+    tangent_dive = env._threat_potential()["total"]
+    blue.velocity_mps = np.array([-350.0, 0.0, 0.0])
+    assert tangent_dive > env._threat_potential()["total"]
+
+
+def test_potential_components_sum_and_include_multi_threat_diagnostics() -> None:
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(missile_count=2, record_acmi=False))
+    env.reset(seed=9)
+    potential = env._threat_potential()
+    assert potential["total"] == pytest.approx(
+        potential["far_away"] + potential["near_tangent"] + potential["near_dive"]
+    )
+    assert 0.0 <= potential["range_blend_weight"] <= 1.0
+    assert potential["softmin_threat_distance"] > 0.0
+
+
+def test_terminal_reward_distinguishes_miss_timeout_and_red_success() -> None:
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(record_acmi=False))
+    assert env._terminal_reward({"termination_reason": "red_failure", "time_s": 20.0}) > 10.0
+    assert env._terminal_reward({"termination_reason": "timeout", "time_s": 180.0}) == 2.0
+    killed = env._terminal_reward({"termination_reason": "success", "time_s": 20.0})
+    assert -10.0 < killed < -9.0
 
 
 def test_rainbow_select_actions_batches_observations() -> None:

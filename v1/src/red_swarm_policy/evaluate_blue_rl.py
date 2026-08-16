@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from .blue_rl import BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent
-from .blue_rl.config_io import load_environment_config
+from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +28,7 @@ def main() -> int:
     if args.episodes < 1 or args.parallel_envs < 1 or args.env_worker_threads < 1: raise SystemExit("episode and worker counts must be positive")
     if args.acmi_interval < 0 or args.env_worker_timeout_s <= 0: raise SystemExit("invalid ACMI interval or worker timeout")
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
-    environment_config = load_environment_config(args.env_config)
+    environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     config = BlueEscapeEnvConfig(args.missiles, decision_interval_s=args.decision_interval,
                                  acmi_episode_interval=args.acmi_interval,
                                  acmi_directory=str(output / "acmi"))

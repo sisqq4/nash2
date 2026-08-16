@@ -9,6 +9,25 @@
 训练环境 `BlueEscapeEnv` 与红方分层训练环境相对独立。所有红弹固定分配给唯一蓝机且残差过载恒为
 零，因此只运行 v1 的比例导引，不会调用红方高层或低层网络。训练和测试每回合都写 Tacview ACMI。
 
+蓝方奖励在每个 **0.1 s 决策边界**计算一次，而不再在 0.005 s 物理帧上反复惩罚不可避免的弹目接近。
+其有界多弹威胁势函数采用 soft-min 权重：远距阶段奖励速度指向远离来弹的方向；进入 30 km 附近后，
+平滑转为奖励与来袭方向近似切向的速度以及俯冲分量。势函数尺度默认为 2，并使用与 DQN 一致的
+`gamma * Phi(next) - Phi(current)`；终止状态的势函数严格置零，避免终局残留势函数改变奖励方向，因此 shaping 不会掩盖
+终局的生存优先级。裁决结果分别映射为明确脱靶/物理失效 `+10`（另有不超过 `+1` 的快速完成奖励）、
+蓝机被击中 `-10`（按生存进度最多减轻 `1`）、mission timeout `+2`。日志逐回合保存
+`reward_components` 和每枚导弹的 `red_loss_reasons`，避免把超时和真正脱靶混为同一成功类型。
+
+建议奖励重构后的训练计划先做 terminal-only 与新 threat-potential 的相同 seed 消融，再逐步扩展到 1v2～1v4；
+每阶段使用独立 evaluation seeds 比较生存率、终止/失效原因、脱靶距离、完成时间与动作分布。C51 support
+随新奖励调整为 `[-12, 12]`；正式长跑仍应依据投影前 n-step return 分位数复核边界，而不是依据 episode
+总回报机械扩大 support。
+
+蓝方训练和评估入口统一把 mission timeout 与 missile guidance timeout 设置为 200 s。针对平均上千个
+决策步的轨迹，Rainbow 默认采用 `gamma=0.999`、`n_step=20`，并将学习率降低到 `2.5e-4` 以减轻后期
+策略漂移。每个 decision 的 `reward_components` 分别记录 `far_away_shaping`、`near_tangent_shaping` 和
+`near_dive_shaping`；`reward_diagnostics` 另外记录 `range_blend_weight`、`softmin_threat_distance`、
+`potential_before`、`potential_after`。训练窗口同时报告 C51 上下界 clamp 比例。
+
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 4 --episodes 1000
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 4

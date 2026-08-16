@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from .blue_rl import BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent, RainbowDQNConfig
-from .blue_rl.config_io import load_environment_config
+from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,12 +78,12 @@ def main() -> int:
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "training.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text("", encoding="utf-8")
-    environment_config = load_environment_config(args.env_config)
+    environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     env_config = BlueEscapeEnvConfig(args.missiles, decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
     rainbow_config = RainbowDQNConfig(6 + args.missiles * 3, 29, batch_size=args.batch_size,
-                                      device=args.device)
+                                      gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
     # starting spawned children after CUDA initialization can indefinitely stall
@@ -117,10 +117,13 @@ def main() -> int:
 
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
+        reward_components_by_worker: dict[int, Counter[str]] = {}
+        reward_diagnostics_by_worker: dict[int, Counter[str]] = {}
         next_episode = 1; completed = 0; update_credit = 0.0
         next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
         window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
         window_grad_norms: list[float] = []; window_values: list[float] = []; window_actions: Counter[int] = Counter()
+        window_clamp_low: list[float] = []; window_clamp_high: list[float] = []
         window_started = started; window_transition_start = 0; window_update_start = 0
         _emit({"event": "environment_workers", "backend": "process_spawn",
                "worker_count": pool_size, "workers": list(pool.worker_info)}, event_rows, jsonl_path)
@@ -128,6 +131,8 @@ def main() -> int:
         for worker in range(pool_size):
             assignments[worker] = (args.seed + next_episode, next_episode)
             episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
+            reward_components_by_worker[worker] = Counter()
+            reward_diagnostics_by_worker[worker] = Counter()
             decisions_by_worker[worker] = 0; next_episode += 1
         for worker, (observation, _) in pool.reset(assignments).items(): observations[worker] = observation
         while observations:
@@ -142,6 +147,11 @@ def main() -> int:
                 done = result.terminated or result.truncated
                 agent.observe_for_env(worker, previous, actions[worker], result.reward, result.observation, done)
                 reward_by_worker[worker] += result.reward; decisions_by_worker[worker] += 1
+                for name, value in dict(result.info.get("reward_components", {})).items():
+                    if name != "threat_potential":
+                        reward_components_by_worker[worker][str(name)] += float(value)
+                for name, value in dict(result.info.get("reward_diagnostics", {})).items():
+                    reward_diagnostics_by_worker[worker][str(name)] += float(value)
                 observations[worker] = result.observation
                 if done:
                     completed += 1
@@ -154,6 +164,12 @@ def main() -> int:
                         "simulation_time_s": float(result.info.get("time_s", 0.0)),
                         "physics_steps": int(result.info.get("step_count", 0)),
                         "decision_steps": decisions_by_worker[worker],
+                        "reward_components": dict(reward_components_by_worker[worker]),
+                        "reward_diagnostics_mean": {
+                            name: value / decisions_by_worker[worker]
+                            for name, value in reward_diagnostics_by_worker[worker].items()
+                        },
+                        "red_loss_reasons": list(result.info.get("red_loss_reasons", [])),
                         "mean_loss": agent.last_update_metrics.get("loss"),
                         "learner_loss_at_completion": agent.last_update_metrics.get("loss"),
                         "acmi_path": result.info.get("acmi_path"),
@@ -162,10 +178,14 @@ def main() -> int:
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode)
                         episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
+                        reward_components_by_worker[worker] = Counter()
+                        reward_diagnostics_by_worker[worker] = Counter()
                         decisions_by_worker[worker] = 0; next_episode += 1
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker)
                         reward_by_worker.pop(worker); decisions_by_worker.pop(worker)
+                        reward_components_by_worker.pop(worker)
+                        reward_diagnostics_by_worker.pop(worker)
             update_credit += len(workers) * args.updates_per_transition
             updates = math.floor(update_credit); update_credit -= updates
             for _ in range(updates):
@@ -173,6 +193,8 @@ def main() -> int:
                 if loss is not None:
                     window_losses.append(loss)
                     window_grad_norms.append(agent.last_update_metrics["gradient_norm"])
+                    window_clamp_low.append(agent.last_update_metrics["c51_clamp_low_fraction"])
+                    window_clamp_high.append(agent.last_update_metrics["c51_clamp_high_fraction"])
             while completed >= next_checkpoint:
                 checkpoint = output / f"blue_rainbow_ep{next_checkpoint:06d}.pt"
                 agent.save(str(checkpoint))
@@ -222,6 +244,8 @@ def main() -> int:
                     "per_beta": agent.last_update_metrics.get("per_beta"),
                     "priority_mean": agent.last_update_metrics.get("priority_mean"),
                     "priority_max": agent.last_update_metrics.get("priority_max"),
+                    "c51_clamp_low_fraction_mean": _mean(window_clamp_low),
+                    "c51_clamp_high_fraction_mean": _mean(window_clamp_high),
                     "completed_optimizer_updates": agent.optimizer_updates,
                     "optimizer_updates_in_window": agent.optimizer_updates - window_update_start,
                     "completed_target_updates": agent.target_updates,
@@ -230,6 +254,7 @@ def main() -> int:
                 _emit(report, event_rows, jsonl_path)
                 while next_log <= completed: next_log += args.log_interval
                 window_episodes = []; window_losses = []; window_grad_norms = []; window_values = []
+                window_clamp_low = []; window_clamp_high = []
                 window_actions = Counter(); window_started = now
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
