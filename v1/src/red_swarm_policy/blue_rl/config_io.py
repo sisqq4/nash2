@@ -8,6 +8,7 @@ from typing import Any, TypeVar
 from ..env.types import EnvironmentConfig
 
 T = TypeVar("T")
+BLUE_MISSION_DURATION_S = 200.0
 
 
 def _replace_dataclass(instance: T, values: dict[str, Any], path: str) -> T:
@@ -37,3 +38,18 @@ def load_environment_config(path: str | None) -> EnvironmentConfig:
         config = _replace_dataclass(config, raw, "environment")
     config.validate()
     return config
+
+
+def configure_blue_mission_duration(
+    config: EnvironmentConfig, duration_s: float = BLUE_MISSION_DURATION_S
+) -> EnvironmentConfig:
+    """Apply the shared blue train/evaluation mission and guidance horizon."""
+    if duration_s <= config.policy_entry_time_s:
+        raise ValueError("blue mission duration must exceed the post-boost policy entry time")
+    configured = replace(
+        config,
+        max_steps=int(round(duration_s / config.time_step_s)),
+        missile=replace(config.missile, max_guidance_time_s=duration_s),
+    )
+    configured.validate()
+    return configured
