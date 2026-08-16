@@ -15,6 +15,7 @@ from red_swarm_policy.blue_rl import (
 )
 from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
 from red_swarm_policy.env import EnvironmentConfig
+from red_swarm_policy.cli_utils import parse_missile_scenarios
 
 
 class FixedPolicy:
@@ -55,6 +56,24 @@ def test_blue_env_is_fixed_shape_and_uses_pure_pn(tmp_path) -> None:
     assert info["pure_pn"] is True
     assert np.allclose(env.inner.previous_action.red.guidance_bias, 0.0)
     assert (tmp_path / "episode_000001.acmi").is_file()
+
+
+def test_multi_scenario_observations_are_padded_to_shared_shape() -> None:
+    cfg = short_config()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1, max_missiles=4, pad_observation_to_max_missiles=True,
+        decision_interval_s=cfg.time_step_s, record_acmi=False,
+    ))
+    one, _ = env.reset(seed=1, missile_count=1)
+    four, _ = env.reset(seed=2, missile_count=4)
+    assert one.shape == four.shape == (18,)
+    assert np.allclose(one[9:], 0.0)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("4", (4,)), ("1,2,3,4", (1, 2, 3, 4)),
+                                                   ("1,3,3", (1, 3))])
+def test_parse_missile_scenarios(value: str, expected: tuple[int, ...]) -> None:
+    assert parse_missile_scenarios(value) == expected
 
 
 def test_controller_is_drop_in_discrete_policy() -> None:

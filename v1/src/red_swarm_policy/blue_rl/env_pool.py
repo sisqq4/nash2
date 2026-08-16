@@ -48,7 +48,8 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
                 _send(connection, (True, None)); break
             try:
                 if operation == "reset":
-                    result = env.reset(payload["seed"], episode_index=payload["episode_index"])
+                    result = env.reset(payload["seed"], episode_index=payload["episode_index"],
+                                       missile_count=payload.get("missile_count"))
                 elif operation == "step":
                     observation, reward, terminated, truncated, info = env.step(payload)
                     result = BlueStepResult(observation, reward, terminated, truncated, info)
@@ -137,9 +138,13 @@ class BlueProcessEnvironmentPool:
             _send(self._connections[index], request)
         return self._receive_many(list(requests), phase)
 
-    def reset(self, assignments: dict[int, tuple[int, int]]) -> dict[int, tuple[np.ndarray, dict[str, object]]]:
-        return self._request({i: ("reset", {"seed": seed, "episode_index": episode})
-                              for i, (seed, episode) in assignments.items()}, "reset")
+    def reset(self, assignments: dict[int, tuple[int, int] | tuple[int, int, int]]) -> dict[int, tuple[np.ndarray, dict[str, object]]]:
+        requests = {}
+        for index, assignment in assignments.items():
+            seed, episode, *scenario = assignment
+            requests[index] = ("reset", {"seed": seed, "episode_index": episode,
+                                          "missile_count": scenario[0] if scenario else None})
+        return self._request(requests, "reset")
 
     def step(self, actions: dict[int, int]) -> dict[int, BlueStepResult]:
         return self._request({i: ("step", int(action)) for i, action in actions.items()}, "step")

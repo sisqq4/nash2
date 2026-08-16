@@ -3,6 +3,18 @@ from __future__ import annotations
 import math
 
 
+def parse_missile_scenarios(value: str | int) -> tuple[int, ...]:
+    """Parse a comma-separated, de-duplicated subset of the 1v1--1v4 scenarios."""
+    try:
+        items = [int(part.strip()) for part in str(value).split(",") if part.strip()]
+    except ValueError as error:
+        raise ValueError("missiles must be a comma-separated subset of 1,2,3,4") from error
+    scenarios = tuple(dict.fromkeys(items))
+    if not scenarios or any(item not in range(1, 5) for item in scenarios):
+        raise ValueError("missiles must be a comma-separated subset of 1,2,3,4")
+    return scenarios
+
+
 def parse_float_sequence(
     value: str | tuple[float, ...] | list[float],
     name: str,
