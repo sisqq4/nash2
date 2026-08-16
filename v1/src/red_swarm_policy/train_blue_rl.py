@@ -15,12 +15,14 @@ import torch
 
 from .blue_rl import BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent, RainbowDQNConfig
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
+from .cli_utils import parse_missile_scenarios
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the independent v1 blue Rainbow-DQN policy")
     parser.add_argument("--episodes", type=int, default=1000)
-    parser.add_argument("--missiles", type=int, choices=range(1, 5), default=1)
+    parser.add_argument("--missiles", default="1",
+                        help="Comma-separated scenarios to sample, e.g. 1,2,3,4 (default: 1)")
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--output", default="outputs/blue_rl/train")
     parser.add_argument("--device", default="cpu"); parser.add_argument("--env-config", default=None)
     parser.add_argument("--decision-interval", type=float, default=0.1)
@@ -66,6 +68,8 @@ def _device_metrics(device: torch.device) -> dict[str, float]:
 
 def main() -> int:
     args = build_parser().parse_args()
+    try: missile_scenarios = parse_missile_scenarios(args.missiles)
+    except ValueError as error: raise SystemExit(str(error)) from error
     if args.episodes < 1 or args.checkpoint_interval < 1 or args.log_interval < 1:
         raise SystemExit("episodes, checkpoint interval and log interval must be positive")
     if args.acmi_interval < 0 or args.parallel_envs < 1 or args.env_worker_threads < 1:
@@ -79,10 +83,12 @@ def main() -> int:
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
-    env_config = BlueEscapeEnvConfig(args.missiles, decision_interval_s=args.decision_interval,
+    env_config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=max(missile_scenarios),
+                                     pad_observation_to_max_missiles=len(missile_scenarios) > 1,
+                                     decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
-    rainbow_config = RainbowDQNConfig(6 + args.missiles * 3, 29, batch_size=args.batch_size,
+    rainbow_config = RainbowDQNConfig(6 + max(missile_scenarios) * 3, 29, batch_size=args.batch_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
@@ -95,8 +101,8 @@ def main() -> int:
         event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
         started = time.monotonic()
         experiment = {
-            "event": "experiment_config", "device": str(agent.device), "red_count": args.missiles,
-            "blue_count": 1, "scenario_sampling": "independent_seed_per_episode",
+            "event": "experiment_config", "device": str(agent.device), "red_counts": list(missile_scenarios),
+            "blue_count": 1, "scenario_sampling": "uniform_random_per_episode",
             "parallel_cpu_envs": pool_size, "parallel_backend": "process_spawn",
             "env_worker_threads": args.env_worker_threads, "env_worker_timeout_s": args.env_worker_timeout_s,
             "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
@@ -115,6 +121,9 @@ def main() -> int:
         _emit(device_row, event_rows, jsonl_path)
         _emit(experiment, event_rows, jsonl_path)
 
+        scenario_rng = random.Random(args.seed)
+        episode_scenarios = {episode: scenario_rng.choice(missile_scenarios)
+                             for episode in range(1, args.episodes + 1)}
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
@@ -129,7 +138,7 @@ def main() -> int:
                "worker_count": pool_size, "workers": list(pool.worker_info)}, event_rows, jsonl_path)
         assignments = {}
         for worker in range(pool_size):
-            assignments[worker] = (args.seed + next_episode, next_episode)
+            assignments[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
             episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
             reward_components_by_worker[worker] = Counter()
             reward_diagnostics_by_worker[worker] = Counter()
@@ -157,6 +166,7 @@ def main() -> int:
                     completed += 1
                     row = {
                         "episode": episode_by_worker[worker], "reward": reward_by_worker[worker],
+                        "missile_count": episode_scenarios[episode_by_worker[worker]],
                         "blue_survived": bool(result.info["blue_survived"]),
                         "termination_reason": result.info.get("termination_reason"),
                         "hit_count": int(result.info.get("hit_count", 0)),
@@ -176,7 +186,7 @@ def main() -> int:
                     }
                     summaries.append(row); window_episodes.append(row)
                     if next_episode <= args.episodes:
-                        resets[worker] = (args.seed + next_episode, next_episode)
+                        resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
                         reward_components_by_worker[worker] = Counter()
                         reward_diagnostics_by_worker[worker] = Counter()
@@ -213,7 +223,8 @@ def main() -> int:
                     "event": "iteration", "iteration": len([row for row in event_rows if row["event"] == "iteration"]) + 1,
                     "completed_episodes": completed,
                     "episode_ids": sorted(int(row["episode"]) for row in window_episodes),
-                    "sampled_red_count": args.missiles, "sampled_blue_count": 1,
+                    "sampled_red_counts": dict(Counter(int(row["missile_count"]) for row in window_episodes)),
+                    "sampled_blue_count": 1,
                     "active_parallel_envs": len(observations), "inference_batch_size": len(workers),
                     "vector_iterations": vector_iterations,
                     "rollout_decision_steps": agent.total_steps - window_transition_start,
@@ -272,6 +283,9 @@ def main() -> int:
             "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
             "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
         }
+        final_summary["scenario_episode_counts"] = dict(Counter(
+            int(row["missile_count"]) for row in summaries
+        ))
         _emit(final_summary, event_rows, jsonl_path)
         (output / "episodes.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
         metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],

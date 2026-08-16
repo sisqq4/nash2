@@ -18,6 +18,7 @@ class BlueEscapeEnvConfig:
 
     missile_count: int = 1
     max_missiles: int = 4
+    pad_observation_to_max_missiles: bool = False
     decision_interval_s: float = 0.1
     record_acmi: bool = True
     acmi_episode_interval: int = 1
@@ -83,16 +84,24 @@ class BlueEscapeEnv:
         self.environment_config, self.config = environment_config, config
         self.inner = RedBlueEngagementEnv(environment_config, record_replay=False)
         self.frames_per_action = int(round(config.decision_interval_s / environment_config.time_step_s))
-        # Preserve nash1.6's observation contract exactly: blue absolute
-        # position/velocity followed by every missile's relative position.
-        # A checkpoint is therefore tied to its configured missile count.
-        self.observation_dim = 6 + config.missile_count * 3
+        # Single-scenario runs retain the nash1.6 observation contract.  A
+        # multi-scenario run pads missing missile slots to max_missiles so one
+        # policy can consume every selected scenario.
+        self.observation_dim = 6 + (config.max_missiles if config.pad_observation_to_max_missiles
+                                    else config.missile_count) * 3
         self.action_dim = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G)
         self.recorder = AcmiRecorder(); self.episode = 0
         self._previous_potential: dict[str, float] = {}
         self._record_current_episode = False
 
-    def reset(self, seed: int | None = None, *, episode_index: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+    def reset(self, seed: int | None = None, *, episode_index: int | None = None,
+              missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+        if missile_count is not None:
+            if not 1 <= int(missile_count) <= self.config.max_missiles:
+                raise ValueError(f"missile_count must be in [1, {self.config.max_missiles}]")
+            self._missile_count = int(missile_count)
+        else:
+            self._missile_count = self.config.missile_count
         self.episode = self.episode + 1 if episode_index is None else int(episode_index)
         if self.episode < 1:
             raise ValueError("episode_index must be positive")
@@ -102,7 +111,7 @@ class BlueEscapeEnv:
             and self.config.acmi_episode_interval > 0
             and self.episode % self.config.acmi_episode_interval == 0
         )
-        self.inner.reset(seed=seed, style="many_to_one", red_count=self.config.missile_count,
+        self.inner.reset(seed=seed, style="many_to_one", red_count=self._missile_count,
                          blue_count=1, start_mode="post_boost")
         assert self.inner.state is not None
         if self._record_current_episode:
@@ -247,4 +256,6 @@ class BlueEscapeEnv:
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]
         for red in state.red:
             values.extend((red.position_m - blue.position_m) / 1000.0)
+        if self.config.pad_observation_to_max_missiles:
+            values.extend([0.0] * (3 * (self.config.max_missiles - len(state.red))))
         return np.asarray(values, dtype=np.float32)

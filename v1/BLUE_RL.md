@@ -2,8 +2,8 @@
 
 `red_swarm_policy.blue_rl` 将 nash1.6 的离散蓝方逃逸强化学习结构移植到 v1：采用 29 个 v1
 蓝机动作、Rainbow DQN（Dueling、NoisyNet、C51、PER、n-step、Double DQN）并提供固定长度的
-单机/1–4 枚来弹观测。观测与 nash1.6 一致，为蓝机绝对位置、速度和每枚红弹相对位置，
-所以不同红弹数量需要分别训练检查点。该子系统只复用 v1 的场景生成、三自由度动力学、导引头、裁决和参数；
+单机/1–4 枚来弹观测。单场景观测与 nash1.6 一致，为蓝机绝对位置、速度和每枚红弹相对位置；
+联合训练则按所选最大来弹数补零到固定长度，从而由同一个策略随机学习多个场景。该子系统只复用 v1 的场景生成、三自由度动力学、导引头、裁决和参数；
 没有复制 nash1.6 的场景数值。
 
 训练环境 `BlueEscapeEnv` 与红方分层训练环境相对独立。所有红弹固定分配给唯一蓝机且残差过载恒为
@@ -29,9 +29,14 @@
 `potential_before`、`potential_after`。训练窗口同时报告 C51 上下界 clamp 比例。
 
 ```bash
-PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 4 --episodes 1000
-PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 4
+PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 1,2,3,4 --episodes 1000
+PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 1,2,3,4
 ```
+
+`--missiles` 接受逗号分隔的任意子集（例如 `1,3,4`）。每个 episode 从该集合中均匀随机抽取一个场景；
+训练日志记录每个窗口和全程的实际抽样数量，评估结果另外按场景报告生存率。随机序列仅由 `--seed`
+决定，不受并行 worker 完成先后影响。测试联合检查点时，所选集合的最大来弹数必须与训练时一致；例如
+用 `1,2,3,4` 训练的检查点可以测试 `2,4`，但不能只传 `1`（后者是 9 维单场景观测）。
 
 常规仿真中，现有 `BlueEvasionController`（规则机）保持不变；将载入的 Rainbow agent 包装为
 `BlueRLController` 即可作为 `RedBlueEngagementEnv(..., blue_policy=controller)` 并列替换。算法与环境通过
@@ -39,7 +44,7 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train
 
 ## 参数设置
 
-命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4）、`--episodes`、`--seed`、
+命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4 的逗号分隔子集）、`--episodes`、`--seed`、
 `--device`、`--decision-interval`、`--checkpoint-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
 `EnvironmentConfig`；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
 
@@ -53,6 +58,9 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train
 
 字段名必须与 `env/types.py` 中的 v1 配置一致，未知字段会立即报错。训练和测试必须使用同一个
 环境配置、来弹数量和决策周期。完整运行示例：
+
+原有单场景接口完全保留：`--missiles 4` 仍生成原来的 18 维观测并训练/测试 1v4 专用检查点，
+`--missiles` 省略时仍默认 1v1。联合模式只在传入多个值时启用补零，因此已有单场景检查点及命令无需迁移。
 
 ```bash
 cd v1
