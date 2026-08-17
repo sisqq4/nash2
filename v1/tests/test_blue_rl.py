@@ -16,6 +16,7 @@ from red_swarm_policy.blue_rl import (
 from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
 from red_swarm_policy.env import EnvironmentConfig
 from red_swarm_policy.cli_utils import parse_missile_scenarios
+from red_swarm_policy.blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
 from red_swarm_policy.evaluate_blue_rl import _aggregate_results
 from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
@@ -69,10 +70,24 @@ def test_multi_scenario_observations_are_padded_to_shared_shape() -> None:
         missile_count=1, max_missiles=4, pad_observation_to_max_missiles=True,
         decision_interval_s=cfg.time_step_s, record_acmi=False,
     ))
-    one, _ = env.reset(seed=1, missile_count=1)
+    one, info = env.reset(seed=1, missile_count=1)
     four, _ = env.reset(seed=2, missile_count=4)
     assert one.shape == four.shape == (18,)
     assert np.allclose(one[9:], 0.0)
+    assert info["missile_slot_mask"] == [True, False, False, False]
+
+
+def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
+    schedule = CurriculumSchedule()
+    assert schedule.total_episodes == 7500
+    assert schedule.probabilities_at(1000) == (1.0, 0.0, 0.0, 0.0)
+    start = schedule.probabilities_at(1001)
+    assert start[0] > .99 and 0.0 < start[1] < .01
+    assert schedule.probabilities_at(1500) == (.70, .30, 0.0, 0.0)
+    assert all(stage.probabilities[0] > 0 for stage in schedule.stages)
+    assert balanced_score({1: .2, 2: .1, 3: 0., 4: .1}, (.1, .2, .3, .4)) == pytest.approx(.08)
+    assert within_forgetting_limit({1: .16}, {1: .20})
+    assert not within_forgetting_limit({1: .14}, {1: .20})
 
 
 @pytest.mark.parametrize(("value", "expected"), [("4", (4,)), ("1,2,3,4", (1, 2, 3, 4)),
