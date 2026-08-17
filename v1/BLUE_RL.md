@@ -44,6 +44,7 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train
 并在每一新阶段前 500 回合线性改变抽样概率。若希望达到建议的 10,000–12,000 回合，应在完成默认课程后，
 以均衡采样继续常规联合训练；当前入口刻意拒绝超过课程定义的回合数，避免悄悄使用未定义概率。
 
+
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --curriculum --episodes 7500 --parallel-envs 16 --device cuda:0 \

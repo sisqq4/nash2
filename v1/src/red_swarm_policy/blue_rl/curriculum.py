@@ -20,7 +20,11 @@ DEFAULT_CURRICULUM: tuple[CurriculumStage, ...] = (
     CurriculumStage("C_1v3_focus", 1000, (.15, .30, .55, 0.), (.25, .25, .25, .25)),
     CurriculumStage("D_1v4_entry", 500, (.15, .25, .35, .25), (.10, .20, .30, .40)),
     CurriculumStage("D_1v4_focus", 1000, (.10, .20, .30, .40), (.10, .20, .30, .40)),
-    CurriculumStage("E_balanced", 1000, (.25, .25, .25, .25), (.25, .25, .25, .25)),
+    # Keep a longer final consolidation period.  The seven preceding rows total
+    # 5,500 episodes; 2,000 balanced episodes make the documented 7,500-run
+    # command exact while giving every scenario 500 expected final rehearsals.
+    CurriculumStage("E_balanced", 2000, (.25, .25, .25, .25), (.25, .25, .25, .25)),
+
 )
 
 

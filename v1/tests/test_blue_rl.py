@@ -80,6 +80,8 @@ def test_multi_scenario_observations_are_padded_to_shared_shape() -> None:
 def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
     schedule = CurriculumSchedule()
     assert schedule.total_episodes == 7500
+    assert schedule.stage_at(7500)[1].name == "E_balanced"
+    assert schedule.stage_at(7500)[2] == 2000
     assert schedule.probabilities_at(1000) == (1.0, 0.0, 0.0, 0.0)
     start = schedule.probabilities_at(1001)
     assert start[0] > .99 and 0.0 < start[1] < .01
