@@ -24,6 +24,7 @@ DEFAULT_CURRICULUM: tuple[CurriculumStage, ...] = (
     # 5,500 episodes; 2,000 balanced episodes make the documented 7,500-run
     # command exact while giving every scenario 500 expected final rehearsals.
     CurriculumStage("E_balanced", 2000, (.25, .25, .25, .25), (.25, .25, .25, .25)),
+
 )
 
 
