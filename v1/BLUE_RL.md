@@ -98,7 +98,11 @@ optimizer/target 更新次数以及 CUDA 显存。所有运行时 JSON 行同步
 `evaluation.jsonl`（可用 `--jsonl-path` 覆盖），最终逐 episode 结果仍写入 `evaluation.json`。最终结果的
 `statistics` 以及各 `by_scenario` 项包含生存/毁伤计数、终止与动作分布，并对回报、脱靶距离、仿真时长和
 决策步数给出均值、标准差、最值、5/25/50/75/95 分位数及直方图；逐 episode 结果另外记录动作直方图、
-累计奖励分量和平均奖励诊断。评估推理固定使用 `torch.inference_mode()`，冻结在线网络参数，并在结束时校验
+累计奖励分量和平均奖励诊断。每个 episode 的 `initialization` 完整记录飞机和各枚导弹的初始位置、高度、
+航向、航迹倾角与速度。飞机初始航向相对弹群中心按 90° 扇区分为朝向弹群、正 90°、负 90°和远离弹群；
+`by_blue_orientation` 分别给出四类的胜率和完整统计（即使某类无样本也保留）。整体及各朝向统计均包含以
+1 m 为固定组距的稀疏脱靶量概率直方图 `miss_distance_probability_histogram_1m`，其中仅输出非空区间。
+评估推理固定使用 `torch.inference_mode()`，冻结在线网络参数，并在结束时校验
 步数、optimizer/target 更新计数、replay 大小及参数版本均未改变；若有任何训练状态变化会直接报错。
 
 `--acmi-interval N` 表示只保存第 N、2N、3N……个回合；默认值 `1` 表示每回合保存，设为 `0`

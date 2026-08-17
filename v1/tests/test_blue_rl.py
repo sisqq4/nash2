@@ -19,6 +19,7 @@ from red_swarm_policy.cli_utils import parse_missile_scenarios
 from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
 from red_swarm_policy.evaluate_blue_rl import _aggregate_results
 from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
+from red_swarm_policy.evaluate_blue_rl import _one_meter_probability_histogram
 from red_swarm_policy.evaluate_blue_rl import build_parser as build_evaluation_parser
 
 
@@ -111,7 +112,34 @@ def test_evaluation_final_statistics_include_distributions() -> None:
     assert statistics["action_distribution"] == {"2": 4, "4": 2}
     assert statistics["reward"]["median"] == pytest.approx(-1.0)
     assert sum(statistics["reward"]["histogram"]["counts"]) == 2
+    assert statistics["miss_distance_probability_histogram_1m"] == {
+        "bin_width_m": 1.0, "sample_count": 2,
+        "bins": [
+            {"lower_m": 0, "upper_m": 1, "count": 1, "probability": 0.5},
+            {"lower_m": 100, "upper_m": 101, "count": 1, "probability": 0.5},
+        ],
+    }
     assert _numeric_distribution([])["histogram"] == {"bin_edges": [], "counts": []}
+    assert _one_meter_probability_histogram([])["bins"] == []
+
+
+def test_blue_reset_records_initial_geometry_and_orientation() -> None:
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(missile_count=2, record_acmi=False))
+
+    _, info = env.reset(seed=19)
+
+    initialization = info["initialization"]
+    assert len(initialization["blue_aircraft"]) == 1
+    assert len(initialization["red_missiles"]) == 2
+    assert initialization["blue_orientation"] in {
+        "toward_missile_swarm", "positive_90_deg", "negative_90_deg",
+        "away_from_missile_swarm",
+    }
+    for entity in initialization["blue_aircraft"] + initialization["red_missiles"]:
+        assert len(entity["position_m"]) == 3
+        assert entity["altitude_m"] == pytest.approx(entity["position_m"][1])
+        assert -180.0 <= entity["heading_deg"] <= 180.0
+        assert -90.0 <= entity["flight_path_angle_deg"] <= 90.0
 
 
 def test_controller_is_drop_in_discrete_policy() -> None:
