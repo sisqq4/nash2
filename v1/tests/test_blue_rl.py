@@ -16,6 +16,10 @@ from red_swarm_policy.blue_rl import (
 from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
 from red_swarm_policy.env import EnvironmentConfig
 from red_swarm_policy.cli_utils import parse_missile_scenarios
+from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
+from red_swarm_policy.evaluate_blue_rl import _aggregate_results
+from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
+from red_swarm_policy.evaluate_blue_rl import build_parser as build_evaluation_parser
 
 
 class FixedPolicy:
@@ -74,6 +78,40 @@ def test_multi_scenario_observations_are_padded_to_shared_shape() -> None:
                                                    ("1,3,3", (1, 3))])
 def test_parse_missile_scenarios(value: str, expected: tuple[int, ...]) -> None:
     assert parse_missile_scenarios(value) == expected
+
+
+def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> None:
+    args = build_evaluation_parser().parse_args(["checkpoint.pt"])
+    assert args.log_interval == 10
+    assert args.jsonl_path is None
+
+    path = tmp_path / "evaluation.jsonl"
+    emit_evaluation_event({"event": "evaluation_progress", "completed_episodes": 10}, path)
+
+    expected = '{"event": "evaluation_progress", "completed_episodes": 10}'
+    assert capsys.readouterr().out.strip() == expected
+    assert path.read_text(encoding="utf-8") == expected + "\n"
+
+
+def test_evaluation_final_statistics_include_distributions() -> None:
+    rows = [
+        {"blue_survived": True, "termination_reason": "red_failure", "red_loss_reasons": ["miss"],
+         "hit_count": 0, "action_histogram": {"2": 3}, "reward": 8.0,
+         "miss_distance_m": 100.0, "simulation_time_s": 20.0, "decision_steps": 3},
+        {"blue_survived": False, "termination_reason": "success", "red_loss_reasons": [],
+         "hit_count": 1, "action_histogram": {"2": 1, "4": 2}, "reward": -10.0,
+         "miss_distance_m": 0.0, "simulation_time_s": 10.0, "decision_steps": 3},
+    ]
+
+    statistics = _aggregate_results(rows)
+
+    assert statistics["episodes"] == 2
+    assert statistics["survival_rate"] == pytest.approx(0.5)
+    assert statistics["termination_counts"] == {"red_failure": 1, "success": 1}
+    assert statistics["action_distribution"] == {"2": 4, "4": 2}
+    assert statistics["reward"]["median"] == pytest.approx(-1.0)
+    assert sum(statistics["reward"]["histogram"]["counts"]) == 2
+    assert _numeric_distribution([])["histogram"] == {"bin_edges": [], "counts": []}
 
 
 def test_controller_is_drop_in_discrete_policy() -> None:
@@ -145,12 +183,17 @@ def test_terminal_reward_distinguishes_miss_timeout_and_red_success() -> None:
 def test_rainbow_select_actions_batches_observations() -> None:
     agent = RainbowDQNAgent(RainbowDQNConfig(9, 29, hidden_dim=16))
     observations = np.zeros((4, 9), dtype=np.float32)
+    parameters_before = {name: value.detach().clone() for name, value in agent.online.state_dict().items()}
 
     actions = agent.select_actions(observations, evaluation=True)
 
     assert actions.shape == (4,)
     assert actions.dtype == np.int64
     assert np.all((0 <= actions) & (actions < 29))
+    assert agent.total_steps == agent.optimizer_updates == agent.target_updates == 0
+    assert agent.replay.size == 0
+    assert all(np.array_equal(parameters_before[name].cpu().numpy(), value.cpu().numpy())
+               for name, value in agent.online.state_dict().items())
 
 
 def test_parallel_observations_keep_independent_n_step_sequences() -> None:
