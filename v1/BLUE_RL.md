@@ -33,6 +33,31 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 1,2,3,4 --epi
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 1,2,3,4
 ```
 
+## 课程学习（可选，原训练方式不变）
+
+课程模式通过单独的 `--curriculum` 开关启用；未提供该开关时，所有既有参数、均匀场景抽样和单场景
+9/12/15/18 维网络行为完全不变。课程模式从第一回合起固定使用 `max_missiles=4`、18 维观测和 29 维
+动作，并为每次 reset/step 在 `info["missile_slot_mask"]` 提供四个显式有效位。mask 作为环境元数据而不拼入
+网络输入，避免将约定的 18 维改为 22 维；无效槽仍严格补零。因此旧 9 维 1v1 checkpoint 不能用于课程训练。
+
+默认八阶段共 **7500** 回合（原建议表各行相加是 7500，而不是文字中的 8500），保留所有旧难度复习，
+并在每一新阶段前 500 回合线性改变抽样概率。若希望达到建议的 10,000–12,000 回合，应在完成默认课程后，
+以均衡采样继续常规联合训练；当前入口刻意拒绝超过课程定义的回合数，避免悄悄使用未定义概率。
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
+  --curriculum --episodes 7500 --parallel-envs 16 --device cuda:0 \
+  --acmi-interval 0 --output outputs/blue_rl/curriculum
+```
+
+默认每 500 个训练回合关闭 NoisyNet 探索，以固定且独立的 seed 对每个已引入场景测试 300 回合，并打印
+`curriculum_evaluation` JSON。评估同时记录各场景生存率、平均生存时间、历史最佳和五个百分点遗忘约束。
+`best_new_scenario.pt` 保存当前最难场景的历史最佳，`best_balanced.pt` 仅在所有旧场景未突破遗忘约束时
+按阶段权重改善才更新（1v4 阶段使用 0.1/0.2/0.3/0.4，最终阶段恢复等权）。全部评估写入
+`training.jsonl` 和 `training_metrics.json` 的 `curriculum_evaluations`，逐回合结果另含 `curriculum_stage`。
+可用 `--curriculum-eval-episodes 500` 增强阶段评估，最终候选仍建议用独立评估入口每场景测试 1000 回合；
+仅做快速调试时可设为 0 禁用内嵌评估。
+
 `--missiles` 接受逗号分隔的任意子集（例如 `1,3,4`）。每个 episode 从该集合中均匀随机抽取一个场景；
 训练日志记录每个窗口和全程的实际抽样数量，评估结果另外按场景报告生存率。随机序列仅由 `--seed`
 决定，不受并行 worker 完成先后影响。测试联合检查点时，所选集合的最大来弹数必须与训练时一致；例如

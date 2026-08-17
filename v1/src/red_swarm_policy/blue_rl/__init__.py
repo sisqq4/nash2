@@ -5,6 +5,7 @@ from .controller import BlueRLController
 from .policy import DiscreteBluePolicy, PolicyRegistry
 from .rainbow import RainbowDQNAgent, RainbowDQNConfig
 from .env_pool import BlueProcessEnvironmentPool, BlueStepResult
+from .curriculum import CurriculumSchedule, CurriculumStage, DEFAULT_CURRICULUM
 
 __all__ = [
     "BlueEscapeEnv",
@@ -16,4 +17,7 @@ __all__ = [
     "RainbowDQNConfig",
     "BlueProcessEnvironmentPool",
     "BlueStepResult",
+    "CurriculumSchedule",
+    "CurriculumStage",
+    "DEFAULT_CURRICULUM",
 ]

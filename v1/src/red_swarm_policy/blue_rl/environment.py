@@ -120,6 +120,7 @@ class BlueEscapeEnv:
         return self._observation(), {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
+            "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
         }
 
@@ -192,6 +193,7 @@ class BlueEscapeEnv:
         terminated, truncated = bool(result.terminated), bool(result.truncated)
         info = dict(result.info); info.update({
             "pure_pn": True,
+            "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "blue_survived": blue_alive,
             "reward_components": {
                 "tactical_shaping": float(shaping_reward),
