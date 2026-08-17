@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import math
 import random
 import time
 from pathlib import Path
@@ -63,6 +64,23 @@ def _numeric_distribution(values: list[float], *, bins: int = 10) -> dict[str, o
     }
 
 
+def _one_meter_probability_histogram(values: list[float]) -> dict[str, object]:
+    """Return occupied [m, m+1) bins; sparse output avoids enormous zero-filled JSON."""
+    if not values:
+        return {"bin_width_m": 1.0, "sample_count": 0, "bins": []}
+    integer_bins = Counter(math.floor(max(0.0, float(value))) for value in values)
+    total = len(values)
+    return {
+        "bin_width_m": 1.0,
+        "sample_count": total,
+        "bins": [
+            {"lower_m": meter, "upper_m": meter + 1, "count": count,
+             "probability": count / total}
+            for meter, count in sorted(integer_bins.items())
+        ],
+    }
+
+
 def _aggregate_results(rows: list[dict[str, object]]) -> dict[str, object]:
     survived = sum(bool(row["blue_survived"]) for row in rows)
     action_counts: Counter[int] = Counter()
@@ -80,6 +98,9 @@ def _aggregate_results(rows: list[dict[str, object]]) -> dict[str, object]:
         "action_distribution": {str(action): count for action, count in sorted(action_counts.items())},
         "reward": _numeric_distribution([float(row["reward"]) for row in rows]),
         "miss_distance_m": _numeric_distribution([float(row["miss_distance_m"]) for row in rows]),
+        "miss_distance_probability_histogram_1m": _one_meter_probability_histogram(
+            [float(row["miss_distance_m"]) for row in rows]
+        ),
         "simulation_time_s": _numeric_distribution([float(row["simulation_time_s"]) for row in rows]),
         "decision_steps": _numeric_distribution([float(row["decision_steps"]) for row in rows]),
     }
@@ -109,7 +130,7 @@ def main() -> int:
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
     pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
-    decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}
+    decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}; initializations = {}
     reward_component_sums: dict[int, Counter[str]] = {}; reward_diagnostic_sums: dict[int, Counter[str]] = {}
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
     completed = 0; next_log = args.log_interval; vector_iterations = 0
@@ -134,7 +155,8 @@ def main() -> int:
             episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
-        for worker, (observation, _) in pool.reset(assignments).items(): observations[worker] = observation
+        for worker, (observation, reset_info) in pool.reset(assignments).items():
+            observations[worker] = observation; initializations[worker] = reset_info["initialization"]
         while observations:
             workers = sorted(observations)
             with torch.inference_mode():
@@ -153,6 +175,8 @@ def main() -> int:
                     episode = episode_by_worker[worker]
                     row = {"episode": episode, "missile_count": episode_scenarios[episode],
                            "reward": rewards[worker], **result.info,
+                           "initialization": initializations[worker],
+                           "blue_orientation": initializations[worker]["blue_orientation"],
                            "simulation_time_s": float(result.info.get("time_s", 0.0)),
                            "physics_steps": int(result.info.get("step_count", 0)),
                            "decision_steps": decisions[worker],
@@ -170,10 +194,11 @@ def main() -> int:
                         reward_diagnostic_sums[worker] = Counter(); next_episode += 1
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker); rewards.pop(worker)
-                        decisions.pop(worker); action_counts.pop(worker)
+                        decisions.pop(worker); action_counts.pop(worker); initializations.pop(worker)
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
             if resets:
-                for worker, (observation, _) in pool.reset(resets).items(): observations[worker] = observation
+                for worker, (observation, reset_info) in pool.reset(resets).items():
+                    observations[worker] = observation; initializations[worker] = reset_info["initialization"]
             if completed >= next_log or (completed == args.episodes and window_rows):
                 now = time.monotonic(); window_rewards = [float(row["reward"]) for row in window_rows]
                 misses = [float(row["miss_distance_m"]) for row in window_rows]
@@ -206,6 +231,12 @@ def main() -> int:
         if (selected := [row for row in rows if row["missile_count"] == count])
     }
     statistics = _aggregate_results(rows)
+    orientation_names = ("toward_missile_swarm", "positive_90_deg", "negative_90_deg",
+                         "away_from_missile_swarm")
+    by_blue_orientation = {
+        name: _aggregate_results([row for row in rows if row["blue_orientation"] == name])
+        for name in orientation_names
+    }
     current_learner_state = (agent.total_steps, agent.optimizer_updates, agent.target_updates,
                              agent.replay.size, tuple(parameter._version for parameter in agent.online.parameters()))
     if current_learner_state != immutable_learner_state:
@@ -213,6 +244,7 @@ def main() -> int:
     elapsed = time.monotonic() - started
     summary = {"episodes": args.episodes, "missile_scenarios": list(missile_scenarios),
                "survival_rate": statistics["survival_rate"], "statistics": statistics,
+               "by_blue_orientation": by_blue_orientation,
                "by_scenario": by_scenario, "parallel_envs": pool_size,
                "inference_batch_size": pool_size,
                "evaluation_only": True, "learner_state_unchanged": True,
@@ -227,6 +259,7 @@ def main() -> int:
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _emit({"event": "evaluation_complete", "episodes": args.episodes,
            "survival_rate": summary["survival_rate"], "by_scenario": by_scenario,
+           "by_blue_orientation": by_blue_orientation,
            "statistics": statistics, "evaluation_only": True, "learner_state_unchanged": True,
            "training_updates_performed": False, "environment_transitions_recorded": 0,
            "optimizer_updates_during_evaluation": 0, "target_updates_during_evaluation": 0,

@@ -117,7 +117,51 @@ class BlueEscapeEnv:
         if self._record_current_episode:
             self.recorder.record(self.inner.state)
         self._previous_potential = self._threat_potential()
-        return self._observation(), {"time_s": self.inner.state.time_s, "pure_pn": True}
+        return self._observation(), {
+            "time_s": self.inner.state.time_s,
+            "pure_pn": True,
+            "initialization": self._initialization_snapshot(),
+        }
+
+    def _initialization_snapshot(self) -> dict[str, object]:
+        """Return a JSON-safe, immutable description of the sampled scenario."""
+        assert self.inner.state is not None
+
+        def describe(entity: object) -> dict[str, object]:
+            position = np.asarray(entity.position_m, dtype=np.float64)
+            velocity = np.asarray(entity.velocity_mps, dtype=np.float64)
+            horizontal_speed = float(np.hypot(velocity[0], velocity[2]))
+            return {
+                "position_m": position.tolist(),
+                "altitude_m": float(position[1]),
+                "heading_deg": float(math.degrees(math.atan2(velocity[2], velocity[0]))),
+                "flight_path_angle_deg": float(math.degrees(math.atan2(velocity[1], horizontal_speed))),
+                "speed_mps": float(np.linalg.norm(velocity)),
+            }
+
+        blue = self.inner.state.blue[0]
+        missile_center = np.mean([red.position_m for red in self.inner.state.red], axis=0)
+        reference = missile_center[[0, 2]] - blue.position_m[[0, 2]]
+        blue_velocity = blue.velocity_mps[[0, 2]]
+        relative_heading_deg = float(math.degrees(math.atan2(
+            reference[0] * blue_velocity[1] - reference[1] * blue_velocity[0],
+            float(np.dot(reference, blue_velocity)),
+        )))
+        if -45.0 <= relative_heading_deg < 45.0:
+            orientation = "toward_missile_swarm"
+        elif 45.0 <= relative_heading_deg < 135.0:
+            orientation = "positive_90_deg"
+        elif -135.0 <= relative_heading_deg < -45.0:
+            orientation = "negative_90_deg"
+        else:
+            orientation = "away_from_missile_swarm"
+        return {
+            "blue_aircraft": [describe(blue)],
+            "red_missiles": [describe(red) for red in self.inner.state.red],
+            "missile_swarm_center_position_m": missile_center.tolist(),
+            "blue_relative_heading_deg": relative_heading_deg,
+            "blue_orientation": orientation,
+        }
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         if not 0 <= int(action) < self.action_dim: raise ValueError(f"action must be in [0, {self.action_dim})")
