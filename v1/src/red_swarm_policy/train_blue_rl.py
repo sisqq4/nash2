@@ -6,15 +6,16 @@ import math
 import random
 import time
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 
-from .blue_rl import BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent, RainbowDQNConfig
+from .blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent, RainbowDQNConfig
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
+from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from .cli_utils import parse_missile_scenarios
 
 
@@ -42,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--acmi-interval", type=int, default=1,
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (keeps an 18-D network)")
+    parser.add_argument("--curriculum-transition-episodes", type=int, default=500,
+                        help="Episodes used to linearly ramp probabilities at each curriculum stage entry")
+    parser.add_argument("--curriculum-eval-interval", type=int, default=500)
+    parser.add_argument("--curriculum-eval-episodes", type=int, default=300,
+                        help="Fixed-seed evaluation episodes per introduced scenario; 0 disables evaluation")
     return parser
 
 
@@ -66,6 +74,32 @@ def _device_metrics(device: torch.device) -> dict[str, float]:
     }
 
 
+def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
+                           env_config: BlueEscapeEnvConfig, scenarios: list[int],
+                           episodes: int, seed: int) -> dict[str, Any]:
+    """Evaluate without replay writes, optimizer steps, or NoisyNet exploration."""
+    evaluation_env = BlueEscapeEnv(environment_config, replace(
+        env_config, record_acmi=False, acmi_episode_interval=0,
+    ))
+    rates: dict[int, float] = {}; mean_times: dict[int, float] = {}
+    for scenario in scenarios:
+        survived: list[float] = []; times: list[float] = []
+        for index in range(episodes):
+            observation, _ = evaluation_env.reset(
+                seed=seed + scenario * 100_000 + index, episode_index=index + 1,
+                missile_count=scenario,
+            )
+            done = False
+            while not done:
+                action = agent.select_action(observation, evaluation=True)
+                observation, _, terminated, truncated, info = evaluation_env.step(action)
+                done = terminated or truncated
+            survived.append(float(info["blue_survived"])); times.append(float(info.get("time_s", 0.0)))
+        rates[scenario] = float(np.mean(survived)); mean_times[scenario] = float(np.mean(times))
+    return {"survival_rates": rates, "mean_survival_time_s": mean_times,
+            "episodes_per_scenario": episodes, "seed_base": seed}
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try: missile_scenarios = parse_missile_scenarios(args.missiles)
@@ -76,6 +110,11 @@ def main() -> int:
         raise SystemExit("ACMI interval must be non-negative and worker counts positive")
     if args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0 or args.batch_size < 1:
         raise SystemExit("timeout and batch size must be positive; update ratio must be non-negative")
+    curriculum = CurriculumSchedule(transition_episodes=args.curriculum_transition_episodes) if args.curriculum else None
+    if curriculum is not None and args.episodes > curriculum.total_episodes:
+        raise SystemExit(f"curriculum defines at most {curriculum.total_episodes} episodes")
+    if args.curriculum_eval_interval < 1 or args.curriculum_eval_episodes < 0:
+        raise SystemExit("curriculum evaluation interval must be positive and episodes non-negative")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_path) if args.metrics_path else output / "training_metrics.json"
@@ -83,12 +122,13 @@ def main() -> int:
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
-    env_config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=max(missile_scenarios),
-                                     pad_observation_to_max_missiles=len(missile_scenarios) > 1,
+    training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
+    env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
+                                     pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
                                      decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
-    rainbow_config = RainbowDQNConfig(6 + max(missile_scenarios) * 3, 29, batch_size=args.batch_size,
+    rainbow_config = RainbowDQNConfig(6 + max(training_scenarios) * 3, 29, batch_size=args.batch_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
@@ -101,8 +141,9 @@ def main() -> int:
         event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
         started = time.monotonic()
         experiment = {
-            "event": "experiment_config", "device": str(agent.device), "red_counts": list(missile_scenarios),
-            "blue_count": 1, "scenario_sampling": "uniform_random_per_episode",
+            "event": "experiment_config", "device": str(agent.device), "red_counts": list(training_scenarios),
+            "blue_count": 1, "scenario_sampling": ("staged_curriculum" if curriculum is not None
+                                                     else "uniform_random_per_episode"),
             "parallel_cpu_envs": pool_size, "parallel_backend": "process_spawn",
             "env_worker_threads": args.env_worker_threads, "env_worker_timeout_s": args.env_worker_timeout_s,
             "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
@@ -113,6 +154,7 @@ def main() -> int:
             "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
             "environment_config": asdict(environment_config),
             "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
+            "curriculum": curriculum.describe() if curriculum is not None else None,
         }
         device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
         if agent.device.type == "cuda":
@@ -122,14 +164,20 @@ def main() -> int:
         _emit(experiment, event_rows, jsonl_path)
 
         scenario_rng = random.Random(args.seed)
-        episode_scenarios = {episode: scenario_rng.choice(missile_scenarios)
+        episode_scenarios = {episode: (curriculum.sample(episode, scenario_rng) if curriculum is not None
+                                      else scenario_rng.choice(missile_scenarios))
                              for episode in range(1, args.episodes + 1)}
+        episode_stages = {episode: curriculum.stage_at(episode)[1].name
+                          for episode in range(1, args.episodes + 1)} if curriculum is not None else {}
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
         reward_diagnostics_by_worker: dict[int, Counter[str]] = {}
         next_episode = 1; completed = 0; update_credit = 0.0
         next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
+        next_curriculum_eval = args.curriculum_eval_interval
+        historical_best: dict[int, float] = {}; best_balanced_score = -math.inf
+        best_new_rate: dict[int, float] = {}
         window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
         window_grad_norms: list[float] = []; window_values: list[float] = []; window_actions: Counter[int] = Counter()
         window_clamp_low: list[float] = []; window_clamp_high: list[float] = []
@@ -167,6 +215,7 @@ def main() -> int:
                     row = {
                         "episode": episode_by_worker[worker], "reward": reward_by_worker[worker],
                         "missile_count": episode_scenarios[episode_by_worker[worker]],
+                        "curriculum_stage": episode_stages.get(episode_by_worker[worker]),
                         "blue_survived": bool(result.info["blue_survived"]),
                         "termination_reason": result.info.get("termination_reason"),
                         "hit_count": int(result.info.get("hit_count", 0)),
@@ -213,6 +262,33 @@ def main() -> int:
                        "environment_transitions": agent.total_steps,
                        "optimizer_updates": agent.optimizer_updates}, event_rows, jsonl_path)
                 next_checkpoint += args.checkpoint_interval
+            while (curriculum is not None and args.curriculum_eval_episodes > 0
+                   and completed >= next_curriculum_eval):
+                _, evaluation_stage, _ = curriculum.stage_at(min(next_curriculum_eval, args.episodes))
+                introduced = [index + 1 for index, probability in enumerate(evaluation_stage.probabilities)
+                              if probability > 0.0]
+                evaluation = _curriculum_evaluation(
+                    agent, environment_config, env_config, introduced,
+                    args.curriculum_eval_episodes, args.seed + 10_000_000,
+                )
+                rates = {int(key): float(value) for key, value in evaluation["survival_rates"].items()}
+                eligible = within_forgetting_limit(rates, historical_best)
+                score = balanced_score(rates, evaluation_stage.score_weights)
+                newest = max(introduced)
+                if rates[newest] > best_new_rate.get(newest, -1.0):
+                    best_new_rate[newest] = rates[newest]
+                    agent.save(str(output / "best_new_scenario.pt"))
+                if eligible and score > best_balanced_score:
+                    best_balanced_score = score
+                    agent.save(str(output / "best_balanced.pt"))
+                for scenario, rate in rates.items():
+                    historical_best[scenario] = max(historical_best.get(scenario, 0.0), rate)
+                _emit({"event": "curriculum_evaluation", "completed_episodes": completed,
+                       "episode_threshold": next_curriculum_eval, "stage": evaluation_stage.name,
+                       **evaluation, "score": score, "score_weights": evaluation_stage.score_weights,
+                       "within_five_point_forgetting_limit": eligible,
+                       "historical_best_survival_rates": dict(historical_best)}, event_rows, jsonl_path)
+                next_curriculum_eval += args.curriculum_eval_interval
             if completed >= next_log or (completed == args.episodes and window_episodes):
                 now = time.monotonic(); rewards = [float(row["reward"]) for row in window_episodes]
                 misses = [float(row["miss_distance_m"]) for row in window_episodes]
@@ -289,6 +365,7 @@ def main() -> int:
         _emit(final_summary, event_rows, jsonl_path)
         (output / "episodes.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
         metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],
+                                            "curriculum_evaluations": [row for row in event_rows if row["event"] == "curriculum_evaluation"],
                                             "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
     return 0
 
