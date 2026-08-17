@@ -45,7 +45,7 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train
 ## 参数设置
 
 命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4 的逗号分隔子集）、`--episodes`、`--seed`、
-`--device`、`--decision-interval`、`--checkpoint-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
+`--device`、`--decision-interval`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
 `EnvironmentConfig`；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
 
 ```json
@@ -91,6 +91,15 @@ GPU 前向推理。每个环境维护独立的 n-step 轨迹，结束的环境�
 optimizer/target 更新次数以及 CUDA 显存。所有运行时 JSON 行同步追加到输出目录的 `training.jsonl`；
 训练结束后，完整配置、区间指标、逐 episode 结果和最终汇总写入 `training_metrics.json`。可分别使用
 `--jsonl-path` 和 `--metrics-path` 覆盖路径。
+
+评估会在启动时输出 `evaluation_config` JSON 行，此后每 `--log-interval` 个已完成 episode 输出一条
+`evaluation_progress`，包括完成进度、窗口生存率、回报、命中数、脱靶距离、终止原因和运行吞吐；结束时输出
+`evaluation_complete`，随后保留原有的完整评估 JSON 输出。以上流式事件同时写入输出目录的
+`evaluation.jsonl`（可用 `--jsonl-path` 覆盖），最终逐 episode 结果仍写入 `evaluation.json`。最终结果的
+`statistics` 以及各 `by_scenario` 项包含生存/毁伤计数、终止与动作分布，并对回报、脱靶距离、仿真时长和
+决策步数给出均值、标准差、最值、5/25/50/75/95 分位数及直方图；逐 episode 结果另外记录动作直方图、
+累计奖励分量和平均奖励诊断。评估推理固定使用 `torch.inference_mode()`，冻结在线网络参数，并在结束时校验
+步数、optimizer/target 更新计数、replay 大小及参数版本均未改变；若有任何训练状态变化会直接报错。
 
 `--acmi-interval N` 表示只保存第 N、2N、3N……个回合；默认值 `1` 表示每回合保存，设为 `0`
 会完全关闭 ACMI 并且不在内存中累计轨迹。训练 ACMI 位于训练输出目录的 `acmi/`，测试 ACMI
