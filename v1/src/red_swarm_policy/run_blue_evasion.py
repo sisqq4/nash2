@@ -184,17 +184,26 @@ def main(argv: list[str] | None = None) -> int:
         from .blue_rl import BlueEscapeEnvConfig, BlueRLController, RainbowDQNAgent
 
         agent = RainbowDQNAgent.load(args.blue_checkpoint, str(device))
-        expected_observation_dim = 6 + 3 * args.red_count
-        if agent.config.observation_dim != expected_observation_dim:
+        legacy_dim = 6 + 3 * args.red_count
+        normalized_dim = 6 + 4 * args.red_count
+        if (agent.config.observation_schema == "normalized_v2"
+                and agent.config.observation_dim == normalized_dim):
+            observation_schema = "normalized_v2"
+        elif (agent.config.observation_schema == "legacy_v1"
+              and agent.config.observation_dim == legacy_dim):
+            observation_schema = "legacy_v1"
+        else:
             parser.error(
                 f"checkpoint expects observation_dim={agent.config.observation_dim}, "
-                f"but --red-count={args.red_count} requires {expected_observation_dim}"
+                f"but --red-count={args.red_count} requires legacy {legacy_dim} "
+                f"or normalized {normalized_dim}"
             )
         controller = BlueRLController(
             agent,
             environment_config,
             BlueEscapeEnvConfig(
                 missile_count=args.red_count,
+                observation_schema=observation_schema,
                 decision_interval_s=args.decision_interval_s,
                 record_acmi=False,
             ),
