@@ -44,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--curriculum", action="store_true",
-                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (keeps an 18-D network)")
+                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v2 22-D network)")
     parser.add_argument("--curriculum-transition-episodes", type=int, default=500,
                         help="Episodes used to linearly ramp probabilities at each curriculum stage entry")
     parser.add_argument("--curriculum-eval-interval", type=int, default=500)
@@ -125,10 +125,13 @@ def main() -> int:
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
                                      pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
+                                     observation_schema="normalized_v2",
                                      decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
-    rainbow_config = RainbowDQNConfig(6 + max(training_scenarios) * 3, 29, batch_size=args.batch_size,
+    rainbow_config = RainbowDQNConfig(6 + max(training_scenarios) * 4, 29,
+                                      observation_schema=env_config.observation_schema,
+                                      batch_size=args.batch_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
