@@ -217,6 +217,35 @@ def test_potential_components_sum_and_include_multi_threat_diagnostics() -> None
     assert potential["softmin_threat_distance"] > 0.0
 
 
+def test_blue_threat_potential_is_bounded_and_normalized_across_missile_counts() -> None:
+    """Duplicating an identical threat must not multiply the shaping reward."""
+    totals: list[float] = []
+    for missile_count in (1, 2, 3, 4):
+        env = BlueEscapeEnv(
+            EnvironmentConfig(),
+            BlueEscapeEnvConfig(missile_count=missile_count, record_acmi=False),
+        )
+        env.reset(seed=100 + missile_count)
+        assert env.inner.state is not None
+        blue = env.inner.state.blue[0]
+        blue.velocity_mps = np.array([-350.0, -50.0, 0.0])
+        for missile in env.inner.state.red:
+            missile.position_m = blue.position_m + np.array([20000.0, 0.0, 0.0])
+        potential = env._threat_potential()
+        assert 0.0 <= potential["total"] <= env.config.shaping_scale
+        totals.append(potential["total"])
+
+    assert totals == pytest.approx([totals[0]] * 4)
+
+
+def test_discounted_potential_shaping_telescopes() -> None:
+    gamma = 0.999
+    potentials = np.asarray([0.4, 1.7, 0.8, 0.0])
+    shaping = gamma * potentials[1:] - potentials[:-1]
+    discounted_sum = sum(gamma ** index * reward for index, reward in enumerate(shaping))
+    assert discounted_sum == pytest.approx(-potentials[0] + gamma ** 3 * potentials[-1])
+
+
 def test_terminal_reward_distinguishes_miss_timeout_and_red_success() -> None:
     env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(record_acmi=False))
     assert env._terminal_reward({"termination_reason": "red_failure", "time_s": 20.0}) > 10.0
