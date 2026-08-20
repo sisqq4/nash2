@@ -33,12 +33,59 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 1,2,3,4 --epi
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 1,2,3,4
 ```
 
+## 当前 normalized_v2 推荐命令
+
+以下命令均从 `v1/` 目录执行。新启动的训练会自动使用 `normalized_v2`，无需额外指定 schema；checkpoint
+会保存 schema，评估入口会自动校验，不能手工混用旧的 `legacy_v1` 输入。
+
+先做快速 smoke，确认环境进程、22 维联合观测、replay、更新和 checkpoint 全链路可运行：
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
+  --missiles 1,2,3,4 --episodes 8 --seed 42 --device cpu \
+  --parallel-envs 2 --batch-size 8 --updates-per-transition 0.25 \
+  --checkpoint-interval 8 --log-interval 2 --acmi-interval 0 \
+  --output outputs/blue_rl/smoke_normalized_v2
+```
+
+推荐的课程训练（默认课程完整长度为 7500 回合）：
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
+  --curriculum --episodes 7500 --seed 42 --device cuda:0 \
+  --parallel-envs 16 --env-worker-threads 1 \
+  --batch-size 256 --updates-per-transition 0.5 \
+  --checkpoint-interval 500 --log-interval 10 --acmi-interval 0 \
+  --output outputs/blue_rl/curriculum_normalized_v2
+```
+
+固定独立 seed 对最终 checkpoint 做 1v1～1v4 联合评估：
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
+  outputs/blue_rl/curriculum_normalized_v2/blue_rainbow.pt \
+  --missiles 1,2,3,4 --episodes 4000 --seed 10042 --device cuda:0 \
+  --parallel-envs 16 --env-worker-threads 1 \
+  --log-interval 100 --acmi-interval 0 \
+  --output outputs/blue_rl/eval_normalized_v2
+```
+
+代码回归测试和命令行检查：
+
+```bash
+PYTHONPATH=src pytest -q tests/test_blue_rl.py
+PYTHONPATH=src pytest -q tests/test_smoke.py tests/test_training_readiness.py
+PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --help
+PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl --help
+```
+
 ## 课程学习（可选，原训练方式不变）
 
-课程模式通过单独的 `--curriculum` 开关启用；未提供该开关时，所有既有参数、均匀场景抽样和单场景
-9/12/15/18 维网络行为完全不变。课程模式从第一回合起固定使用 `max_missiles=4`、18 维观测和 29 维
-动作，并为每次 reset/step 在 `info["missile_slot_mask"]` 提供四个显式有效位。mask 作为环境元数据而不拼入
-网络输入，避免将约定的 18 维改为 22 维；无效槽仍严格补零。因此旧 9 维 1v1 checkpoint 不能用于课程训练。
+课程模式通过单独的 `--curriculum` 开关启用。新训练统一使用版本化 `normalized_v2` 观测：蓝机水平位置置于
+相对原点、绝对高度除以 20 km、速度除以 2000 m/s、弹机相对位置除以 200 km，并在每个导弹槽后附加一个
+有效位。因此课程模式从第一回合起固定使用 `max_missiles=4`、22 维观测和 29 维动作；无效槽严格补零。
+旧训练环境接口仍默认 `legacy_v1`，评估和常规运行会根据 checkpoint 输入维度自动选用旧的 9/12/15/18 维
+schema 或新的 10/14/18/22 维 schema。旧 checkpoint 不会被静默解释为新输入。
 
 默认八阶段共 **7500** 回合（原建议表各行相加是 7500，而不是文字中的 8500），保留所有旧难度复习，
 并在每一新阶段前 500 回合线性改变抽样概率。若希望达到建议的 10,000–12,000 回合，应在完成默认课程后，

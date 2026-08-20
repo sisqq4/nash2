@@ -59,6 +59,7 @@ class RainbowNetwork(nn.Module):
 class RainbowDQNConfig:
     observation_dim: int
     action_dim: int
+    observation_schema: str = "legacy_v1"
     hidden_dim: int = 128
     learning_rate: float = 2.5e-4
     gamma: float = 0.999

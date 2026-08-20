@@ -19,6 +19,7 @@ class BlueEscapeEnvConfig:
     missile_count: int = 1
     max_missiles: int = 4
     pad_observation_to_max_missiles: bool = False
+    observation_schema: str = "legacy_v1"
     decision_interval_s: float = 0.1
     record_acmi: bool = True
     acmi_episode_interval: int = 1
@@ -40,6 +41,8 @@ class BlueEscapeEnvConfig:
     def validate(self, environment: EnvironmentConfig) -> None:
         if not 1 <= self.missile_count <= self.max_missiles <= 4:
             raise ValueError("blue training supports one to four missiles against one aircraft")
+        if self.observation_schema not in {"legacy_v1", "normalized_v2"}:
+            raise ValueError("observation_schema must be 'legacy_v1' or 'normalized_v2'")
         if (
             isinstance(self.acmi_episode_interval, bool)
             or not isinstance(self.acmi_episode_interval, (int, np.integer))
@@ -87,8 +90,8 @@ class BlueEscapeEnv:
         # Single-scenario runs retain the nash1.6 observation contract.  A
         # multi-scenario run pads missing missile slots to max_missiles so one
         # policy can consume every selected scenario.
-        self.observation_dim = 6 + (config.max_missiles if config.pad_observation_to_max_missiles
-                                    else config.missile_count) * 3
+        slots = config.max_missiles if config.pad_observation_to_max_missiles else config.missile_count
+        self.observation_dim = 6 + slots * (4 if config.observation_schema == "normalized_v2" else 3)
         self.action_dim = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G)
         self.recorder = AcmiRecorder(); self.episode = 0
         self._previous_potential: dict[str, float] = {}
@@ -298,7 +301,20 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         state = self.inner.state
         blue = state.blue[0]
-        # nash1.6 exposes kilometres and kilometres/second to the network.
+        if self.config.observation_schema == "normalized_v2":
+            # Versioned, dimensionless input.  Horizontal position is relative
+            # to the blue aircraft (altitude remains absolute because ground
+            # clearance matters).  A per-slot validity bit removes zero-padding
+            # ambiguity in mixed 1v1--1v4 training.
+            values = [0.0, blue.position_m[1] / 20000.0, 0.0,
+                      *(blue.velocity_mps / 2000.0)]
+            for red in state.red:
+                values.extend((red.position_m - blue.position_m) / 200000.0)
+                values.append(1.0)
+            if self.config.pad_observation_to_max_missiles:
+                values.extend([0.0] * (4 * (self.config.max_missiles - len(state.red))))
+            return np.asarray(values, dtype=np.float32)
+        # Legacy checkpoint contract: kilometres and kilometres/second.
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]
         for red in state.red:
             values.extend((red.position_m - blue.position_m) / 1000.0)

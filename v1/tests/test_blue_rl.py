@@ -77,6 +77,28 @@ def test_multi_scenario_observations_are_padded_to_shared_shape() -> None:
     assert info["missile_slot_mask"] == [True, False, False, False]
 
 
+def test_normalized_v2_observation_is_dimensionless_and_masks_padding() -> None:
+    cfg = short_config()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1, max_missiles=4, pad_observation_to_max_missiles=True,
+        observation_schema="normalized_v2", decision_interval_s=cfg.time_step_s,
+        record_acmi=False,
+    ))
+    observation, _ = env.reset(seed=1, missile_count=1)
+    assert observation.shape == (22,)
+    assert observation[0] == observation[2] == 0.0
+    assert 0.0 < observation[1] < 1.0
+    assert np.linalg.norm(observation[3:6]) < 1.0
+    assert observation[9] == 1.0
+    assert np.allclose(observation[10:], 0.0)
+
+    assert env.inner.state is not None
+    translated = observation.copy()
+    for entity in [*env.inner.state.red, *env.inner.state.blue]:
+        entity.position_m += np.array([50000.0, 0.0, 30000.0])
+    assert env._observation() == pytest.approx(translated)
+
+
 def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
     schedule = CurriculumSchedule()
     assert schedule.total_episodes == 7500

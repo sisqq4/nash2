@@ -34,6 +34,13 @@ class BlueRLController:
                 f"checkpoint expects {self.config.missile_count} missiles, got {len(state.red)}"
             )
         blue = state.blue[0]
+        if self.config.observation_schema == "normalized_v2":
+            values = [0.0, blue.position_m[1] / 20000.0, 0.0,
+                      *(blue.velocity_mps / 2000.0)]
+            for red in state.red:
+                values.extend((red.position_m - blue.position_m) / 200000.0)
+                values.append(1.0)
+            return np.asarray(values, dtype=np.float32)
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]
         for red in state.red:
             values.extend((red.position_m - blue.position_m) / 1000.0)
