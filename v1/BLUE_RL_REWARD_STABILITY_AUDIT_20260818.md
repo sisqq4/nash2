@@ -28,6 +28,7 @@
 新训练默认使用该 schema；`legacy_v1` 仍保留给旧 checkpoint，评估和常规运行按 checkpoint 输入维度自动选择，
 因此不会静默改变旧模型的输入语义。
 
+
 ### 2. 联合场景的零填充存在语义歧义（高风险）
 
 1v1～1v4 联训时，缺失来弹槽补三个零，但 `missile_slot_mask` 只存在于 `info`，没有输入 Rainbow 网络。
