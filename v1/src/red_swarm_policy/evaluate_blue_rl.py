@@ -12,7 +12,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from .blue_rl import BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent
+from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
+                      EvaluationShapingConfig, RainbowDQNAgent)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
 
@@ -32,6 +33,21 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Streaming progress path; defaults to OUTPUT/evaluation.jsonl")
     parser.add_argument("--acmi-interval", type=int, default=1,
                         help="Save one evaluation ACMI every N episodes; use 0 to disable ACMI output")
+    parser.add_argument("--mechanism-threat", action="store_true",
+                        help="Enable test-only short-horizon threat-relief scoring")
+    parser.add_argument("--mechanism-timing", action="store_true",
+                        help="Enable test-only P0/P1/P2 timing and phase scoring")
+    parser.add_argument("--mechanism-direction", action="store_true",
+                        help="Enable test-only LOS-normal escape-direction scoring")
+    parser.add_argument("--mechanism-overload", action="store_true",
+                        help="Enable test-only threat/energy-dependent overload scoring")
+    parser.add_argument("--mechanism-weight", type=float, default=0.35,
+                        help="Weight of each enabled normalized mechanism score")
+    for name in ("threat", "timing", "direction", "overload"):
+        parser.add_argument(f"--mechanism-{name}-weight", type=float, default=1.0,
+                            help=f"Relative {name} score weight before phase scheduling")
+    parser.add_argument("--mechanism-detail-log", action="store_true",
+                        help="Store per-decision Q vectors and mechanism scores for offline analysis")
     return parser
 
 
@@ -116,6 +132,14 @@ def main() -> int:
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "evaluation.jsonl"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
+    shaping_config = EvaluationShapingConfig(
+        threat=args.mechanism_threat, timing=args.mechanism_timing,
+        direction=args.mechanism_direction, overload=args.mechanism_overload,
+        weight=args.mechanism_weight, threat_weight=args.mechanism_threat_weight,
+        timing_weight=args.mechanism_timing_weight,
+        direction_weight=args.mechanism_direction_weight,
+        overload_weight=args.mechanism_overload_weight,
+    )
     agent = RainbowDQNAgent.load(args.checkpoint, args.device)
     agent.online.eval()
     for parameter in agent.online.parameters(): parameter.requires_grad_(False)
@@ -137,6 +161,7 @@ def main() -> int:
                                  pad_observation_to_max_missiles=len(missile_scenarios) > 1,
                                  observation_schema=observation_schema,
                                  decision_interval_s=args.decision_interval,
+                                 expose_evaluation_mechanism_state=True,
                                  acmi_episode_interval=args.acmi_interval,
                                  acmi_directory=str(output / "acmi"))
     observation_dim = normalized_dim if observation_schema == "normalized_v2" else legacy_dim
@@ -144,6 +169,10 @@ def main() -> int:
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
     pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
+    mechanism_states: dict[int, dict[str, object]] = {}
+    shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
+    mechanism_interventions: dict[int, int] = {}; mechanism_diagnostics: dict[int, dict[str, object]] = {}
+    mechanism_traces: dict[int, list[dict[str, object]]] = {}
     decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}; initializations = {}
     reward_component_sums: dict[int, Counter[str]] = {}; reward_diagnostic_sums: dict[int, Counter[str]] = {}
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
@@ -158,6 +187,9 @@ def main() -> int:
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
+           "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
+                                     "direction": shaping_config.direction, "overload": shaping_config.overload,
+                                     "weight": shaping_config.weight},
            "checkpoint_optimizer_updates": agent.optimizer_updates,
            "checkpoint_target_updates": agent.target_updates}, jsonl_path)
     with BlueProcessEnvironmentPool(environment_config, config, pool_size,
@@ -168,18 +200,33 @@ def main() -> int:
             assignments[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
             episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
+            mechanism_interventions[worker] = 0; shapers[worker].reset()
+            mechanism_traces[worker] = []
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
         for worker, (observation, reset_info) in pool.reset(assignments).items():
             observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+            mechanism_states[worker] = reset_info["mechanism_state"]
         while observations:
             workers = sorted(observations)
+            observation_batch = np.stack([observations[w] for w in workers])
             with torch.inference_mode():
-                actions = agent.select_actions(np.stack([observations[w] for w in workers]), evaluation=True)
+                if shaping_config.enabled:
+                    q_values = agent.expected_action_values(observation_batch)
+                    selected = [shapers[w].select(q, mechanism_states[w])
+                                for w, q in zip(workers, q_values)]
+                    actions = np.asarray([item[0] for item in selected], dtype=np.int64)
+                    for worker, (_, diagnostic) in zip(workers, selected):
+                        mechanism_diagnostics[worker] = diagnostic
+                        mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
+                        mechanism_traces[worker].append(diagnostic)
+                else:
+                    actions = agent.select_actions(observation_batch, evaluation=True)
             results = pool.step({worker: int(action) for worker, action in zip(workers, actions)})
             vector_iterations += 1
             resets = {}
             for worker, action in zip(workers, actions):
                 result = results[worker]; rewards[worker] += result.reward; observations[worker] = result.observation
+                mechanism_states[worker] = dict(result.info["mechanism_state"])
                 decisions[worker] += 1; action_counts[worker][int(action)] += 1
                 for name, value in dict(result.info.get("reward_components", {})).items():
                     reward_component_sums[worker][str(name)] += float(value)
@@ -199,20 +246,44 @@ def main() -> int:
                            "reward_diagnostics_mean": {
                                name: value / decisions[worker]
                                for name, value in reward_diagnostic_sums[worker].items()
-                           }}
+                           },
+                           "mechanism": {"enabled": shaping_config.enabled,
+                                         "interventions": mechanism_interventions[worker],
+                                         "intervention_rate": mechanism_interventions[worker] / decisions[worker],
+                                         "phase_switches": sum(bool(item.get("phase_changed"))
+                                                               for item in mechanism_traces[worker]),
+                                         "main_threat_switches": sum(
+                                             left.get("main_threat_slot") != right.get("main_threat_slot")
+                                             for left, right in zip(mechanism_traces[worker],
+                                                                    mechanism_traces[worker][1:])),
+                                         "peak_total_threat": max(
+                                             (float(item.get("total_threat", 0.0))
+                                              for item in mechanism_traces[worker]), default=0.0),
+                                         "minimum_safe_corridor": min(
+                                             (float(item.get("W_safe", 1.0))
+                                              for item in mechanism_traces[worker]), default=1.0),
+                                         "last": mechanism_diagnostics.get(worker, {}),
+                                         **({"trace": mechanism_traces[worker]}
+                                            if args.mechanism_detail_log else {})}}
                     rows.append(row); window_rows.append(row); completed += 1
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
                         action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
+                        mechanism_interventions[worker] = 0; mechanism_diagnostics.pop(worker, None)
+                        mechanism_traces[worker] = []
+                        shapers[worker].reset()
                         reward_diagnostic_sums[worker] = Counter(); next_episode += 1
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker); rewards.pop(worker)
                         decisions.pop(worker); action_counts.pop(worker); initializations.pop(worker)
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
+                        mechanism_states.pop(worker); mechanism_interventions.pop(worker)
+                        mechanism_traces.pop(worker)
             if resets:
                 for worker, (observation, reset_info) in pool.reset(resets).items():
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+                    mechanism_states[worker] = reset_info["mechanism_state"]
             if completed >= next_log or (completed == args.episodes and window_rows):
                 now = time.monotonic(); window_rewards = [float(row["reward"]) for row in window_rows]
                 misses = [float(row["miss_distance_m"]) for row in window_rows]
@@ -262,6 +333,9 @@ def main() -> int:
                "by_scenario": by_scenario, "parallel_envs": pool_size,
                "inference_batch_size": pool_size,
                "evaluation_only": True, "learner_state_unchanged": True,
+               "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
+                                         "direction": shaping_config.direction, "overload": shaping_config.overload,
+                                         "weight": shaping_config.weight},
                "training_updates_performed": False, "environment_transitions_recorded": 0,
                "optimizer_updates_during_evaluation": 0, "target_updates_during_evaluation": 0,
                "replay_transitions_added": 0,
