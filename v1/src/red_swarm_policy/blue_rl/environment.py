@@ -24,6 +24,7 @@ class BlueEscapeEnvConfig:
     record_acmi: bool = True
     acmi_episode_interval: int = 1
     acmi_directory: str = "outputs/blue_rl/acmi"
+    expose_evaluation_mechanism_state: bool = False
     terminal_success_reward: float = 10.0
     terminal_killed_reward: float = -10.0
     terminal_timeout_reward: float = 2.0
@@ -120,12 +121,33 @@ class BlueEscapeEnv:
         if self._record_current_episode:
             self.recorder.record(self.inner.state)
         self._previous_potential = self._threat_potential()
-        return self._observation(), {
+        info = {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
         }
+        if self.config.expose_evaluation_mechanism_state:
+            info["mechanism_state"] = self._mechanism_snapshot()
+        return self._observation(), info
+
+    def _mechanism_snapshot(self) -> dict[str, object]:
+        """Expose physical state to the optional evaluation-only action shaper."""
+        assert self.inner.state is not None
+        blue = self.inner.state.blue[0]
+        return {"blue_position_m": blue.position_m.tolist(),
+                "blue_velocity_mps": blue.velocity_mps.tolist(),
+                "time_s": float(self.inner.state.time_s),
+                "red_positions_m": [red.position_m.tolist() for red in self.inner.state.red],
+                "red_velocities_mps": [red.velocity_mps.tolist() for red in self.inner.state.red],
+                "red_alive": [bool(red.alive) for red in self.inner.state.red],
+                "red_energy": [float(red.energy) for red in self.inner.state.red],
+                "red_guidance_modes": [red.guidance_mode for red in self.inner.state.red],
+                "min_altitude_m": self.environment_config.aircraft.min_altitude_m,
+                "max_altitude_m": self.environment_config.aircraft.max_altitude_m,
+                "min_speed_mps": self.environment_config.aircraft.min_speed_mps,
+                "max_speed_mps": self.environment_config.aircraft.max_speed_mps,
+                "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g}
 
     def _initialization_snapshot(self) -> dict[str, object]:
         """Return a JSON-safe, immutable description of the sampled scenario."""
@@ -213,6 +235,8 @@ class BlueEscapeEnv:
                 "measured_potential_after": float(measured_potential["total"]),
             },
         })
+        if self.config.expose_evaluation_mechanism_state:
+            info["mechanism_state"] = self._mechanism_snapshot()
         if result.done:
             info["red_loss_reasons"] = [item.loss_reason or "unknown" for item in self.inner.state.red]
         if result.done and self._record_current_episode:
