@@ -101,6 +101,17 @@ class RainbowDQNAgent:
     def select_action(self, observation: np.ndarray, *, evaluation: bool = False) -> int:
         return int(self.select_actions(np.asarray(observation)[None], evaluation=evaluation)[0])
 
+    def expected_action_values(self, observations: np.ndarray) -> np.ndarray:
+        """Return all C51 expectations for deterministic evaluation arbitration."""
+        array = np.asarray(observations, dtype=np.float32)
+        if array.ndim == 1: array = array[None, :]
+        if array.ndim != 2 or array.shape[1] != self.config.observation_dim:
+            raise ValueError(f"observations must have shape [batch, {self.config.observation_dim}]")
+        self.online.eval()
+        with torch.inference_mode():
+            tensor = torch.as_tensor(array, dtype=torch.float32, device=self.device)
+            return ((self.online(tensor).softmax(-1) * self.support).sum(-1)).cpu().numpy()
+
     def select_actions(self, observations: np.ndarray, *, evaluation: bool = False) -> np.ndarray:
         """Select a batch of actions in one device call for vector environments."""
         values = np.asarray(observations, dtype=np.float32)

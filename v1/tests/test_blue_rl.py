@@ -10,6 +10,8 @@ from red_swarm_policy.blue_rl import (
     BlueEscapeEnvConfig,
     BlueProcessEnvironmentPool,
     BlueRLController,
+    EvaluationActionShaper,
+    EvaluationShapingConfig,
     RainbowDQNAgent,
     RainbowDQNConfig,
 )
@@ -124,6 +126,8 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     args = build_evaluation_parser().parse_args(["checkpoint.pt"])
     assert args.log_interval == 10
     assert args.jsonl_path is None
+    assert not any((args.mechanism_threat, args.mechanism_timing,
+                    args.mechanism_direction, args.mechanism_overload))
 
     path = tmp_path / "evaluation.jsonl"
     emit_evaluation_event({"event": "evaluation_progress", "completed_episodes": 10}, path)
@@ -131,6 +135,65 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     expected = '{"event": "evaluation_progress", "completed_episodes": 10}'
     assert capsys.readouterr().out.strip() == expected
     assert path.read_text(encoding="utf-8") == expected + "\n"
+
+
+def test_evaluation_mechanisms_are_independent_and_deterministic() -> None:
+    snapshot = {"blue_position_m": [0.0, 9000.0, 0.0],
+                "blue_velocity_mps": [300.0, 0.0, 0.0],
+                "red_positions_m": [[10000.0, 9000.0, 0.0]],
+                "red_velocities_mps": [[-500.0, 0.0, 0.0]], "red_alive": [True],
+                "min_altitude_m": 8000.0}
+    q_values = np.zeros(29)
+    assert EvaluationActionShaper(EvaluationShapingConfig()).select(q_values, snapshot)[0] == 0
+    shaper = EvaluationActionShaper(EvaluationShapingConfig(direction=True))
+    first, diagnostic = shaper.select(q_values, snapshot)
+    shaper.reset(); second, _ = shaper.select(q_values, snapshot)
+    assert first == second and first != 0
+    assert diagnostic["active_scores"] == ["direction"]
+
+
+def test_evaluation_safety_mask_prevents_low_altitude_descent() -> None:
+    snapshot = {"blue_position_m": [0.0, 8100.0, 0.0],
+                "blue_velocity_mps": [300.0, 0.0, 0.0],
+                "red_positions_m": [[10000.0, 8100.0, 0.0]],
+                "red_velocities_mps": [[-500.0, 0.0, 0.0]], "red_alive": [True],
+                "min_altitude_m": 8000.0}
+    q_values = np.zeros(29); q_values[16] = 100.0
+    action, _ = EvaluationActionShaper(EvaluationShapingConfig(threat=True)).select(q_values, snapshot)
+    assert action != 16
+
+
+def test_evaluation_shield_respects_low_mobility_platform() -> None:
+    snapshot = {"blue_position_m": [0.0, 9000.0, 0.0],
+                "blue_velocity_mps": [300.0, 0.0, 0.0],
+                "red_positions_m": [[10000.0, 9000.0, 0.0]],
+                "red_velocities_mps": [[-500.0, 0.0, 0.0]], "red_alive": [True],
+                "min_altitude_m": 8000.0, "max_altitude_m": 12000.0,
+                "min_speed_mps": 80.0, "max_speed_mps": 200.0,
+                "max_load_factor_g": 3.0, "time_s": 1.0}
+    q_values = np.zeros(29); q_values[13] = 100.0
+    action, diagnostic = EvaluationActionShaper(
+        EvaluationShapingConfig(overload=True)
+    ).select(q_values, snapshot)
+    assert action != 13
+    assert diagnostic["safe_action_count"] < 29
+    assert "maximum_load" in diagnostic["hard_mask_reasons"]
+
+
+def test_evaluation_nan_uses_deterministic_fallback() -> None:
+    snapshot = {"blue_position_m": [0.0, 9000.0, 0.0],
+                "blue_velocity_mps": [300.0, 0.0, 0.0],
+                "red_positions_m": [[10000.0, 9000.0, 0.0]],
+                "red_velocities_mps": [[-500.0, 0.0, 0.0]], "red_alive": [True],
+                "min_altitude_m": 8000.0, "max_altitude_m": 12000.0,
+                "min_speed_mps": 100.0, "max_speed_mps": 600.0,
+                "max_load_factor_g": 9.0, "time_s": 1.0}
+    action, diagnostic = EvaluationActionShaper(
+        EvaluationShapingConfig(threat=True)
+    ).select(np.full(29, np.nan), snapshot)
+    assert 0 <= action < 29
+    assert diagnostic["fallback_reason"] == "network_nan"
+    assert all(value is None or np.isfinite(value) for value in diagnostic["q_fuse"])
 
 
 def test_evaluation_final_statistics_include_distributions() -> None:
