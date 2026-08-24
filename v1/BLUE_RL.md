@@ -20,6 +20,23 @@
 `--mechanism-detail-log` 会额外保存每个决策周期的 29 维原始/融合 Q 值和各评分通道，适合
 复盘介入原因，但会显著增加 JSON 文件大小。
 
+消融实验可用批处理入口一次顺序执行，并在输出根目录写入可恢复审计的
+`ablation_manifest.json`。`core` 套件包含 Rainbow-only、四个单项、威胁+时机、
+威胁+时机+方向和完整融合共 8 组；`full-factorial` 会运行全部 16 种开关组合：
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
+  outputs/blue_rl/curriculum_normalized_v2/blue_rainbow.pt \
+  --suite core --seeds 10042,20042,30042 \
+  --missiles 1,2,3,4 --episodes 400 --device cuda:0 \
+  --parallel-envs 16 --acmi-interval 0 \
+  --output outputs/blue_rl/ablations/core
+```
+
+先加 `--dry-run` 可只生成并打印全部命令；默认遇到首个失败即停止，加入
+`--continue-on-error` 后会继续其余组合，并在 manifest 中记录每次运行的返回码。
+
+
 `red_swarm_policy.blue_rl` 将 nash1.6 的离散蓝方逃逸强化学习结构移植到 v1：采用 29 个 v1
 蓝机动作、Rainbow DQN（Dueling、NoisyNet、C51、PER、n-step、Double DQN）并提供固定长度的
 单机/1–4 枚来弹观测。单场景观测与 nash1.6 一致，为蓝机绝对位置、速度和每枚红弹相对位置；
