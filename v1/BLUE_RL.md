@@ -36,6 +36,7 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 先加 `--dry-run` 可只生成并打印全部命令；默认遇到首个失败即停止，加入
 `--continue-on-error` 后会继续其余组合，并在 manifest 中记录每次运行的返回码。
 
+
 `red_swarm_policy.blue_rl` 将 nash1.6 的离散蓝方逃逸强化学习结构移植到 v1：采用 29 个 v1
 蓝机动作、Rainbow DQN（Dueling、NoisyNet、C51、PER、n-step、Double DQN）并提供固定长度的
 单机/1–4 枚来弹观测。单场景观测与 nash1.6 一致，为蓝机绝对位置、速度和每枚红弹相对位置；
