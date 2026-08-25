@@ -1,5 +1,27 @@
 # 蓝方强化学习子系统
 
+## 双方均不学习的规则基线
+
+蓝方测试新增独立基线场景，并通过与 Rainbow 测试相同的 `BlueEscapeEnv` 适配层运行：蓝方使用 v1 现有的
+`BlueEvasionController(BlueEvasionRuleMachine)`，红方使用容量约束的规则分配与
+零残差比例导引（PN 系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
+回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。入口独立于原有
+蓝方训练、Rainbow 评估和机理消融流程，因此不会改变已有训练及测试设置。
+
+以下命令在 1～4 枚来弹场景各运行 100 回合，并输出逐回合 CSV 和汇总 JSON；汇总配置会显式
+记录 `baseline=true`、双方学习开关均为 `false`，以及双方 checkpoint 均为空：
+
+```bash
+PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rule_baseline \
+  --missiles 1,2,3,4 --episodes-per-scenario 100 \
+  --seed-start 20271000 --decision-interval 0.1 \
+  --output outputs/blue_rl/rule_baseline/holdout_100_seed_20271000
+```
+
+与智能策略比较时应使用相同的来弹数量、每场景回合数和连续 seed 起点，以确保初始化样本配对；
+基线结果分别写入 `blue_rule_baseline_summary.json` 和
+`blue_rule_baseline_trials.csv`。
+
 ## 仅测试启用的机理塑形与消融
 
 `evaluate_blue_rl` 可在完整 29 维 C51 动作价值上独立启用四类物理评分：
