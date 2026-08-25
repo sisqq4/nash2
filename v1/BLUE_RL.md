@@ -11,6 +11,7 @@
 以下命令在 1～4 枚来弹场景各运行 100 回合，并输出逐回合 CSV 和汇总 JSON；汇总配置会显式
 记录 `baseline=true`、双方学习开关均为 `false`，以及双方 checkpoint 均为空：
 
+
 先进入仓库的 `v1` 目录（PowerShell 使用 `cd v1`），再执行：
 
 ```bash
@@ -25,6 +26,7 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rule_baseline \
 `baseline_start`；默认每完成一个回合输出一条 `baseline_progress`（可用
 `--log-interval N` 调整频率），结束时输出 `baseline_complete`。正式汇总 JSON 和逐回合
 CSV 在全部回合完成后写入。
+
 
 与智能策略比较时应使用相同的来弹数量、每场景回合数和连续 seed 起点，以确保初始化样本配对；
 基线结果分别写入 `blue_rule_baseline_summary.json` 和
