@@ -78,8 +78,13 @@ def _json_safe_csv_value(value: object) -> object:
 def _write_trials(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         raise ValueError("cannot write an empty baseline")
+    # Episode metadata is intentionally sparse: for example, ``acmi_path`` is
+    # only present on episodes selected by ``acmi_episode_interval``.  Build the
+    # header from every row so later optional fields are not rejected by
+    # DictWriter merely because the first episode did not contain them.
+    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows({key: _json_safe_csv_value(value) for key, value in row.items()}
                          for row in rows)
