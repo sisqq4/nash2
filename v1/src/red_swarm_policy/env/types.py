@@ -67,6 +67,16 @@ class AircraftConfig:
     max_speed_mps: float = 600.0
     min_altitude_m: float = 8000.0
     max_altitude_m: float = 12000.0
+    flight_path_soft_down_deg: float = -35.0
+    flight_path_soft_up_deg: float = 25.0
+    flight_path_hard_down_deg: float = -55.0
+    flight_path_hard_up_deg: float = 45.0
+    horizontal_speed_soft_mps: float = 180.0
+    horizontal_speed_hard_mps: float = 130.0
+    altitude_recovery_margin_m: float = 1250.0
+    axial_load_rate_gps: float = 5.0
+    normal_load_rate_gps: float = 15.0
+    bank_rate_deg_s: float = 90.0
 
     def validate(self) -> None:
         if not _all_finite(
@@ -75,6 +85,16 @@ class AircraftConfig:
             self.max_speed_mps,
             self.min_altitude_m,
             self.max_altitude_m,
+            self.flight_path_soft_down_deg,
+            self.flight_path_soft_up_deg,
+            self.flight_path_hard_down_deg,
+            self.flight_path_hard_up_deg,
+            self.horizontal_speed_soft_mps,
+            self.horizontal_speed_hard_mps,
+            self.altitude_recovery_margin_m,
+            self.axial_load_rate_gps,
+            self.normal_load_rate_gps,
+            self.bank_rate_deg_s,
         ):
             raise ValueError("aircraft scalar parameters must be finite")
         if self.max_load_factor_g <= 0.0:
@@ -83,6 +103,16 @@ class AircraftConfig:
             raise ValueError("aircraft speed limits are invalid")
         if self.min_altitude_m < 0.0 or self.min_altitude_m >= self.max_altitude_m:
             raise ValueError("aircraft altitude limits are invalid")
+        if not self.flight_path_hard_down_deg < self.flight_path_soft_down_deg < 0.0:
+            raise ValueError("descending flight-path limits are invalid")
+        if not 0.0 < self.flight_path_soft_up_deg < self.flight_path_hard_up_deg < 90.0:
+            raise ValueError("climbing flight-path limits are invalid")
+        if not 0.0 < self.horizontal_speed_hard_mps < self.horizontal_speed_soft_mps:
+            raise ValueError("horizontal speed protection limits are invalid")
+        if self.altitude_recovery_margin_m <= 0.0 or 2.0 * self.altitude_recovery_margin_m >= self.max_altitude_m - self.min_altitude_m:
+            raise ValueError("altitude recovery margin is invalid")
+        if min(self.axial_load_rate_gps, self.normal_load_rate_gps, self.bank_rate_deg_s) <= 0.0:
+            raise ValueError("aircraft command rates must be positive")
 
 
 @dataclass(frozen=True)
@@ -536,6 +566,8 @@ class ThreeDoFState:
     bias_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     gravity_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     final_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    aircraft_executed_load_body_g: np.ndarray = field(default_factory=lambda: np.array([0.0, 1.0, 0.0]))
+    aircraft_executed_bank_rad: float = 0.0
 
     def copy(self) -> "ThreeDoFState":
         return ThreeDoFState(
@@ -558,6 +590,8 @@ class ThreeDoFState:
             target_estimate_position_m=np.asarray(self.target_estimate_position_m, dtype=np.float64).copy(),
             target_estimate_velocity_mps=np.asarray(self.target_estimate_velocity_mps, dtype=np.float64).copy(),
             target_estimate_age_s=float(self.target_estimate_age_s),
+            aircraft_executed_load_body_g=np.asarray(self.aircraft_executed_load_body_g, dtype=np.float64).copy(),
+            aircraft_executed_bank_rad=float(self.aircraft_executed_bank_rad),
             boost_initial_flight_path_angle_rad=float(self.boost_initial_flight_path_angle_rad),
             guidance_bias=np.asarray(self.guidance_bias, dtype=np.float64).copy(),
             pn_load_body_g=np.asarray(self.pn_load_body_g, dtype=np.float64).copy(),

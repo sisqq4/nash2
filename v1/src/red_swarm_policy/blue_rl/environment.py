@@ -147,7 +147,11 @@ class BlueEscapeEnv:
                 "max_altitude_m": self.environment_config.aircraft.max_altitude_m,
                 "min_speed_mps": self.environment_config.aircraft.min_speed_mps,
                 "max_speed_mps": self.environment_config.aircraft.max_speed_mps,
-                "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g}
+                "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g,
+                "horizontal_speed_hard_mps": self.environment_config.aircraft.horizontal_speed_hard_mps,
+                "flight_path_hard_down_deg": self.environment_config.aircraft.flight_path_hard_down_deg,
+                "flight_path_hard_up_deg": self.environment_config.aircraft.flight_path_hard_up_deg,
+                "altitude_recovery_margin_m": self.environment_config.aircraft.altitude_recovery_margin_m}
 
     def _initialization_snapshot(self) -> dict[str, object]:
         """Return a JSON-safe, immutable description of the sampled scenario."""
@@ -234,6 +238,7 @@ class BlueEscapeEnv:
                 "potential_after": float(potential_after),
                 "measured_potential_after": float(measured_potential["total"]),
             },
+            "blue_flight_envelope": self._flight_envelope_snapshot(),
         })
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -306,6 +311,30 @@ class BlueEscapeEnv:
             "total": sum(components.values()),
             "range_blend_weight": float(np.dot(weights, near_gates)),
             "softmin_threat_distance": float(softmin_distance),
+        }
+
+    def _flight_envelope_snapshot(self) -> dict[str, float | bool]:
+        assert self.inner.state is not None
+        blue = self.inner.state.blue[0]
+        velocity = np.asarray(blue.velocity_mps, dtype=np.float64)
+        horizontal_speed = float(np.hypot(velocity[0], velocity[2]))
+        gamma_deg = math.degrees(math.atan2(float(velocity[1]), max(horizontal_speed, 1.0e-9)))
+        aircraft = self.environment_config.aircraft
+        return {
+            "flight_path_angle_deg": float(gamma_deg),
+            "horizontal_speed_mps": horizontal_speed,
+            "lower_altitude_margin_m": float(blue.position_m[1] - aircraft.min_altitude_m),
+            "upper_altitude_margin_m": float(aircraft.max_altitude_m - blue.position_m[1]),
+            "executed_axial_load_g": float(blue.aircraft_executed_load_body_g[0]),
+            "executed_normal_load_g": float(blue.aircraft_executed_load_body_g[1]),
+            "executed_bank_deg": math.degrees(float(blue.aircraft_executed_bank_rad)),
+            "protection_active": bool(
+                gamma_deg > aircraft.flight_path_soft_up_deg
+                or gamma_deg < aircraft.flight_path_soft_down_deg
+                or horizontal_speed < aircraft.horizontal_speed_soft_mps
+                or blue.position_m[1] < aircraft.min_altitude_m + aircraft.altitude_recovery_margin_m
+                or blue.position_m[1] > aircraft.max_altitude_m - aircraft.altitude_recovery_margin_m
+            ),
         }
 
     def _terminal_reward(self, info: dict[str, object]) -> float:

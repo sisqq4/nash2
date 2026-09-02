@@ -210,17 +210,16 @@ def main() -> int:
             workers = sorted(observations)
             observation_batch = np.stack([observations[w] for w in workers])
             with torch.inference_mode():
-                if shaping_config.enabled:
-                    q_values = agent.expected_action_values(observation_batch)
-                    selected = [shapers[w].select(q, mechanism_states[w])
-                                for w, q in zip(workers, q_values)]
-                    actions = np.asarray([item[0] for item in selected], dtype=np.int64)
-                    for worker, (_, diagnostic) in zip(workers, selected):
-                        mechanism_diagnostics[worker] = diagnostic
-                        mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
-                        mechanism_traces[worker].append(diagnostic)
-                else:
-                    actions = agent.select_actions(observation_batch, evaluation=True)
+                # The hard safety mask is part of evaluation even when all
+                # optional tactical shaping channels are disabled.
+                q_values = agent.expected_action_values(observation_batch)
+                selected = [shapers[w].select(q, mechanism_states[w])
+                            for w, q in zip(workers, q_values)]
+                actions = np.asarray([item[0] for item in selected], dtype=np.int64)
+                for worker, (_, diagnostic) in zip(workers, selected):
+                    mechanism_diagnostics[worker] = diagnostic
+                    mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
+                    mechanism_traces[worker].append(diagnostic)
             results = pool.step({worker: int(action) for worker, action in zip(workers, actions)})
             vector_iterations += 1
             resets = {}

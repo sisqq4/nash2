@@ -162,6 +162,38 @@ def test_standard_atmosphere_and_mach_drag_table_are_physical() -> None:
     assert np.linalg.norm(drag) == pytest.approx(expected_drag)
 
 
+def test_blue_aircraft_command_rates_limit_execution() -> None:
+    config = EnvironmentConfig(scenario=ScenarioConfig(red_count=1, blue_count=1))
+    physics = ThreeDoFPhysicsLayer(config)
+    aircraft = _state((0.0, 10000.0, 0.0), (350.0, 0.0, 0.0), 1.0)
+
+    first = physics._step_aircraft(aircraft, np.array([2.0, 9.0, math.pi]))
+    assert first.aircraft_executed_load_body_g[0] == pytest.approx(
+        config.aircraft.axial_load_rate_gps * config.time_step_s
+    )
+    assert first.aircraft_executed_load_body_g[1] == pytest.approx(
+        1.0 + config.aircraft.normal_load_rate_gps * config.time_step_s
+    )
+    assert math.degrees(first.aircraft_executed_bank_rad) == pytest.approx(
+        config.aircraft.bank_rate_deg_s * config.time_step_s
+    )
+
+def test_blue_aircraft_hard_flight_path_envelope_commands_recovery() -> None:
+    config = EnvironmentConfig(scenario=ScenarioConfig(red_count=1, blue_count=1))
+    physics = ThreeDoFPhysicsLayer(config)
+    gamma = math.radians(50.0)
+    speed = 350.0
+    aircraft = _state(
+        (0.0, 10000.0, 0.0),
+        (speed * math.cos(gamma), speed * math.sin(gamma), 0.0),
+        1.0,
+    )
+    before = math.atan2(aircraft.velocity_mps[1], aircraft.velocity_mps[0])
+    after_state = physics._step_aircraft(aircraft, np.array([0.0, 9.0, 0.0]))
+    after = math.atan2(after_state.velocity_mps[1], after_state.velocity_mps[0])
+    assert after < before
+
+
 def test_boost_climb_reaches_20_degrees_at_2_seconds_and_holds_to_entry() -> None:
     config = EnvironmentConfig(scenario=ScenarioConfig(red_count=1, blue_count=1))
     env = RedBlueEngagementEnv(config, device="cpu", record_replay=False)
