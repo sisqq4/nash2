@@ -231,13 +231,19 @@ class EvaluationActionShaper:
         predicted_p = blue_p + blue_v * horizon + 0.5 * accelerations * horizon ** 2
         predicted_v = blue_v + accelerations * self.config.prediction_s
         speeds = np.linalg.norm(predicted_v, axis=1)
+        horizontal_speeds = np.hypot(predicted_v[:, 0], predicted_v[:, 2])
+        flight_path_angles = np.degrees(np.arctan2(predicted_v[:, 1], np.maximum(horizontal_speeds, _EPS)))
+        altitude_margin = float(snapshot.get("altitude_recovery_margin_m", 0.0))
         loads = np.linalg.norm(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[:, :2], axis=1)
         safe = loads <= float(snapshot.get("max_load_factor_g", 9.0)) + 1.0e-9
         reasons = []
         checks = ((speeds >= float(snapshot.get("min_speed_mps", 100.0)), "minimum_speed"),
                   (speeds <= float(snapshot.get("max_speed_mps", 600.0)), "maximum_speed"),
-                  (predicted_p[:, 1] >= float(snapshot.get("min_altitude_m", 0.0)), "minimum_altitude"),
-                  (predicted_p[:, 1] <= float(snapshot.get("max_altitude_m", 1.0e9)), "maximum_altitude"))
+                  (horizontal_speeds >= float(snapshot.get("horizontal_speed_hard_mps", 0.0)), "horizontal_speed"),
+                  (flight_path_angles >= float(snapshot.get("flight_path_hard_down_deg", -90.0)), "flight_path_down"),
+                  (flight_path_angles <= float(snapshot.get("flight_path_hard_up_deg", 90.0)), "flight_path_up"),
+                  (predicted_p[:, 1] >= float(snapshot.get("min_altitude_m", 0.0)) + altitude_margin, "lower_altitude_recovery"),
+                  (predicted_p[:, 1] <= float(snapshot.get("max_altitude_m", 1.0e9)) - altitude_margin, "upper_altitude_recovery"))
         if not np.all(safe): reasons.append("maximum_load")
         for condition, name in checks:
             if np.any(safe & ~condition): reasons.append(name)

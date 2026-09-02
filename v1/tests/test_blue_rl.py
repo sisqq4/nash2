@@ -159,7 +159,7 @@ def test_evaluation_safety_mask_prevents_low_altitude_descent() -> None:
                 "red_velocities_mps": [[-500.0, 0.0, 0.0]], "red_alive": [True],
                 "min_altitude_m": 8000.0}
     q_values = np.zeros(29); q_values[16] = 100.0
-    action, _ = EvaluationActionShaper(EvaluationShapingConfig(threat=True)).select(q_values, snapshot)
+    action, _ = EvaluationActionShaper(EvaluationShapingConfig()).select(q_values, snapshot)
     assert action != 16
 
 

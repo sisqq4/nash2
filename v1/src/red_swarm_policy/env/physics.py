@@ -55,12 +55,13 @@ class ThreeDoFPhysicsLayer:
         return next_state
 
     def _step_aircraft(self, state: ThreeDoFState, command: np.ndarray) -> ThreeDoFState:
-        axial_load_g, normal_load_g, bank_rad = np.asarray(command, dtype=np.float64)
+        axial_load_g, normal_load_g, bank_rad = self._shape_aircraft_command(state, command)
         frame = velocity_local_frame(state.velocity_mps)
         normal_direction = math.cos(bank_rad) * frame[:, 1] - math.sin(bank_rad) * frame[:, 2]
         acceleration = axial_load_g * G0 * frame[:, 0]
         acceleration += normal_load_g * G0 * normal_direction
         acceleration += np.array([0.0, -G0, 0.0], dtype=np.float64)
+        acceleration = self._protect_aircraft_envelope(state, acceleration)
         next_state = self._integrate(state, acceleration, mass_flow_rate_kg_s=0.0)
         speed = float(np.clip(norm(next_state.velocity_mps), self.config.aircraft.min_speed_mps, self.config.aircraft.max_speed_mps))
         next_state.velocity_mps = unit(next_state.velocity_mps, frame[:, 0]) * speed
@@ -71,7 +72,64 @@ class ThreeDoFPhysicsLayer:
             next_state.position_m[UP_AXIS] = self.config.aircraft.max_altitude_m
             next_state.velocity_mps[UP_AXIS] = min(0.0, next_state.velocity_mps[UP_AXIS])
         next_state.energy = float(np.clip(speed / self.config.aircraft.max_speed_mps, 0.0, 1.0))
+        next_state.aircraft_executed_load_body_g = np.array(
+            [axial_load_g, normal_load_g, bank_rad], dtype=np.float64
+        )
+        next_state.aircraft_executed_bank_rad = bank_rad
         return next_state
+
+    def _shape_aircraft_command(self, state: ThreeDoFState, command: np.ndarray) -> tuple[float, float, float]:
+        """Apply actuator rate and platform load limits before integration."""
+        requested = np.asarray(command, dtype=np.float64)
+        if requested.shape != (3,) or not np.all(np.isfinite(requested)):
+            raise ValueError("aircraft load command must contain three finite values")
+        cfg, dt = self.config.aircraft, self.config.time_step_s
+        previous = np.asarray(state.aircraft_executed_load_body_g, dtype=np.float64)
+        axial = float(previous[0] + np.clip(requested[0] - previous[0], -cfg.axial_load_rate_gps * dt, cfg.axial_load_rate_gps * dt))
+        normal = float(previous[1] + np.clip(requested[1] - previous[1], -cfg.normal_load_rate_gps * dt, cfg.normal_load_rate_gps * dt))
+        bank_delta = (float(requested[2]) - state.aircraft_executed_bank_rad + math.pi) % (2.0 * math.pi) - math.pi
+        bank = state.aircraft_executed_bank_rad + float(np.clip(bank_delta, -math.radians(cfg.bank_rate_deg_s) * dt, math.radians(cfg.bank_rate_deg_s) * dt))
+        return axial, float(np.clip(normal, -cfg.max_load_factor_g, cfg.max_load_factor_g)), bank
+
+    def _protect_aircraft_envelope(self, state: ThreeDoFState, acceleration: np.ndarray) -> np.ndarray:
+        """Smoothly remove unsafe pitch acceleration and command energy recovery."""
+        cfg = self.config.aircraft
+        velocity = np.asarray(state.velocity_mps, dtype=np.float64)
+        horizontal = float(np.hypot(velocity[0], velocity[2]))
+        gamma = math.degrees(math.atan2(float(velocity[1]), max(horizontal, EPS)))
+        horizontal_hat = (
+            np.array([velocity[0], 0.0, velocity[2]]) / horizontal
+            if horizontal > EPS
+            else np.array([1.0, 0.0, 0.0])
+        )
+        # Direction of increasing flight-path angle, orthogonal to velocity.
+        pitch_up = unit(np.array([
+            -velocity[1] * horizontal_hat[0], horizontal, -velocity[1] * horizontal_hat[2]
+        ]), np.array([0.0, 1.0, 0.0]))
+        result = np.asarray(acceleration, dtype=np.float64).copy()
+
+        upper = (gamma - cfg.flight_path_soft_up_deg) / (cfg.flight_path_hard_up_deg - cfg.flight_path_soft_up_deg)
+        lower = (cfg.flight_path_soft_down_deg - gamma) / (cfg.flight_path_soft_down_deg - cfg.flight_path_hard_down_deg)
+        altitude = float(state.position_m[UP_AXIS])
+        upper = max(upper, (altitude - (cfg.max_altitude_m - cfg.altitude_recovery_margin_m)) / cfg.altitude_recovery_margin_m)
+        lower = max(lower, ((cfg.min_altitude_m + cfg.altitude_recovery_margin_m) - altitude) / cfg.altitude_recovery_margin_m)
+        upper = max(0.0, upper)
+        lower = max(0.0, lower)
+        low_speed = (cfg.horizontal_speed_soft_mps - horizontal) / (cfg.horizontal_speed_soft_mps - cfg.horizontal_speed_hard_mps)
+        if low_speed > 0.0:
+            upper = max(upper, low_speed)
+            lower = max(lower, low_speed)
+            result += horizontal_hat * (G0 * (0.5 + 1.5 * min(low_speed, 1.0)))
+
+        pitch_accel = float(np.dot(result, pitch_up))
+        if upper > 0.0 and pitch_accel > 0.0:
+            result -= pitch_up * pitch_accel * min(upper, 1.0)
+        if lower > 0.0 and pitch_accel < 0.0:
+            result -= pitch_up * pitch_accel * min(lower, 1.0)
+        # Beyond a soft boundary, add a bounded restoring acceleration; at the
+        # hard boundary this is about 2 g and dominates persistent bad commands.
+        result += pitch_up * G0 * (2.0 * min(lower, 1.5) - 2.0 * min(upper, 1.5))
+        return result
 
     def _step_missile(
         self,
