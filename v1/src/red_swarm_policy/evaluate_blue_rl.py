@@ -16,6 +16,7 @@ from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, Evaluatio
                       EvaluationShapingConfig, RainbowDQNAgent)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
+from .blue_flight_quality import write_flight_quality_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
                             help=f"Relative {name} score weight before phase scheduling")
     parser.add_argument("--mechanism-detail-log", action="store_true",
                         help="Store per-decision Q vectors and mechanism scores for offline analysis")
+    parser.add_argument("--no-flight-quality-report", action="store_true",
+                        help="Disable Blue flight-quality metrics, event tables, and diagnostic panels")
+    parser.add_argument("--flight-quality-max-plots", type=int, default=20,
+                        help="Maximum worst/failed episodes rendered as six-panel PNGs")
+    parser.add_argument("--survival-reference", type=float, default=None,
+                        help="Optional pre-change survival rate used for the <=5 percentage-point gate")
     return parser
 
 
@@ -127,7 +134,10 @@ def main() -> int:
     try: missile_scenarios = parse_missile_scenarios(args.missiles)
     except ValueError as error: raise SystemExit(str(error)) from error
     if args.episodes < 1 or args.parallel_envs < 1 or args.env_worker_threads < 1 or args.log_interval < 1: raise SystemExit("episode, worker, and log interval counts must be positive")
-    if args.acmi_interval < 0 or args.env_worker_timeout_s <= 0: raise SystemExit("invalid ACMI interval or worker timeout")
+    if args.acmi_interval < 0 or args.env_worker_timeout_s <= 0 or args.flight_quality_max_plots < 0:
+        raise SystemExit("invalid ACMI interval, worker timeout, or flight-quality plot count")
+    if args.survival_reference is not None and not 0.0 <= args.survival_reference <= 1.0:
+        raise SystemExit("--survival-reference must be in [0, 1]")
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "evaluation.jsonl"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.write_text("", encoding="utf-8")
@@ -173,6 +183,7 @@ def main() -> int:
     shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
     mechanism_interventions: dict[int, int] = {}; mechanism_diagnostics: dict[int, dict[str, object]] = {}
     mechanism_traces: dict[int, list[dict[str, object]]] = {}
+    flight_quality_traces: dict[int, list[dict[str, object]]] = {}
     decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}; initializations = {}
     reward_component_sums: dict[int, Counter[str]] = {}; reward_diagnostic_sums: dict[int, Counter[str]] = {}
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
@@ -187,6 +198,11 @@ def main() -> int:
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
+           "flight_quality_report": {
+               "enabled": not args.no_flight_quality_report,
+               "max_plots": args.flight_quality_max_plots,
+               "survival_reference": args.survival_reference,
+           },
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                      "direction": shaping_config.direction, "overload": shaping_config.overload,
                                      "weight": shaping_config.weight},
@@ -202,6 +218,7 @@ def main() -> int:
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
             mechanism_interventions[worker] = 0; shapers[worker].reset()
             mechanism_traces[worker] = []
+            flight_quality_traces[worker] = []
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
         for worker, (observation, reset_info) in pool.reset(assignments).items():
             observations[worker] = observation; initializations[worker] = reset_info["initialization"]
@@ -220,6 +237,23 @@ def main() -> int:
                     mechanism_diagnostics[worker] = diagnostic
                     mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
                     mechanism_traces[worker].append(diagnostic)
+                    if not args.no_flight_quality_report:
+                        snapshot = mechanism_states[worker]
+                        flight_quality_traces[worker].append({
+                            "time_s": snapshot["time_s"],
+                            "blue_position_m": snapshot["blue_position_m"],
+                            "blue_velocity_mps": snapshot["blue_velocity_mps"],
+                            "red_positions_m": snapshot["red_positions_m"],
+                            "executed_load_body_g": snapshot["executed_load_body_g"],
+                            "physics_protection_active": snapshot["physics_protection_active"],
+                            "min_altitude_m": snapshot["min_altitude_m"],
+                            "max_altitude_m": snapshot["max_altitude_m"],
+                            "altitude_recovery_margin_m": snapshot["altitude_recovery_margin_m"],
+                            "raw_action": diagnostic.get("raw_action"),
+                            "executed_action": diagnostic.get("executed_action"),
+                            "safety_intervened": bool(diagnostic.get("safety_intervened")),
+                            "safety_reason": diagnostic.get("hard_mask_reasons", []),
+                        })
             results = pool.step({worker: int(action) for worker, action in zip(workers, actions)})
             vector_iterations += 1
             resets = {}
@@ -264,6 +298,27 @@ def main() -> int:
                                          "last": mechanism_diagnostics.get(worker, {}),
                                          **({"trace": mechanism_traces[worker]}
                                             if args.mechanism_detail_log else {})}}
+                    final_snapshot = mechanism_states[worker]
+                    if (not args.no_flight_quality_report
+                            and (not flight_quality_traces[worker]
+                                 or float(final_snapshot["time_s"])
+                                 > float(flight_quality_traces[worker][-1]["time_s"]))):
+                        flight_quality_traces[worker].append({
+                            "time_s": final_snapshot["time_s"],
+                            "blue_position_m": final_snapshot["blue_position_m"],
+                            "blue_velocity_mps": final_snapshot["blue_velocity_mps"],
+                            "red_positions_m": final_snapshot["red_positions_m"],
+                            "executed_load_body_g": final_snapshot["executed_load_body_g"],
+                            "physics_protection_active": final_snapshot["physics_protection_active"],
+                            "min_altitude_m": final_snapshot["min_altitude_m"],
+                            "max_altitude_m": final_snapshot["max_altitude_m"],
+                            "altitude_recovery_margin_m": final_snapshot["altitude_recovery_margin_m"],
+                            # Terminal state is not another policy decision.
+                            "raw_action": None, "executed_action": None,
+                            "safety_intervened": False, "safety_reason": [],
+                        })
+                    if not args.no_flight_quality_report:
+                        row["flight_quality_trace"] = flight_quality_traces[worker]
                     rows.append(row); window_rows.append(row); completed += 1
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
@@ -271,6 +326,7 @@ def main() -> int:
                         action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
                         mechanism_interventions[worker] = 0; mechanism_diagnostics.pop(worker, None)
                         mechanism_traces[worker] = []
+                        flight_quality_traces[worker] = []
                         shapers[worker].reset()
                         reward_diagnostic_sums[worker] = Counter(); next_episode += 1
                     else:
@@ -279,6 +335,7 @@ def main() -> int:
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
                         mechanism_states.pop(worker); mechanism_interventions.pop(worker)
                         mechanism_traces.pop(worker)
+                        flight_quality_traces.pop(worker)
             if resets:
                 for worker, (observation, reset_info) in pool.reset(resets).items():
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
@@ -309,6 +366,16 @@ def main() -> int:
                 while next_log <= completed: next_log += args.log_interval
                 window_rows = []; window_started = now
     rows.sort(key=lambda row: int(row["episode"]))
+    if not args.no_flight_quality_report:
+        flight_quality_summary = write_flight_quality_report(
+            rows, output / "flight_quality", survival_reference=args.survival_reference,
+            max_plots=args.flight_quality_max_plots)
+        for row in rows:
+            row.pop("flight_quality_trace", None)
+    else:
+        flight_quality_summary = None
+        for row in rows:
+            row.pop("flight_quality_trace", None)
     by_scenario = {
         str(count): _aggregate_results(selected)
         for count in missile_scenarios
@@ -343,6 +410,8 @@ def main() -> int:
                "elapsed_s": elapsed,
                "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
                "results": rows}
+    if flight_quality_summary is not None:
+        summary["flight_quality"] = flight_quality_summary
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _emit({"event": "evaluation_complete", "episodes": args.episodes,
            "survival_rate": summary["survival_rate"], "by_scenario": by_scenario,

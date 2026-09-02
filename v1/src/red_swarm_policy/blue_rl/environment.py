@@ -135,8 +135,13 @@ class BlueEscapeEnv:
         """Expose physical state to the optional evaluation-only action shaper."""
         assert self.inner.state is not None
         blue = self.inner.state.blue[0]
+        envelope = self._flight_envelope_snapshot()
         return {"blue_position_m": blue.position_m.tolist(),
                 "blue_velocity_mps": blue.velocity_mps.tolist(),
+                "executed_load_body_g": [envelope["executed_axial_load_g"],
+                                          envelope["executed_normal_load_g"]],
+                "executed_bank_deg": envelope["executed_bank_deg"],
+                "physics_protection_active": envelope["protection_active"],
                 "time_s": float(self.inner.state.time_s),
                 "red_positions_m": [red.position_m.tolist() for red in self.inner.state.red],
                 "red_velocities_mps": [red.velocity_mps.tolist() for red in self.inner.state.red],
