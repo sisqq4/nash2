@@ -237,8 +237,34 @@ optimizer/target 更新次数以及 CUDA 显存。所有运行时 JSON 行同步
 评估会在启动时输出 `evaluation_config` JSON 行，此后每 `--log-interval` 个已完成 episode 输出一条
 `evaluation_progress`，包括完成进度、窗口生存率、回报、命中数、脱靶距离、终止原因和运行吞吐；结束时输出
 `evaluation_complete`，随后保留原有的完整评估 JSON 输出。以上流式事件同时写入输出目录的
-`evaluation.jsonl`（可用 `--jsonl-path` 覆盖），最终逐 episode 结果仍写入 `evaluation.json`。最终结果的
-`statistics` 以及各 `by_scenario` 项包含生存/毁伤计数、终止与动作分布，并对回报、脱靶距离、仿真时长和
+`evaluation.jsonl`（可用 `--jsonl-path` 覆盖），最终逐 episode 结果仍写入 `evaluation.json`。
+
+每次评估默认还会在 `OUTPUT/flight_quality/` 生成蓝机飞行品质验收报告：`summary.csv` 是逐回合汇总表，
+`events.csv` 给出近垂直、螺旋、折返、高度边界和安全保护介入的起止时刻，`report.json` 保留全部原始指标与
+时序数据，并为评分最低或未通过的回合生成最多 20 张六联诊断图。图中包含三维/俯视轨迹、高度、飞行路径角、
+航向角速度、总/水平速度、转弯半径、原始/执行动作及安全介入标记。可用
+`--flight-quality-max-plots N` 控制图片数，或用 `--no-flight-quality-report` 关闭；提供修改前生存率
+`--survival-reference RATE` 后，还会执行“生存率下降不超过 5 个百分点”的硬验收门槛。
+
+例如，使用与修改前完全相同的 checkpoint、场景和 seed 执行正式验收：
+
+```bash
+PYTHONPATH=src conda run -n 612 --no-capture-output \
+python -m red_swarm_policy.evaluate_blue_rl \
+  outputs/blue_rl/train/blue_rainbow.pt \
+  --episodes 100 --missiles 1,2,3,4 --seed 20271000 \
+  --parallel-envs 16 --device cuda:0 \
+  --output outputs/blue_rl/acceptance \
+  --survival-reference 0.87 \
+  --flight-quality-max-plots 20
+```
+
+其中 `0.87` 必须替换为修改前、相同 seed 和导弹场景下的生存率。报告默认启用，不需要额外开关；若只想保留
+原评估流程和原有输出文件，可传入 `--no-flight-quality-report`。启用报告不会修改策略动作、环境步进、奖励、
+原有逐回合字段或原有统计口径，只会增加 `flight_quality/` 目录以及 `evaluation.json` 顶层的
+`flight_quality` 汇总字段。设置 `--flight-quality-max-plots 0` 可以保留指标和 CSV/JSON、但跳过 Matplotlib
+绘图，适合无图形依赖或大批量快速验收。
+最终结果的 `statistics` 以及各 `by_scenario` 项包含生存/毁伤计数、终止与动作分布，并对回报、脱靶距离、仿真时长和
 决策步数给出均值、标准差、最值、5/25/50/75/95 分位数及直方图；逐 episode 结果另外记录动作直方图、
 累计奖励分量和平均奖励诊断。每个 episode 的 `initialization` 完整记录飞机和各枚导弹的初始位置、高度、
 航向、航迹倾角与速度。飞机初始航向相对弹群中心按 90° 扇区分为朝向弹群、正 90°、负 90°和远离弹群；
