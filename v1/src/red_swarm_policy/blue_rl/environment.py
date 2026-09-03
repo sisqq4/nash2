@@ -156,6 +156,7 @@ class BlueEscapeEnv:
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
+            "flight_quality_state": self._mechanism_snapshot(),
         }
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -271,6 +272,9 @@ class BlueEscapeEnv:
                 "measured_potential_after": float(measured_potential["total"]),
                 **maneuver_diagnostics,
             },
+            # Kept separate from the normalized observation so diagnostics can
+            # evolve without changing a checkpoint's observation schema.
+            "flight_quality_state": self._mechanism_snapshot(),
         })
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()

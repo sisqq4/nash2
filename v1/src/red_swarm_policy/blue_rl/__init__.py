@@ -7,6 +7,7 @@ from .rainbow import RainbowDQNAgent, RainbowDQNConfig
 from .env_pool import BlueProcessEnvironmentPool, BlueStepResult
 from .curriculum import CurriculumSchedule, CurriculumStage, DEFAULT_CURRICULUM
 from .evaluation_shaping import EvaluationActionShaper, EvaluationShapingConfig
+from .flight_quality import FlightQualityTracker, write_flight_quality_report
 
 __all__ = [
     "BlueEscapeEnv",
@@ -23,4 +24,6 @@ __all__ = [
     "DEFAULT_CURRICULUM",
     "EvaluationActionShaper",
     "EvaluationShapingConfig",
+    "FlightQualityTracker",
+    "write_flight_quality_report",
 ]
