@@ -318,6 +318,7 @@ class EvaluationActionShaper:
                       "phase_criterion": float(criterion), "main_threat_slot": int(self.primary_slot),
                       "raw_action": raw_action, "executed_action": action,
                       "intervened": action != raw_action, "active_scores": active,
+                      "safety_filter_intervened": bool(not safe[raw_action]),
                       "fallback_reason": fallback_reason, "hard_mask_reasons": mask_reasons,
                       "safe_action_count": int(np.sum(safe)), "total_threat": threat["total"],
                       "local_threats": np.asarray(threat["local"]).tolist(),

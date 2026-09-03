@@ -151,6 +151,13 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert path.read_text(encoding="utf-8") == expected + "\n"
 
 
+def test_training_parser_accepts_replay_capacity_override() -> None:
+    from red_swarm_policy.train_blue_rl import build_parser
+
+    args = build_parser().parse_args(["--replay-size", "500000"])
+    assert args.replay_size == 500_000
+
+
 def test_evaluation_mechanisms_are_independent_and_deterministic() -> None:
     snapshot = {"blue_position_m": [0.0, 9000.0, 0.0],
                 "blue_velocity_mps": [300.0, 0.0, 0.0],

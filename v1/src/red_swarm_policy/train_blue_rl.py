@@ -13,7 +13,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from .blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool, RainbowDQNAgent, RainbowDQNConfig
+from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
+                      FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
+                      append_flight_quality_episode,
+                      write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from .cli_utils import parse_missile_scenarios
@@ -34,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates-per-transition", type=float, default=1.0,
                         help="Gradient updates scheduled per collected environment transition")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--replay-size", type=int, default=50_000,
+                        help="Maximum number of transitions retained by prioritized replay")
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Print and archive one aggregate row every N completed episodes")
     parser.add_argument("--metrics-path", default=None,
@@ -50,6 +55,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum-eval-interval", type=int, default=500)
     parser.add_argument("--curriculum-eval-episodes", type=int, default=300,
                         help="Fixed-seed evaluation episodes per introduced scenario; 0 disables evaluation")
+    parser.add_argument("--flight-quality-plot-limit", type=int, default=10)
+    parser.add_argument("--baseline-survival-rate", type=float, default=None)
     return parser
 
 
@@ -108,19 +115,26 @@ def main() -> int:
         raise SystemExit("episodes, checkpoint interval and log interval must be positive")
     if args.acmi_interval < 0 or args.parallel_envs < 1 or args.env_worker_threads < 1:
         raise SystemExit("ACMI interval must be non-negative and worker counts positive")
-    if args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0 or args.batch_size < 1:
-        raise SystemExit("timeout and batch size must be positive; update ratio must be non-negative")
+    if (args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0
+            or args.batch_size < 1 or args.replay_size < 1):
+        raise SystemExit("timeout, batch size, and replay size must be positive; update ratio must be non-negative")
     curriculum = CurriculumSchedule(transition_episodes=args.curriculum_transition_episodes) if args.curriculum else None
     if curriculum is not None and args.episodes > curriculum.total_episodes:
         raise SystemExit(f"curriculum defines at most {curriculum.total_episodes} episodes")
     if args.curriculum_eval_interval < 1 or args.curriculum_eval_episodes < 0:
         raise SystemExit("curriculum evaluation interval must be positive and episodes non-negative")
+    if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
+    if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
+        raise SystemExit("baseline survival rate must be in [0, 1]")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_path) if args.metrics_path else output / "training_metrics.json"
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "training.jsonl"
+    flight_quality_jsonl_path = output / "flight_quality" / "flight_quality_episodes.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text("", encoding="utf-8")
+    flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
@@ -132,6 +146,7 @@ def main() -> int:
     rainbow_config = RainbowDQNConfig(9 + max(training_scenarios) * 4, 29,
                                       observation_schema=env_config.observation_schema,
                                       batch_size=args.batch_size,
+                                      replay_size=args.replay_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
@@ -157,6 +172,7 @@ def main() -> int:
             "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
             "environment_config": asdict(environment_config),
             "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
+            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
             "curriculum": curriculum.describe() if curriculum is not None else None,
         }
         device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
@@ -176,6 +192,7 @@ def main() -> int:
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
         reward_diagnostics_by_worker: dict[int, Counter[str]] = {}
+        quality: dict[int, FlightQualityTracker] = {}; quality_episodes: list[dict[str, Any]] = []
         next_episode = 1; completed = 0; update_credit = 0.0
         next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
         next_curriculum_eval = args.curriculum_eval_interval
@@ -194,7 +211,9 @@ def main() -> int:
             reward_components_by_worker[worker] = Counter()
             reward_diagnostics_by_worker[worker] = Counter()
             decisions_by_worker[worker] = 0; next_episode += 1
-        for worker, (observation, _) in pool.reset(assignments).items(): observations[worker] = observation
+            quality[worker] = FlightQualityTracker()
+        for worker, (observation, info) in pool.reset(assignments).items():
+            observations[worker] = observation; quality[worker].add(info["flight_quality_state"])
         while observations:
             vector_iterations += 1; workers = sorted(observations)
             selected = agent.select_actions(np.stack([observations[worker] for worker in workers]))
@@ -213,6 +232,8 @@ def main() -> int:
                 for name, value in dict(result.info.get("reward_diagnostics", {})).items():
                     reward_diagnostics_by_worker[worker][str(name)] += float(value)
                 observations[worker] = result.observation
+                quality[worker].add(result.info["flight_quality_state"],
+                                    policy_action=actions[worker], executed_action=actions[worker])
                 if done:
                     completed += 1
                     row = {
@@ -237,17 +258,24 @@ def main() -> int:
                         "acmi_path": result.info.get("acmi_path"),
                     }
                     summaries.append(row); window_episodes.append(row)
+                    quality_result = quality[worker].finish(episode=episode_by_worker[worker],
+                                                            survived=bool(result.info["blue_survived"]))
+                    row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
+                    quality_episodes.append(quality_result)
+                    append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
                         reward_components_by_worker[worker] = Counter()
                         reward_diagnostics_by_worker[worker] = Counter()
                         decisions_by_worker[worker] = 0; next_episode += 1
+                        quality[worker] = FlightQualityTracker()
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker)
                         reward_by_worker.pop(worker); decisions_by_worker.pop(worker)
                         reward_components_by_worker.pop(worker)
                         reward_diagnostics_by_worker.pop(worker)
+                        quality.pop(worker)
             update_credit += len(workers) * args.updates_per_transition
             updates = math.floor(update_credit); update_credit -= updates
             for _ in range(updates):
@@ -348,10 +376,14 @@ def main() -> int:
                 window_actions = Counter(); window_started = now
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
-                for worker, (observation, _) in pool.reset(resets).items(): observations[worker] = observation
+                for worker, (observation, info) in pool.reset(resets).items():
+                    observations[worker] = observation; quality[worker].add(info["flight_quality_state"])
         summaries.sort(key=lambda row: int(row["episode"]))
         final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
         elapsed = time.monotonic() - started
+        flight_quality_summary = write_flight_quality_report(
+            sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
+            baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
         final_summary = {
             "event": "training_complete", "episodes": args.episodes,
             "survival_rate": _mean([float(row["blue_survived"]) for row in summaries]),
@@ -361,6 +393,7 @@ def main() -> int:
             "completed_optimizer_updates": agent.optimizer_updates,
             "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
             "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
+            "flight_quality": flight_quality_summary,
         }
         final_summary["scenario_episode_counts"] = dict(Counter(
             int(row["missile_count"]) for row in summaries
