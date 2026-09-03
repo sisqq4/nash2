@@ -186,7 +186,11 @@ def main(argv: list[str] | None = None) -> int:
         agent = RainbowDQNAgent.load(args.blue_checkpoint, str(device))
         legacy_dim = 6 + 3 * args.red_count
         normalized_dim = 6 + 4 * args.red_count
-        if (agent.config.observation_schema == "normalized_v2"
+        regularized_dim = 9 + 4 * args.red_count
+        if (agent.config.observation_schema == "normalized_v3"
+                and agent.config.observation_dim == regularized_dim):
+            observation_schema = "normalized_v3"
+        elif (agent.config.observation_schema == "normalized_v2"
                 and agent.config.observation_dim == normalized_dim):
             observation_schema = "normalized_v2"
         elif (agent.config.observation_schema == "legacy_v1"
@@ -196,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 f"checkpoint expects observation_dim={agent.config.observation_dim}, "
                 f"but --red-count={args.red_count} requires legacy {legacy_dim} "
-                f"or normalized {normalized_dim}"
+                f", normalized_v2 {normalized_dim}, or normalized_v3 {regularized_dim}"
             )
         controller = BlueRLController(
             agent,
