@@ -9,6 +9,7 @@ from ..env.types import EnvironmentConfig
 
 T = TypeVar("T")
 BLUE_MISSION_DURATION_S = 200.0
+BLUE_INITIAL_ALTITUDE_RANGE_M = (9000.0, 11000.0)
 
 
 def _replace_dataclass(instance: T, values: dict[str, Any], path: str) -> T:
@@ -50,6 +51,7 @@ def configure_blue_mission_duration(
         config,
         max_steps=int(round(duration_s / config.time_step_s)),
         missile=replace(config.missile, max_guidance_time_s=duration_s),
+        scenario=replace(config.scenario, blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M),
     )
     configured.validate()
     return configured

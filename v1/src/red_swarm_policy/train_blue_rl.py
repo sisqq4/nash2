@@ -92,14 +92,16 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
     for scenario in scenarios:
         survived: list[float] = []; times: list[float] = []
         for index in range(episodes):
-            observation, _ = evaluation_env.reset(
+            observation, reset_info = evaluation_env.reset(
                 seed=seed + scenario * 100_000 + index, episode_index=index + 1,
                 missile_count=scenario,
             )
+            learning_active = bool(reset_info["learning_active"])
             done = False
             while not done:
-                action = agent.select_action(observation, evaluation=True)
+                action = agent.select_action(observation, evaluation=True) if learning_active else 0
                 observation, _, terminated, truncated, info = evaluation_env.step(action)
+                learning_active = bool(info["learning_active"])
                 done = terminated or truncated
             survived.append(float(info["blue_survived"])); times.append(float(info.get("time_s", 0.0)))
         rates[scenario] = float(np.mean(survived)); mean_times[scenario] = float(np.mean(times))
@@ -189,6 +191,7 @@ def main() -> int:
         episode_stages = {episode: curriculum.stage_at(episode)[1].name
                           for episode in range(1, args.episodes + 1)} if curriculum is not None else {}
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
+        learning_active_by_worker: dict[int, bool] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
         reward_diagnostics_by_worker: dict[int, Counter[str]] = {}
@@ -213,27 +216,42 @@ def main() -> int:
             decisions_by_worker[worker] = 0; next_episode += 1
             quality[worker] = FlightQualityTracker()
         for worker, (observation, info) in pool.reset(assignments).items():
-            observations[worker] = observation; quality[worker].add(info["flight_quality_state"])
+            observations[worker] = observation
+            learning_active_by_worker[worker] = bool(info["learning_active"])
+            quality[worker].add(info["flight_quality_state"])
         while observations:
             vector_iterations += 1; workers = sorted(observations)
-            selected = agent.select_actions(np.stack([observations[worker] for worker in workers]))
-            actions = {worker: int(action) for worker, action in zip(workers, selected)}
-            window_actions.update(actions.values())
-            window_values.append(agent.last_action_metrics["selected_value_mean"])
+            active_workers = [worker for worker in workers if learning_active_by_worker[worker]]
+            actions = {worker: 0 for worker in workers}
+            if active_workers:
+                selected = agent.select_actions(np.stack([observations[worker] for worker in active_workers]))
+                actions.update({worker: int(action) for worker, action in zip(active_workers, selected)})
+                window_values.append(agent.last_action_metrics["selected_value_mean"])
             results = pool.step(actions); resets: dict[int, tuple[int, int]] = {}
+            learning_transition_count = 0
             for worker in workers:
                 result = results[worker]; previous = observations[worker]
                 done = result.terminated or result.truncated
-                agent.observe_for_env(worker, previous, actions[worker], result.reward, result.observation, done)
-                reward_by_worker[worker] += result.reward; decisions_by_worker[worker] += 1
-                for name, value in dict(result.info.get("reward_components", {})).items():
-                    if name != "threat_potential":
-                        reward_components_by_worker[worker][str(name)] += float(value)
-                for name, value in dict(result.info.get("reward_diagnostics", {})).items():
-                    reward_diagnostics_by_worker[worker][str(name)] += float(value)
+                learning_transition = bool(result.info["learning_transition"])
+                executed_action = int(result.info["executed_action_index"])
+                if learning_transition:
+                    agent.observe_for_env(
+                        worker, previous, actions[worker], result.reward, result.observation, done
+                    )
+                    learning_transition_count += 1
+                    decisions_by_worker[worker] += 1
+                    window_actions[actions[worker]] += 1
+                    for name, value in dict(result.info.get("reward_components", {})).items():
+                        if name != "threat_potential":
+                            reward_components_by_worker[worker][str(name)] += float(value)
+                    for name, value in dict(result.info.get("reward_diagnostics", {})).items():
+                        reward_diagnostics_by_worker[worker][str(name)] += float(value)
+                reward_by_worker[worker] += result.reward
                 observations[worker] = result.observation
+                learning_active_by_worker[worker] = bool(result.info["learning_active"])
                 quality[worker].add(result.info["flight_quality_state"],
-                                    policy_action=actions[worker], executed_action=actions[worker])
+                                    policy_action=actions[worker] if learning_transition else None,
+                                    executed_action=executed_action)
                 if done:
                     completed += 1
                     row = {
@@ -247,14 +265,23 @@ def main() -> int:
                         "simulation_time_s": float(result.info.get("time_s", 0.0)),
                         "physics_steps": int(result.info.get("step_count", 0)),
                         "decision_steps": decisions_by_worker[worker],
+                        "learning_activation_time_s": result.info.get("learning_activation_time_s"),
+                        "learning_activation_range_m": result.info.get("learning_activation_range_m"),
+                        "threat_observed": bool(result.info.get("learning_active", False)),
                         "reward_components": dict(reward_components_by_worker[worker]),
                         "reward_diagnostics_mean": {
                             name: value / decisions_by_worker[worker]
                             for name, value in reward_diagnostics_by_worker[worker].items()
                         },
                         "red_loss_reasons": list(result.info.get("red_loss_reasons", [])),
-                        "mean_loss": agent.last_update_metrics.get("loss"),
-                        "learner_loss_at_completion": agent.last_update_metrics.get("loss"),
+                        "mean_loss": (
+                            agent.last_update_metrics.get("loss")
+                            if decisions_by_worker[worker] > 0 else None
+                        ),
+                        "learner_loss_at_completion": (
+                            agent.last_update_metrics.get("loss")
+                            if decisions_by_worker[worker] > 0 else None
+                        ),
                         "acmi_path": result.info.get("acmi_path"),
                     }
                     summaries.append(row); window_episodes.append(row)
@@ -272,11 +299,14 @@ def main() -> int:
                         quality[worker] = FlightQualityTracker()
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker)
+                        learning_active_by_worker.pop(worker)
                         reward_by_worker.pop(worker); decisions_by_worker.pop(worker)
                         reward_components_by_worker.pop(worker)
                         reward_diagnostics_by_worker.pop(worker)
                         quality.pop(worker)
-            update_credit += len(workers) * args.updates_per_transition
+            # Replay insertion and loss/gradient computation are both driven
+            # exclusively by post-detection transitions.
+            update_credit += learning_transition_count * args.updates_per_transition
             updates = math.floor(update_credit); update_credit -= updates
             for _ in range(updates):
                 loss = agent.update()
@@ -332,7 +362,7 @@ def main() -> int:
                     "episode_ids": sorted(int(row["episode"]) for row in window_episodes),
                     "sampled_red_counts": dict(Counter(int(row["missile_count"]) for row in window_episodes)),
                     "sampled_blue_count": 1,
-                    "active_parallel_envs": len(observations), "inference_batch_size": len(workers),
+                    "active_parallel_envs": len(observations), "inference_batch_size": len(active_workers),
                     "vector_iterations": vector_iterations,
                     "rollout_decision_steps": agent.total_steps - window_transition_start,
                     "completed_environment_transitions": agent.total_steps,
@@ -377,7 +407,9 @@ def main() -> int:
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
                 for worker, (observation, info) in pool.reset(resets).items():
-                    observations[worker] = observation; quality[worker].add(info["flight_quality_state"])
+                    observations[worker] = observation
+                    learning_active_by_worker[worker] = bool(info["learning_active"])
+                    quality[worker].add(info["flight_quality_state"])
         summaries.sort(key=lambda row: int(row["episode"]))
         final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
         elapsed = time.monotonic() - started

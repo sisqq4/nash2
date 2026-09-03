@@ -161,7 +161,15 @@ def main(argv: list[str] | None = None) -> int:
         assignment_update_interval_s=1.0,
         max_steps=max_steps,
         policy_start_mode=args.start_mode,
-        scenario=ScenarioConfig(red_count=args.red_count, blue_count=args.blue_count),
+        scenario=ScenarioConfig(
+            red_count=args.red_count,
+            blue_count=args.blue_count,
+            blue_altitude_range_m=(
+                (9000.0, 11000.0)
+                if args.blue_policy == "rainbow"
+                else ScenarioConfig().blue_altitude_range_m
+            ),
+        ),
         sensor=SensorConfig(detection_range_m=args.detection_range_m),
     )
     evasion_config = BlueEvasionConfig(

@@ -16,7 +16,7 @@ from red_swarm_policy.blue_rl import (
     RainbowDQNConfig,
 )
 from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
-from red_swarm_policy.env import EnvironmentConfig
+from red_swarm_policy.env import EnvironmentConfig, ScenarioConfig
 from red_swarm_policy.cli_utils import parse_missile_scenarios
 from red_swarm_policy.blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
@@ -35,15 +35,29 @@ class FixedPolicy:
         pass
 
 
+class CountingPolicy(FixedPolicy):
+    def __init__(self, action: int = 7) -> None:
+        self.action = action
+        self.calls = 0
+
+    def select_action(self, observation: np.ndarray, *, evaluation: bool = False) -> int:
+        assert observation.ndim == 1
+        self.calls += 1
+        return self.action
+
+
 def short_config() -> EnvironmentConfig:
     base = EnvironmentConfig()
-    return replace(base, max_steps=base.policy_entry_steps + 2)
+    return replace(base, max_steps=base.policy_entry_steps + 1)
 
 
 def test_blue_cli_duration_sets_mission_and_guidance_to_200_seconds() -> None:
-    config = configure_blue_mission_duration(EnvironmentConfig())
+    config = configure_blue_mission_duration(EnvironmentConfig(
+        scenario=ScenarioConfig(blue_altitude_range_m=(8000.0, 12000.0)),
+    ))
     assert config.max_steps * config.time_step_s == pytest.approx(200.0)
     assert config.missile.max_guidance_time_s == pytest.approx(200.0)
+    assert config.scenario.blue_altitude_range_m == (9000.0, 11000.0)
 
 
 def test_rainbow_defaults_match_long_decision_horizon() -> None:
@@ -233,7 +247,11 @@ def test_evaluation_final_statistics_include_distributions() -> None:
 
 
 def test_blue_reset_records_initial_geometry_and_orientation() -> None:
-    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(missile_count=2, record_acmi=False))
+    config = EnvironmentConfig(scenario=ScenarioConfig(
+        blue_altitude_range_m=(8000.0, 12000.0),
+        velocity_perturb_mps=75.0,
+    ))
+    env = BlueEscapeEnv(config, BlueEscapeEnvConfig(missile_count=2, record_acmi=False))
 
     _, info = env.reset(seed=19)
 
@@ -244,6 +262,12 @@ def test_blue_reset_records_initial_geometry_and_orientation() -> None:
         "toward_missile_swarm", "positive_90_deg", "negative_90_deg",
         "away_from_missile_swarm",
     }
+    blue = initialization["blue_aircraft"][0]
+    assert 9000.0 <= blue["altitude_m"] <= 11000.0
+    assert blue["flight_path_angle_deg"] == pytest.approx(0.0, abs=1.0e-12)
+    assert blue["bank_angle_deg"] == pytest.approx(0.0, abs=1.0e-12)
+    assert env.inner.state is not None
+    assert env.inner.state.blue[0].velocity_mps[1] == pytest.approx(0.0, abs=1.0e-12)
     for entity in initialization["blue_aircraft"] + initialization["red_missiles"]:
         assert len(entity["position_m"]) == 3
         assert entity["altitude_m"] == pytest.approx(entity["position_m"][1])
@@ -257,6 +281,88 @@ def test_controller_is_drop_in_discrete_policy() -> None:
     controller = BlueRLController(FixedPolicy(), cfg, BlueEscapeEnvConfig(missile_count=1))
     action = controller(env.inner.state)
     assert action["action_indices"].tolist() == [0]
+
+
+def test_blue_rl_waits_for_strict_60km_detection_before_maneuver_and_reward() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1,
+        decision_interval_s=cfg.time_step_s,
+        record_acmi=False,
+    ))
+    _, reset_info = env.reset(seed=2)
+    assert env.inner.state is not None
+    blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
+    initial_velocity = blue.velocity_mps.copy()
+
+    _, reward, terminated, truncated, info = env.step(7)
+    assert not (terminated or truncated)
+    assert reset_info["learning_active"] is False
+    assert info["learning_active"] is False
+    assert info["learning_transition"] is False
+    assert info["requested_action_index"] == 7
+    assert info["executed_action_index"] == 0
+    assert reward == 0.0
+    blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
+    np.testing.assert_allclose(blue.velocity_mps, initial_velocity, rtol=0.0, atol=1.0e-12)
+    assert blue.bank_angle_rad == pytest.approx(0.0)
+
+    missile.position_m = blue.position_m + np.array([59000.0, 0.0, 0.0])
+    missile.velocity_mps = blue.velocity_mps.copy()
+    _, reward, _, _, activation_info = env.step(7)
+    assert activation_info["learning_active"] is True
+    assert activation_info["learning_transition"] is False
+    assert activation_info["learning_activation_range_m"] < 60000.0
+    assert activation_info["executed_action_index"] == 0
+    assert reward == 0.0
+
+    _, _, _, _, learning_info = env.step(7)
+    assert learning_info["learning_active"] is True
+    assert learning_info["learning_transition"] is True
+    assert learning_info["executed_action_index"] == 7
+    assert env.inner.state.blue[0].bank_angle_rad == pytest.approx(
+        np.arccos(1.0 / 9.0)
+    )
+
+
+def test_drop_in_controller_does_not_call_policy_before_detection() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(missile_count=1, record_acmi=False))
+    env.reset(seed=2)
+    assert env.inner.state is not None
+    policy = CountingPolicy(action=7)
+    controller = BlueRLController(policy, cfg, BlueEscapeEnvConfig(missile_count=1))
+
+    assert controller(env.inner.state)["action_indices"].tolist() == [0]
+    assert policy.calls == 0
+
+    blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
+    missile.position_m = blue.position_m + np.array([60000.0, 0.0, 0.0])
+    assert controller(env.inner.state)["action_indices"].tolist() == [0]
+    assert policy.calls == 0
+
+    missile.position_m = blue.position_m + np.array([59999.0, 0.0, 0.0])
+    assert controller(env.inner.state)["action_indices"].tolist() == [7]
+    assert policy.calls == 1
+
+
+def test_acmi_writes_explicit_upright_initial_aircraft_attitude(tmp_path) -> None:
+    cfg = short_config()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1,
+        decision_interval_s=cfg.time_step_s,
+        acmi_directory=str(tmp_path),
+    ))
+    env.reset(seed=3)
+    _, _, terminated, truncated, _ = env.step(0)
+    assert terminated or truncated
+
+    lines = (tmp_path / "episode_000001.acmi").read_text(encoding="utf-8").splitlines()
+    blue_line = next(line for line in lines if line.startswith("100,T="))
+    transform = blue_line.split("T=", 1)[1].split(",", 1)[0].split("|")
+    assert len(transform) == 6
+    assert float(transform[3]) == pytest.approx(0.0)
+    assert float(transform[4]) == pytest.approx(0.0)
 
 
 def test_acmi_interval_skips_unscheduled_episodes(tmp_path) -> None:

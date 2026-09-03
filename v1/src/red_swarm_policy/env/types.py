@@ -536,12 +536,14 @@ class ThreeDoFState:
     bias_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     gravity_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     final_load_body_g: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
+    bank_angle_rad: float = 0.0
 
     def copy(self) -> "ThreeDoFState":
         return ThreeDoFState(
             position_m=self.position_m.astype(np.float64).copy(),
             velocity_mps=self.velocity_mps.astype(np.float64).copy(),
             mass_kg=float(self.mass_kg),
+            bank_angle_rad=float(self.bank_angle_rad),
             fuel_mass_kg=float(self.fuel_mass_kg),
             energy=float(self.energy),
             alive=bool(self.alive),

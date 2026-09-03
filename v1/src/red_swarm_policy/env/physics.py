@@ -62,6 +62,7 @@ class ThreeDoFPhysicsLayer:
         acceleration += normal_load_g * G0 * normal_direction
         acceleration += np.array([0.0, -G0, 0.0], dtype=np.float64)
         next_state = self._integrate(state, acceleration, mass_flow_rate_kg_s=0.0)
+        next_state.bank_angle_rad = float(bank_rad)
         speed = float(np.clip(norm(next_state.velocity_mps), self.config.aircraft.min_speed_mps, self.config.aircraft.max_speed_mps))
         next_state.velocity_mps = unit(next_state.velocity_mps, frame[:, 0]) * speed
         if next_state.position_m[UP_AXIS] < self.config.aircraft.min_altitude_m:

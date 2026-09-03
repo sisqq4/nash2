@@ -14,13 +14,33 @@ class BlueRLController:
                  config: BlueEscapeEnvConfig = BlueEscapeEnvConfig()) -> None:
         config.validate(environment); self.policy, self.environment, self.config = policy, environment, config
         self.decision_steps = int(round(config.decision_interval_s / environment.time_step_s)); self._action = 0
+        self._learning_active = False
+        self._last_decision_step: int | None = None
 
     def reset(self) -> None:
         self._action = 0
+        self._learning_active = False
+        self._last_decision_step = None
 
     def __call__(self, state: EngagementState) -> dict[str, np.ndarray]:
-        if state.step_count % self.decision_steps == 0:
+        if not self._learning_active:
+            self._learning_active = any(
+                red.alive and np.linalg.norm(red.position_m - blue.position_m) < self.config.threat_detection_range_m
+                for blue in state.blue
+                for red in state.red
+            )
+        decision_due = (
+            self._learning_active
+            and (
+                self._last_decision_step is None
+                or state.step_count - self._last_decision_step >= self.decision_steps
+            )
+        )
+        if decision_due:
             self._action = self.policy.select_action(self.encode(state), evaluation=True)
+            self._last_decision_step = int(state.step_count)
+        elif not self._learning_active:
+            self._action = 0
         return {"action_indices": np.full(len(state.blue), self._action, dtype=np.int64)}
 
     def action_for(self, state: EngagementState) -> tuple[dict[str, np.ndarray], None]:

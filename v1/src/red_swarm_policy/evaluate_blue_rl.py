@@ -181,6 +181,7 @@ def main() -> int:
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
     pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
+    learning_active_by_worker: dict[int, bool] = {}
     mechanism_states: dict[int, dict[str, object]] = {}
     shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
     mechanism_interventions: dict[int, int] = {}; mechanism_diagnostics: dict[int, dict[str, object]] = {}
@@ -220,40 +221,53 @@ def main() -> int:
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
         for worker, (observation, reset_info) in pool.reset(assignments).items():
             observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+            learning_active_by_worker[worker] = bool(reset_info["learning_active"])
             mechanism_states[worker] = reset_info["mechanism_state"]
             quality[worker].add(reset_info["flight_quality_state"])
         while observations:
             workers = sorted(observations)
-            observation_batch = np.stack([observations[w] for w in workers])
-            with torch.inference_mode():
-                if shaping_config.enabled:
-                    q_values = agent.expected_action_values(observation_batch)
-                    selected = [shapers[w].select(q, mechanism_states[w])
-                                for w, q in zip(workers, q_values)]
-                    actions = np.asarray([item[0] for item in selected], dtype=np.int64)
-                    for worker, (_, diagnostic) in zip(workers, selected):
-                        mechanism_diagnostics[worker] = diagnostic
-                        mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
-                        mechanism_traces[worker].append(diagnostic)
-                else:
-                    actions = agent.select_actions(observation_batch, evaluation=True)
-            results = pool.step({worker: int(action) for worker, action in zip(workers, actions)})
+            active_workers = [worker for worker in workers if learning_active_by_worker[worker]]
+            actions = {worker: 0 for worker in workers}
+            if active_workers:
+                observation_batch = np.stack([observations[w] for w in active_workers])
+                with torch.inference_mode():
+                    if shaping_config.enabled:
+                        q_values = agent.expected_action_values(observation_batch)
+                        selected = [shapers[w].select(q, mechanism_states[w])
+                                    for w, q in zip(active_workers, q_values)]
+                        actions.update({worker: int(item[0])
+                                        for worker, item in zip(active_workers, selected)})
+                        for worker, (_, diagnostic) in zip(active_workers, selected):
+                            mechanism_diagnostics[worker] = diagnostic
+                            mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
+                            mechanism_traces[worker].append(diagnostic)
+                    else:
+                        selected_actions = agent.select_actions(observation_batch, evaluation=True)
+                        actions.update({worker: int(action)
+                                        for worker, action in zip(active_workers, selected_actions)})
+            results = pool.step(actions)
             vector_iterations += 1
             resets = {}
-            for worker, action in zip(workers, actions):
+            for worker in workers:
+                action = actions[worker]
                 result = results[worker]; rewards[worker] += result.reward; observations[worker] = result.observation
+                learning_transition = bool(result.info["learning_transition"])
+                learning_active_by_worker[worker] = bool(result.info["learning_active"])
                 mechanism_states[worker] = dict(result.info["mechanism_state"])
-                diagnostic = mechanism_diagnostics.get(worker, {})
+                diagnostic = mechanism_diagnostics.get(worker, {}) if learning_transition else {}
                 raw_action = int(diagnostic.get("raw_action", action))
-                quality[worker].add(result.info["flight_quality_state"], policy_action=raw_action,
-                                    executed_action=int(action),
+                executed_action = int(result.info["executed_action_index"])
+                quality[worker].add(result.info["flight_quality_state"],
+                                    policy_action=raw_action if learning_transition else None,
+                                    executed_action=executed_action,
                                     safety_intervened=bool(diagnostic.get("safety_filter_intervened", False)),
                                     safety_reasons=list(diagnostic.get("hard_mask_reasons", [])))
-                decisions[worker] += 1; action_counts[worker][int(action)] += 1
-                for name, value in dict(result.info.get("reward_components", {})).items():
-                    reward_component_sums[worker][str(name)] += float(value)
-                for name, value in dict(result.info.get("reward_diagnostics", {})).items():
-                    reward_diagnostic_sums[worker][str(name)] += float(value)
+                if learning_transition:
+                    decisions[worker] += 1; action_counts[worker][int(action)] += 1
+                    for name, value in dict(result.info.get("reward_components", {})).items():
+                        reward_component_sums[worker][str(name)] += float(value)
+                    for name, value in dict(result.info.get("reward_diagnostics", {})).items():
+                        reward_diagnostic_sums[worker][str(name)] += float(value)
                 if result.terminated or result.truncated:
                     episode = episode_by_worker[worker]
                     row = {"episode": episode, "missile_count": episode_scenarios[episode],
@@ -271,7 +285,7 @@ def main() -> int:
                            },
                            "mechanism": {"enabled": shaping_config.enabled,
                                          "interventions": mechanism_interventions[worker],
-                                         "intervention_rate": mechanism_interventions[worker] / decisions[worker],
+                                          "intervention_rate": mechanism_interventions[worker] / max(decisions[worker], 1),
                                          "phase_switches": sum(bool(item.get("phase_changed"))
                                                                for item in mechanism_traces[worker]),
                                          "main_threat_switches": sum(
@@ -303,6 +317,7 @@ def main() -> int:
                         reward_diagnostic_sums[worker] = Counter(); next_episode += 1
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker); rewards.pop(worker)
+                        learning_active_by_worker.pop(worker)
                         decisions.pop(worker); action_counts.pop(worker); initializations.pop(worker)
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
                         mechanism_states.pop(worker); mechanism_interventions.pop(worker)
@@ -311,6 +326,7 @@ def main() -> int:
             if resets:
                 for worker, (observation, reset_info) in pool.reset(resets).items():
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+                    learning_active_by_worker[worker] = bool(reset_info["learning_active"])
                     mechanism_states[worker] = reset_info["mechanism_state"]
                     quality[worker].add(reset_info["flight_quality_state"])
             if completed >= next_log or (completed == args.episodes and window_rows):
@@ -321,7 +337,7 @@ def main() -> int:
                     "total_episodes": args.episodes, "progress_fraction": completed / args.episodes,
                     "episode_ids": sorted(int(row["episode"]) for row in window_rows),
                     "sampled_red_counts": dict(Counter(int(row["missile_count"]) for row in window_rows)),
-                    "active_parallel_envs": len(observations), "inference_batch_size": len(workers),
+                    "active_parallel_envs": len(observations), "inference_batch_size": len(active_workers),
                     "vector_iterations": vector_iterations,
                     "reward_mean": _mean(window_rewards),
                     "reward_std": float(np.std(window_rewards)) if window_rewards else None,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,8 @@ class BlueEscapeEnvConfig:
     pad_observation_to_max_missiles: bool = False
     observation_schema: str = "legacy_v1"
     decision_interval_s: float = 0.1
+    threat_detection_range_m: float = 60000.0
+    initial_altitude_range_m: tuple[float, float] = (9000.0, 11000.0)
     record_acmi: bool = True
     acmi_episode_interval: int = 1
     acmi_directory: str = "outputs/blue_rl/acmi"
@@ -59,6 +61,7 @@ class BlueEscapeEnvConfig:
             self.fast_success_bonus, self.shaping_scale, self.shaping_discount, self.near_range_m,
             self.range_transition_m, self.threat_softmin_temperature_m,
             self.far_away_weight, self.near_tangent_weight, self.near_dive_weight,
+            self.threat_detection_range_m, *self.initial_altitude_range_m,
         )
         if not all(math.isfinite(value) for value in scalar_values):
             raise ValueError("blue reward configuration values must be finite")
@@ -68,8 +71,13 @@ class BlueEscapeEnvConfig:
             or min(self.survival_progress_bonus, self.fast_success_bonus, self.shaping_scale) < 0.0
             or not 0.0 < self.shaping_discount <= 1.0
             or min(self.near_range_m, self.range_transition_m, self.threat_softmin_temperature_m) <= 0.0
+            or self.threat_detection_range_m <= 0.0
             or min(self.far_away_weight, self.near_tangent_weight, self.near_dive_weight) < 0.0
             or not np.isclose(self.near_tangent_weight + self.near_dive_weight, 1.0)
+            or len(self.initial_altitude_range_m) != 2
+            or self.initial_altitude_range_m[0] > self.initial_altitude_range_m[1]
+            or self.initial_altitude_range_m[0] < environment.aircraft.min_altitude_m
+            or self.initial_altitude_range_m[1] > environment.aircraft.max_altitude_m
         ):
             raise ValueError("blue reward scales, ranges, or tactical weights are invalid")
 
@@ -84,6 +92,16 @@ class BlueEscapeEnv:
 
     def __init__(self, environment_config: EnvironmentConfig = EnvironmentConfig(),
                  config: BlueEscapeEnvConfig = BlueEscapeEnvConfig()) -> None:
+        # Blue-RL scenarios have a deliberately narrower launch-altitude
+        # contract than the general engagement environment.
+        environment_config = replace(
+            environment_config,
+            scenario=replace(
+                environment_config.scenario,
+                blue_altitude_range_m=tuple(config.initial_altitude_range_m),
+            ),
+        )
+        environment_config.validate()
         config.validate(environment_config)
         self.environment_config, self.config = environment_config, config
         self.inner = RedBlueEngagementEnv(environment_config, record_replay=False)
@@ -97,6 +115,9 @@ class BlueEscapeEnv:
         self.recorder = AcmiRecorder(); self.episode = 0
         self._previous_potential: dict[str, float] = {}
         self._record_current_episode = False
+        self._learning_active = False
+        self._activation_time_s: float | None = None
+        self._activation_range_m: float | None = None
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
               missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
@@ -120,13 +141,18 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         if self._record_current_episode:
             self.recorder.record(self.inner.state)
-        self._previous_potential = self._threat_potential()
+        self._learning_active = False
+        self._activation_time_s = None
+        self._activation_range_m = None
+        self._activate_if_threat_observed()
+        self._previous_potential = self._threat_potential() if self._learning_active else self._zero_potential()
         info = {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
             "flight_quality_state": self._mechanism_snapshot(),
+            **self._learning_status(learning_transition=False, requested_action=0, executed_action=0),
         }
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -163,6 +189,7 @@ class BlueEscapeEnv:
                 "altitude_m": float(position[1]),
                 "heading_deg": float(math.degrees(math.atan2(velocity[2], velocity[0]))),
                 "flight_path_angle_deg": float(math.degrees(math.atan2(velocity[1], horizontal_speed))),
+                "bank_angle_deg": float(math.degrees(entity.bank_angle_rad)),
                 "speed_mps": float(np.linalg.norm(velocity)),
             }
 
@@ -192,29 +219,45 @@ class BlueEscapeEnv:
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         if not 0 <= int(action) < self.action_dim: raise ValueError(f"action must be in [0, {self.action_dim})")
+        requested_action = int(action)
+        learning_transition = self._learning_active
+        # Action zero is [0 axial g, 1 normal g, 0 bank], exactly cancelling
+        # gravity for unchanged straight-and-level flight before detection.
+        executed_action = requested_action if learning_transition else 0
         result = None
         for _ in range(self.frames_per_action):
             assert self.inner.state is not None
             red = RedAction(np.zeros(len(self.inner.state.red), np.int64), np.zeros((len(self.inner.state.red), 2)))
-            result = self.inner.step(red_action=red, blue_action={"action_indices": [int(action)]})
+            result = self.inner.step(red_action=red, blue_action={"action_indices": [executed_action]})
+            self._activate_if_threat_observed()
             if self._record_current_episode:
                 self.recorder.record(self.inner.state)
             if result.done: break
         assert result is not None and self.inner.state is not None
         blue_alive = self.inner.state.blue[0].alive
         measured_potential = self._threat_potential()
-        # A terminal MDP state has Phi=0.  Using the learner's discount here is
-        # required for policy-invariant potential shaping: gamma*Phi(s')-Phi(s).
-        current_potential = self._zero_potential() if result.done else measured_potential
-        shaping = {
-            name: self.config.shaping_discount * current_potential[name] - self._previous_potential[name]
-            for name in ("far_away", "near_tangent", "near_dive")
-        }
-        shaping_reward = sum(shaping.values())
         potential_before = self._previous_potential["total"]
+        if learning_transition:
+            # A terminal MDP state has Phi=0.  Using the learner's discount
+            # gives policy-invariant shaping: gamma*Phi(s')-Phi(s).
+            current_potential = self._zero_potential() if result.done else measured_potential
+            shaping = {
+                name: self.config.shaping_discount * current_potential[name] - self._previous_potential[name]
+                for name in ("far_away", "near_tangent", "near_dive")
+            }
+            terminal_reward = self._terminal_reward(result.info) if result.done else 0.0
+        else:
+            # The transition that first crosses the detection boundary belongs
+            # to straight-flight warmup.  It establishes the first RL state but
+            # is never rewarded or inserted into replay.
+            current_potential = (
+                measured_potential if self._learning_active and not result.done else self._zero_potential()
+            )
+            shaping = {"far_away": 0.0, "near_tangent": 0.0, "near_dive": 0.0}
+            terminal_reward = 0.0
+        shaping_reward = sum(shaping.values())
         potential_after = current_potential["total"]
         self._previous_potential = current_potential
-        terminal_reward = self._terminal_reward(result.info) if result.done else 0.0
         reward = shaping_reward + terminal_reward
         terminated, truncated = bool(result.terminated), bool(result.truncated)
         info = dict(result.info); info.update({
@@ -238,6 +281,11 @@ class BlueEscapeEnv:
             # Kept separate from the normalized observation so diagnostics can
             # evolve without changing a checkpoint's observation schema.
             "flight_quality_state": self._mechanism_snapshot(),
+            **self._learning_status(
+                learning_transition=learning_transition,
+                requested_action=requested_action,
+                executed_action=executed_action,
+            ),
         })
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -247,6 +295,41 @@ class BlueEscapeEnv:
             path = Path(self.config.acmi_directory) / f"episode_{self.episode:06d}.acmi"
             info["acmi_path"] = str(self.recorder.save(path))
         return self._observation(), float(reward), terminated, truncated, info
+
+    def _minimum_live_missile_range_m(self) -> float | None:
+        assert self.inner.state is not None
+        blue = self.inner.state.blue[0]
+        distances = [
+            float(np.linalg.norm(red.position_m - blue.position_m))
+            for red in self.inner.state.red
+            if red.alive
+        ]
+        return min(distances) if distances else None
+
+    def _activate_if_threat_observed(self) -> bool:
+        if self._learning_active:
+            return False
+        minimum_range_m = self._minimum_live_missile_range_m()
+        if minimum_range_m is None or minimum_range_m >= self.config.threat_detection_range_m:
+            return False
+        assert self.inner.state is not None
+        self._learning_active = True
+        self._activation_time_s = float(self.inner.state.time_s)
+        self._activation_range_m = minimum_range_m
+        return True
+
+    def _learning_status(self, *, learning_transition: bool, requested_action: int,
+                         executed_action: int) -> dict[str, object]:
+        return {
+            "learning_active": bool(self._learning_active),
+            "learning_transition": bool(learning_transition),
+            "threat_detection_range_m": float(self.config.threat_detection_range_m),
+            "minimum_live_missile_range_m": self._minimum_live_missile_range_m(),
+            "learning_activation_time_s": self._activation_time_s,
+            "learning_activation_range_m": self._activation_range_m,
+            "requested_action_index": int(requested_action),
+            "executed_action_index": int(executed_action),
+        }
 
     @staticmethod
     def _zero_potential() -> dict[str, float]:

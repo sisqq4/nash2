@@ -76,7 +76,11 @@ class ScenarioGenerator:
             speed = rng.uniform(*self.config.blue_speed_range_mps)
             velocity = speed * np.array([math.cos(heading), 0.0, math.sin(heading)], dtype=np.float64)
             if self.config.velocity_perturb_mps > 0.0:
-                velocity += rng.normal(0.0, self.config.velocity_perturb_mps, 3)
+                # Blue aircraft always start in level flight.  Random velocity
+                # perturbations may change horizontal speed and heading, but
+                # must never introduce an initial climb or dive component.
+                horizontal_noise = rng.normal(0.0, self.config.velocity_perturb_mps, 2)
+                velocity[[NORTH_AXIS, EAST_AXIS]] += horizontal_noise
                 perturbed_speed = float(np.linalg.norm(velocity))
                 bounded_speed = float(np.clip(perturbed_speed, *self.config.blue_speed_range_mps))
                 velocity = unit(velocity, np.array([math.cos(heading), 0.0, math.sin(heading)])) * bounded_speed
@@ -85,6 +89,7 @@ class ScenarioGenerator:
                     position_m=position,
                     velocity_mps=velocity,
                     mass_kg=1.0,
+                    bank_angle_rad=0.0,
                 )
             )
         return blue
