@@ -132,8 +132,9 @@ class FlightQualityTracker:
         maneuver_vectors = [np.array([command[0], command[1] * math.cos(command[2]) - 1.0,
                                       -command[1] * math.sin(command[2])]) for command in commands]
         opposite = sum(float(np.dot(a, b)) < 0 for a, b in zip(maneuver_vectors, maneuver_vectors[1:]))
-        left_right = sum(a[2] * b[2] < 0 for a, b in zip(commands, commands[1:]))
-        load_flips = sum(a[0] * b[0] < 0 or a[1] * b[1] < 0 for a, b in zip(commands, commands[1:]))
+        # Summing NumPy comparisons produces np.int64; reports need Python ints.
+        left_right = int(sum(a[2] * b[2] < 0 for a, b in zip(commands, commands[1:])))
+        load_flips = int(sum(a[0] * b[0] < 0 or a[1] * b[1] < 0 for a, b in zip(commands, commands[1:])))
         longest_extreme_run = current_extreme_run = 0
         previous_extreme: int | None = None
         for action, command in zip(actions, commands):

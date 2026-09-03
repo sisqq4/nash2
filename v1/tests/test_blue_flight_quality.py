@@ -67,14 +67,29 @@ def test_report_writes_json_and_csv_and_validates_options(tmp_path: Path) -> Non
         write_flight_quality_report([], tmp_path, baseline_survival_rate=1.1, plot_limit=0)
 
 
-def test_completed_episodes_are_streamed_as_jsonl(tmp_path: Path) -> None:
+@pytest.mark.parametrize("actions,left_right_flips,load_flips", [
+    ([0], 0, 0),
+    ([0] * 10, 0, 0),
+    ([5, 8, 5], 2, 0),
+    ([1, 3, 1], 0, 2),
+    ([11, 15, 11], 0, 2),
+    ([17, 23, 26, 20], 3, 2),
+])
+def test_completed_episodes_are_streamed_as_jsonl(
+    tmp_path: Path, actions: list[int], left_right_flips: int, load_flips: int,
+) -> None:
     tracker = FlightQualityTracker()
-    for index in range(11):
+    tracker.add(_state(0.0, [0.0, 10_000.0, 0.0], [300.0, 0.0, 0.0]))
+    for index, action in enumerate(actions, start=1):
         tracker.add(_state(index * .1, [30.0 * index, 10_000.0, 0.0], [300.0, 0.0, 0.0]),
-                    policy_action=0, executed_action=0)
+                    policy_action=action, executed_action=action)
     episode = tracker.finish(episode=7, survived=True)
+    for name, expected in (("left_right_flip_count", left_right_flips),
+                           ("positive_negative_load_flip_count", load_flips)):
+        assert type(episode["metrics"][name]) is int
+        assert episode["metrics"][name] == expected
     path = tmp_path / "flight_quality_episodes.jsonl"
     append_flight_quality_episode(episode, path)
     append_flight_quality_episode({**episode, "episode": 8}, path)
     rows = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [row["episode"] for row in rows] == [7, 8]
+    assert rows == [episode, {**episode, "episode": 8}]
