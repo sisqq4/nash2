@@ -97,46 +97,24 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 `near_dive_shaping`；`reward_diagnostics` 另外记录 `range_blend_weight`、`softmin_threat_distance`、
 `potential_before`、`potential_after`。训练窗口同时报告 C51 上下界 clamp 比例。
 
-为抑制原地盘旋、旋转爬升/下降以及相反机动的高频切换，训练奖励还在同一决策边界加入六个可配置的
-非正正则项。`action_switch_penalty` 按相邻动作的机动过载矢量差连续计罚（而不是把任意换挡一律等价
-处理）；`opposite_maneuver_penalty` 仅在去除平飞重力补偿后的相邻过载矢量夹角余弦低于阈值时计罚，
-专门约束突然反向。爬升与下降根据超过垂直速度死区的幅度分别计罚，默认下降权重较低，以免完全抵消
-近距阶段的战术俯冲收益。结构过载采用超过 6g 软阈值后的平方罚项，仍由动力学的 9g 上限负责硬裁剪；
-横向约束以决策前水平速度为随动前向，惩罚一个决策周期内超过 5m/s 的法向速度增量，并以平台在该
-决策周期内的最大理论横向速度增量归一化。它约束的是
-过快转弯而不是相对初始航向的累计偏角，因此不会错误惩罚已经稳定在新航向上的正常平飞。所有严重度
-均归一化并截断到 `[0, 1]`，不会随一个决策内的物理子步数重复累计。
-
-每步 `reward_components` 记录六个带负号的罚项；`reward_diagnostics` 同时记录动作切换严重度、相邻
-机动余弦、垂直速度、指令过载和决策周期横向速度增量，便于区分究竟是哪类异常机动导致回报下降。
-这些正则项会改变最优策略，并非势函数塑形；开始长训前应以相同 seed 分别做全关闭、逐项开启和完整
-组合消融，并联合检查生存率、动作切换率、反向切换率、垂直速度/过载/横向速度分位数，而不能只看
-episode return。
-
-上述权重定义为“整段任务在严重度始终为 1 时的最大累计预算”，每步实际罚值还会乘以
-`decision_interval_s / policy_horizon_s`。这样更改决策间隔或物理子步数不会无意放大奖励尺度，并保证
-默认六项预算总和小于生存/被击中的终局回报差。动作切换奖励依赖上一动作，因此新训练使用
-`normalized_v3`：在原 `normalized_v2` 后附加归一化的上一动作 `[轴向过载, 法向过载, 滚转角]`，使该
-奖励保持马尔可夫性；评估和常规运行仍兼容旧的 `legacy_v1` 与 `normalized_v2` checkpoint。
-
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 1,2,3,4 --episodes 1000
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 1,2,3,4
 ```
 
-## 当前 normalized_v3 推荐命令
+## 当前 normalized_v2 推荐命令
 
-以下命令均从 `v1/` 目录执行。新启动的训练会自动使用 `normalized_v3`，无需额外指定 schema；checkpoint
+以下命令均从 `v1/` 目录执行。新启动的训练会自动使用 `normalized_v2`，无需额外指定 schema；checkpoint
 会保存 schema，评估入口会自动校验，不能手工混用旧的 `legacy_v1` 输入。
 
-先做快速 smoke，确认环境进程、25 维联合观测、replay、更新和 checkpoint 全链路可运行：
+先做快速 smoke，确认环境进程、22 维联合观测、replay、更新和 checkpoint 全链路可运行：
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --missiles 1,2,3,4 --episodes 8 --seed 42 --device cpu \
   --parallel-envs 2 --batch-size 8 --updates-per-transition 0.25 \
   --checkpoint-interval 8 --log-interval 2 --acmi-interval 0 \
-  --output outputs/blue_rl/smoke_normalized_v3
+  --output outputs/blue_rl/smoke_normalized_v2
 ```
 
 推荐的课程训练（默认课程完整长度为 7500 回合）：
@@ -147,18 +125,18 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --parallel-envs 16 --env-worker-threads 1 \
   --batch-size 256 --updates-per-transition 0.5 \
   --checkpoint-interval 500 --log-interval 10 --acmi-interval 0 \
-  --output outputs/blue_rl/curriculum_normalized_v3
+  --output outputs/blue_rl/curriculum_normalized_v2
 ```
 
 固定独立 seed 对最终 checkpoint 做 1v1～1v4 联合评估：
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
-  outputs/blue_rl/curriculum_normalized_v3/blue_rainbow.pt \
+  outputs/blue_rl/curriculum_normalized_v2/blue_rainbow.pt \
   --missiles 1,2,3,4 --episodes 4000 --seed 10042 --device cuda:0 \
   --parallel-envs 16 --env-worker-threads 1 \
   --log-interval 100 --acmi-interval 0 \
-  --output outputs/blue_rl/eval_normalized_v3
+  --output outputs/blue_rl/eval_normalized_v2
 ```
 
 代码回归测试和命令行检查：
@@ -172,13 +150,12 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl --help
 
 ## 课程学习（可选，原训练方式不变）
 
-课程模式通过单独的 `--curriculum` 开关启用。新训练统一使用版本化 `normalized_v3` 观测：蓝机水平位置置于
+课程模式通过单独的 `--curriculum` 开关启用。新训练统一使用版本化 `normalized_v2` 观测：蓝机水平位置置于
 相对原点、绝对高度除以 20 km、速度除以 2000 m/s、弹机相对位置除以 200 km，并在每个导弹槽后附加一个
-有效位，并附加 3 维上一动作。因此课程模式从第一回合起固定使用 `max_missiles=4`、25 维观测和
+有效位。因此课程模式从第一回合起固定使用 `max_missiles=4`、22 维观测和
 29 维动作；无效槽严格补零。
 旧训练环境接口仍默认 `legacy_v1`，评估和常规运行会根据 checkpoint 输入维度自动选用旧的 9/12/15/18 维
-schema、`normalized_v2` 的 10/14/18/22 维，或 `normalized_v3` 的 13/17/21/25 维 schema。
-旧 checkpoint 不会被静默解释为新输入。
+schema 或新的 10/14/18/22 维 schema。旧 checkpoint 不会被静默解释为新输入。
 
 默认八阶段共 **7500** 回合（原建议表各行相加是 7500，而不是文字中的 8500），保留所有旧难度复习，
 并在每一新阶段前 500 回合线性改变抽样概率。若希望达到建议的 10,000–12,000 回合，应在完成默认课程后，

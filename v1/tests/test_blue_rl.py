@@ -101,20 +101,6 @@ def test_normalized_v2_observation_is_dimensionless_and_masks_padding() -> None:
     assert env._observation() == pytest.approx(translated)
 
 
-def test_normalized_v3_observation_exposes_previous_action_state() -> None:
-    cfg = short_config()
-    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
-        observation_schema="normalized_v3", decision_interval_s=cfg.time_step_s,
-        record_acmi=False,
-    ))
-    initial, _ = env.reset(seed=1)
-    assert initial.shape == (13,)
-    assert initial[-3:] == pytest.approx([0.0, 1.0 / 9.0, 0.0])
-
-    following, _, _, _, _ = env.step(1)
-    assert following[-3:] == pytest.approx([0.5, 1.0 / 9.0, 0.0])
-
-
 def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
     schedule = CurriculumSchedule()
     assert schedule.total_episodes == 7500
@@ -342,45 +328,6 @@ def test_blue_threat_potential_is_bounded_and_normalized_across_missile_counts()
         totals.append(potential["total"])
 
     assert totals == pytest.approx([totals[0]] * 4)
-
-
-def test_maneuver_regularizers_penalize_switch_reversal_and_state_limits() -> None:
-    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(record_acmi=False))
-    env.reset(seed=4)
-    assert env.inner.state is not None
-
-    first, _ = env._maneuver_penalties(0)
-    assert first["action_switch_penalty"] == 0.0
-    assert first["opposite_maneuver_penalty"] == 0.0
-
-    env._previous_action = 1
-    reversed_penalties, diagnostics = env._maneuver_penalties(3)
-    assert reversed_penalties["action_switch_penalty"] > 0.0
-    assert reversed_penalties["opposite_maneuver_penalty"] > 0.0
-    assert diagnostics["maneuver_cosine"] < env.config.opposite_maneuver_cosine
-
-    blue = env.inner.state.blue[0]
-    velocity_before = np.array([400.0, 0.0, 0.0])
-    blue.velocity_mps[[0, 2]] = [400.0, 400.0]
-    blue.velocity_mps[1] = 300.0
-    constrained, state_diagnostics = env._maneuver_penalties(7, velocity_before)
-    assert constrained["climb_rate_penalty"] > 0.0
-    assert constrained["descent_rate_penalty"] == 0.0
-    assert constrained["overload_penalty"] > 0.0
-    assert constrained["lateral_speed_penalty"] > 0.0
-    assert state_diagnostics["lateral_velocity_change_mps"] == pytest.approx(400.0)
-
-    blue.velocity_mps[1] = -300.0
-    descending, _ = env._maneuver_penalties(0, velocity_before)
-    assert descending["climb_rate_penalty"] == 0.0
-    assert descending["descent_rate_penalty"] > 0.0
-
-
-def test_maneuver_regularizer_configuration_rejects_invalid_limits() -> None:
-    with pytest.raises(ValueError, match="reward scales, ranges, or tactical weights"):
-        BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(overload_soft_limit_g=10.0))
-    with pytest.raises(ValueError, match="reward scales, ranges, or tactical weights"):
-        BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(opposite_maneuver_cosine=0.0))
 
 
 def test_discounted_potential_shaping_telescopes() -> None:

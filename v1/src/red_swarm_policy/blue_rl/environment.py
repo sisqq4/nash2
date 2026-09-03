@@ -8,7 +8,6 @@ import numpy as np
 
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.environment import RedBlueEngagementEnv
-from ..env.math_utils import G0
 from ..env.types import EnvironmentConfig, RedAction
 from .acmi import AcmiRecorder
 
@@ -39,22 +38,12 @@ class BlueEscapeEnvConfig:
     far_away_weight: float = 1.0
     near_tangent_weight: float = 0.65
     near_dive_weight: float = 0.35
-    action_switch_penalty: float = 0.50
-    opposite_maneuver_penalty: float = 1.00
-    climb_rate_penalty: float = 0.50
-    descent_rate_penalty: float = 0.25
-    overload_penalty: float = 0.50
-    lateral_speed_penalty: float = 0.50
-    vertical_speed_deadband_mps: float = 20.0
-    overload_soft_limit_g: float = 6.0
-    lateral_speed_limit_mps: float = 5.0
-    opposite_maneuver_cosine: float = -0.25
 
     def validate(self, environment: EnvironmentConfig) -> None:
         if not 1 <= self.missile_count <= self.max_missiles <= 4:
             raise ValueError("blue training supports one to four missiles against one aircraft")
-        if self.observation_schema not in {"legacy_v1", "normalized_v2", "normalized_v3"}:
-            raise ValueError("observation_schema must be 'legacy_v1', 'normalized_v2', or 'normalized_v3'")
+        if self.observation_schema not in {"legacy_v1", "normalized_v2"}:
+            raise ValueError("observation_schema must be 'legacy_v1' or 'normalized_v2'")
         if (
             isinstance(self.acmi_episode_interval, bool)
             or not isinstance(self.acmi_episode_interval, (int, np.integer))
@@ -70,11 +59,6 @@ class BlueEscapeEnvConfig:
             self.fast_success_bonus, self.shaping_scale, self.shaping_discount, self.near_range_m,
             self.range_transition_m, self.threat_softmin_temperature_m,
             self.far_away_weight, self.near_tangent_weight, self.near_dive_weight,
-            self.action_switch_penalty, self.opposite_maneuver_penalty,
-            self.climb_rate_penalty, self.descent_rate_penalty,
-            self.overload_penalty, self.lateral_speed_penalty,
-            self.vertical_speed_deadband_mps, self.overload_soft_limit_g,
-            self.lateral_speed_limit_mps, self.opposite_maneuver_cosine,
         )
         if not all(math.isfinite(value) for value in scalar_values):
             raise ValueError("blue reward configuration values must be finite")
@@ -86,13 +70,6 @@ class BlueEscapeEnvConfig:
             or min(self.near_range_m, self.range_transition_m, self.threat_softmin_temperature_m) <= 0.0
             or min(self.far_away_weight, self.near_tangent_weight, self.near_dive_weight) < 0.0
             or not np.isclose(self.near_tangent_weight + self.near_dive_weight, 1.0)
-            or min(self.action_switch_penalty, self.opposite_maneuver_penalty,
-                   self.climb_rate_penalty, self.descent_rate_penalty,
-                   self.overload_penalty, self.lateral_speed_penalty) < 0.0
-            or not 0.0 <= self.vertical_speed_deadband_mps < environment.aircraft.max_speed_mps
-            or not 0.0 < self.overload_soft_limit_g <= environment.aircraft.max_load_factor_g
-            or not 0.0 <= self.lateral_speed_limit_mps < environment.aircraft.max_speed_mps
-            or not -1.0 <= self.opposite_maneuver_cosine < 0.0
         ):
             raise ValueError("blue reward scales, ranges, or tactical weights are invalid")
 
@@ -115,14 +92,10 @@ class BlueEscapeEnv:
         # multi-scenario run pads missing missile slots to max_missiles so one
         # policy can consume every selected scenario.
         slots = config.max_missiles if config.pad_observation_to_max_missiles else config.missile_count
-        normalized = config.observation_schema in {"normalized_v2", "normalized_v3"}
-        self.observation_dim = 6 + slots * (4 if normalized else 3)
-        if config.observation_schema == "normalized_v3":
-            self.observation_dim += 3
+        self.observation_dim = 6 + slots * (4 if config.observation_schema == "normalized_v2" else 3)
         self.action_dim = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G)
         self.recorder = AcmiRecorder(); self.episode = 0
         self._previous_potential: dict[str, float] = {}
-        self._previous_action: int | None = 0
         self._record_current_episode = False
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
@@ -148,9 +121,6 @@ class BlueEscapeEnv:
         if self._record_current_episode:
             self.recorder.record(self.inner.state)
         self._previous_potential = self._threat_potential()
-        # Level flight is the explicit pre-decision command represented in the
-        # normalized_v3 observation and used for the first switch comparison.
-        self._previous_action = 0
         info = {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
@@ -222,8 +192,6 @@ class BlueEscapeEnv:
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         if not 0 <= int(action) < self.action_dim: raise ValueError(f"action must be in [0, {self.action_dim})")
-        assert self.inner.state is not None
-        velocity_before = self.inner.state.blue[0].velocity_mps.copy()
         result = None
         for _ in range(self.frames_per_action):
             assert self.inner.state is not None
@@ -247,10 +215,7 @@ class BlueEscapeEnv:
         potential_after = current_potential["total"]
         self._previous_potential = current_potential
         terminal_reward = self._terminal_reward(result.info) if result.done else 0.0
-        maneuver_penalties, maneuver_diagnostics = self._maneuver_penalties(int(action), velocity_before)
-        maneuver_penalty = sum(maneuver_penalties.values())
-        self._previous_action = int(action)
-        reward = shaping_reward + terminal_reward - maneuver_penalty
+        reward = shaping_reward + terminal_reward
         terminated, truncated = bool(result.terminated), bool(result.truncated)
         info = dict(result.info); info.update({
             "pure_pn": True,
@@ -262,7 +227,6 @@ class BlueEscapeEnv:
                 "near_tangent_shaping": float(shaping["near_tangent"]),
                 "near_dive_shaping": float(shaping["near_dive"]),
                 "terminal": float(terminal_reward),
-                **{name: -float(value) for name, value in maneuver_penalties.items()},
             },
             "reward_diagnostics": {
                 "range_blend_weight": float(measured_potential["range_blend_weight"]),
@@ -270,7 +234,6 @@ class BlueEscapeEnv:
                 "potential_before": float(potential_before),
                 "potential_after": float(potential_after),
                 "measured_potential_after": float(measured_potential["total"]),
-                **maneuver_diagnostics,
             },
             # Kept separate from the normalized observation so diagnostics can
             # evolve without changing a checkpoint's observation schema.
@@ -284,95 +247,6 @@ class BlueEscapeEnv:
             path = Path(self.config.acmi_directory) / f"episode_{self.episode:06d}.acmi"
             info["acmi_path"] = str(self.recorder.save(path))
         return self._observation(), float(reward), terminated, truncated, info
-
-    def _maneuver_penalties(
-        self, action: int, velocity_before: np.ndarray | None = None
-    ) -> tuple[dict[str, float], dict[str, float]]:
-        """Return bounded, decision-rate regularizers for physically plausible flight.
-
-        Switching and reversal use maneuver load (with level-flight gravity support
-        removed), while the state terms constrain the resulting trajectory.  This
-        keeps the shaping independent of the number of 0.005 s physics substeps.
-        """
-        assert self.inner.state is not None
-        command = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[action]
-        previous = None if self._previous_action is None else BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[self._previous_action]
-
-        def maneuver_vector(value: np.ndarray) -> np.ndarray:
-            axial, normal, bank = value
-            return np.array([axial, (normal * math.cos(bank)) - 1.0,
-                             -normal * math.sin(bank)], dtype=np.float64)
-
-        current_vector = maneuver_vector(command)
-        switch_severity = 0.0
-        reversal_severity = 0.0
-        maneuver_cosine = 1.0
-        if previous is not None:
-            previous_vector = maneuver_vector(previous)
-            load_delta = float(np.linalg.norm(current_vector - previous_vector))
-            switch_severity = min(1.0, load_delta / (2.0 * self.environment_config.aircraft.max_load_factor_g))
-            norms = float(np.linalg.norm(current_vector) * np.linalg.norm(previous_vector))
-            if norms > 1.0e-9:
-                maneuver_cosine = float(np.clip(np.dot(current_vector, previous_vector) / norms, -1.0, 1.0))
-                reversal_severity = float(np.clip(
-                    (self.config.opposite_maneuver_cosine - maneuver_cosine)
-                    / (1.0 + self.config.opposite_maneuver_cosine), 0.0, 1.0
-                ))
-
-        blue = self.inner.state.blue[0]
-        before = blue.velocity_mps if velocity_before is None else np.asarray(velocity_before, dtype=np.float64)
-        if before.shape != (3,) or not np.all(np.isfinite(before)):
-            raise ValueError("velocity_before must be a finite three-vector")
-        vertical_speed = float(blue.velocity_mps[1])
-        vertical_excess = max(0.0, abs(vertical_speed) - self.config.vertical_speed_deadband_mps)
-        vertical_severity = min(1.0, vertical_excess / max(
-            self.environment_config.aircraft.max_speed_mps - self.config.vertical_speed_deadband_mps, 1.0
-        ))
-        load_g = float(np.hypot(command[0], command[1]))
-        overload_severity = float(np.clip(
-            (load_g - self.config.overload_soft_limit_g)
-            / max(self.environment_config.aircraft.max_load_factor_g - self.config.overload_soft_limit_g, 1.0e-9),
-            0.0, 1.0,
-        ))
-        horizontal_before = before[[0, 2]]
-        horizontal_speed_before = float(np.linalg.norm(horizontal_before))
-        forward = (horizontal_before / horizontal_speed_before
-                   if horizontal_speed_before > 1.0e-9 else np.array([1.0, 0.0]))
-        lateral_direction = np.array([-forward[1], forward[0]])
-        lateral_speed = abs(float(np.dot(
-            blue.velocity_mps[[0, 2]] - horizontal_before, lateral_direction
-        )))
-        maximum_lateral_delta = (
-            self.environment_config.aircraft.max_load_factor_g * G0 * self.config.decision_interval_s
-        )
-        lateral_severity = float(np.clip(
-            (lateral_speed - self.config.lateral_speed_limit_mps)
-            / max(maximum_lateral_delta - self.config.lateral_speed_limit_mps, 1.0e-9),
-            0.0, 1.0,
-        ))
-        # Configured weights are full-horizon budgets.  Scaling by the fraction
-        # of one decision in the mission prevents dense penalties from growing
-        # large enough to reverse the terminal survival preference.
-        budget_scale = self.config.decision_interval_s / max(
-            self.environment_config.policy_horizon_s, self.config.decision_interval_s
-        )
-        penalties = {
-            "action_switch_penalty": budget_scale * self.config.action_switch_penalty * switch_severity,
-            "opposite_maneuver_penalty": budget_scale * self.config.opposite_maneuver_penalty * reversal_severity,
-            "climb_rate_penalty": budget_scale * self.config.climb_rate_penalty * vertical_severity if vertical_speed > 0.0 else 0.0,
-            "descent_rate_penalty": budget_scale * self.config.descent_rate_penalty * vertical_severity if vertical_speed < 0.0 else 0.0,
-            "overload_penalty": budget_scale * self.config.overload_penalty * overload_severity ** 2,
-            "lateral_speed_penalty": budget_scale * self.config.lateral_speed_penalty * lateral_severity ** 2,
-        }
-        diagnostics = {
-            "maneuver_switch_severity": switch_severity,
-            "maneuver_cosine": maneuver_cosine,
-            "vertical_speed_mps": vertical_speed,
-            "commanded_load_g": load_g,
-            "lateral_velocity_change_mps": lateral_speed,
-            "maneuver_penalty_budget_scale": budget_scale,
-        }
-        return penalties, diagnostics
 
     @staticmethod
     def _zero_potential() -> dict[str, float]:
@@ -455,7 +329,7 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         state = self.inner.state
         blue = state.blue[0]
-        if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:
+        if self.config.observation_schema == "normalized_v2":
             # Versioned, dimensionless input.  Horizontal position is relative
             # to the blue aircraft (altitude remains absolute because ground
             # clearance matters).  A per-slot validity bit removes zero-padding
@@ -467,11 +341,6 @@ class BlueEscapeEnv:
                 values.append(1.0)
             if self.config.pad_observation_to_max_missiles:
                 values.extend([0.0] * (4 * (self.config.max_missiles - len(state.red))))
-            if self.config.observation_schema == "normalized_v3":
-                previous = 0 if self._previous_action is None else self._previous_action
-                command = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[previous]
-                values.extend((command[:2] / self.environment_config.aircraft.max_load_factor_g).tolist())
-                values.append(float(command[2] / math.pi))
             return np.asarray(values, dtype=np.float32)
         # Legacy checkpoint contract: kilometres and kilometres/second.
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]

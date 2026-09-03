@@ -158,19 +158,16 @@ def main() -> int:
     immutable_learner_state = (agent.total_steps, agent.optimizer_updates, agent.target_updates,
                                agent.replay.size, tuple(parameter._version for parameter in agent.online.parameters()))
     slots = max(missile_scenarios)
-    legacy_dim, normalized_dim, regularized_dim = 6 + slots * 3, 6 + slots * 4, 9 + slots * 4
+    legacy_dim, normalized_dim = 6 + slots * 3, 6 + slots * 4
     checkpoint_schema = agent.config.observation_schema
-    if checkpoint_schema == "normalized_v3" and agent.config.observation_dim == regularized_dim:
-        observation_schema = "normalized_v3"
-    elif checkpoint_schema == "normalized_v2" and agent.config.observation_dim == normalized_dim:
+    if checkpoint_schema == "normalized_v2" and agent.config.observation_dim == normalized_dim:
         observation_schema = "normalized_v2"
     elif checkpoint_schema == "legacy_v1" and agent.config.observation_dim == legacy_dim:
         observation_schema = "legacy_v1"
     else:
         raise ValueError(
             f"checkpoint schema/dimension ({checkpoint_schema}, {agent.config.observation_dim}) "
-            f"does not match --missiles; expected legacy ({legacy_dim}), normalized_v2 "
-            f"({normalized_dim}), or normalized_v3 ({regularized_dim})"
+            f"does not match --missiles; expected legacy ({legacy_dim}) or normalized ({normalized_dim})"
         )
     config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=slots,
                                  pad_observation_to_max_missiles=len(missile_scenarios) > 1,
@@ -179,8 +176,7 @@ def main() -> int:
                                  expose_evaluation_mechanism_state=True,
                                  acmi_episode_interval=args.acmi_interval,
                                  acmi_directory=str(output / "acmi"))
-    observation_dim = (regularized_dim if observation_schema == "normalized_v3" else
-                       normalized_dim if observation_schema == "normalized_v2" else legacy_dim)
+    observation_dim = normalized_dim if observation_schema == "normalized_v2" else legacy_dim
     action_dim = 29
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
