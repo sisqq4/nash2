@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.types import EngagementState, EnvironmentConfig
 from .environment import BlueEscapeEnvConfig
 from .policy import DiscreteBluePolicy
@@ -34,12 +35,16 @@ class BlueRLController:
                 f"checkpoint expects {self.config.missile_count} missiles, got {len(state.red)}"
             )
         blue = state.blue[0]
-        if self.config.observation_schema == "normalized_v2":
+        if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:
             values = [0.0, blue.position_m[1] / 20000.0, 0.0,
                       *(blue.velocity_mps / 2000.0)]
             for red in state.red:
                 values.extend((red.position_m - blue.position_m) / 200000.0)
                 values.append(1.0)
+            if self.config.observation_schema == "normalized_v3":
+                command = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[self._action]
+                values.extend((command[:2] / self.environment.aircraft.max_load_factor_g).tolist())
+                values.append(float(command[2] / np.pi))
             return np.asarray(values, dtype=np.float32)
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]
         for red in state.red:
