@@ -5,6 +5,9 @@ from __future__ import annotations
 import csv
 import json
 import math
+
+import os
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -166,15 +169,20 @@ class FlightQualityTracker:
             "spiral_event_count": len(spiral_runs),
             "spiral_total_duration_s": sum(float(dt[a:b].sum()) for a, b in spiral_runs),
             "spiral_longest_duration_s": max((float(dt[a:b].sum()) for a, b in spiral_runs), default=0.0),
-            "spiral_climb_count": sum(float(np.mean(fpa[a:b])) > 0 for a, b in spiral_runs),
-            "spiral_dive_count": sum(float(np.mean(fpa[a:b])) < 0 for a, b in spiral_runs),
+
+            "spiral_climb_count": int(sum(float(np.mean(fpa[a:b])) > 0 for a, b in spiral_runs)),
+            "spiral_dive_count": int(sum(float(np.mean(fpa[a:b])) < 0 for a, b in spiral_runs)),
+
             "spiral_max_abs_fpa_deg": max((float(np.abs(fpa[a:b]).max()) for a, b in spiral_runs), default=0.0),
             "spiral_min_radius_m": min((float(radius[a:b].min()) for a, b in spiral_runs), default=None),
             "reversal_event_count": len(reversal_events),
             "reversal_total_duration_s": sum(float(time[b] - time[a]) for a, b in reversal_events),
             "minimum_displacement_efficiency": min(efficiencies, default=1.0),
             "maximum_velocity_reversal_deg": max(reversal_angles, default=0.0),
-            "reversal_with_low_horizontal_speed_count": sum(np.any(low_mask[a:b + 1]) for a, b in reversal_events),
+
+            "reversal_with_low_horizontal_speed_count": int(sum(
+                bool(np.any(low_mask[a:b + 1])) for a, b in reversal_events)),
+
             "action_switch_rate_hz": switches / max(float(time[-1] - time[0]), EPS),
             "opposite_action_switch_count": opposite, "left_right_flip_count": left_right,
             "positive_negative_load_flip_count": load_flips,
@@ -210,6 +218,16 @@ class FlightQualityTracker:
                  "red_positions_m": [s["red_positions_m"] for s in self.samples]}
         return {"episode": episode, "blue_survived": survived, "metrics": metrics,
                 "verdicts": verdicts, "events": sorted(events, key=lambda e: e["start_s"]), "trace": trace}
+
+
+def append_flight_quality_episode(episode: dict[str, Any], path: Path) -> None:
+    """Durably archive a completed episode instead of waiting for run completion."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(episode, ensure_ascii=True, allow_nan=False)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(encoded + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def write_flight_quality_report(episodes: list[dict[str, Any]], output: Path,

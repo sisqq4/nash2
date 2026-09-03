@@ -15,6 +15,7 @@ import torch
 
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
                       FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
+                      append_flight_quality_episode,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
@@ -129,8 +130,11 @@ def main() -> int:
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_path) if args.metrics_path else output / "training_metrics.json"
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "training.jsonl"
+    flight_quality_jsonl_path = output / "flight_quality" / "flight_quality_episodes.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     jsonl_path.write_text("", encoding="utf-8")
+    flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
@@ -168,6 +172,7 @@ def main() -> int:
             "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
             "environment_config": asdict(environment_config),
             "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
+            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
             "curriculum": curriculum.describe() if curriculum is not None else None,
         }
         device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
@@ -257,6 +262,7 @@ def main() -> int:
                                                             survived=bool(result.info["blue_survived"]))
                     row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
                     quality_episodes.append(quality_result)
+                    append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0

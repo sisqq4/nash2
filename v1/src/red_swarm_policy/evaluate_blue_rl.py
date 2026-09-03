@@ -14,6 +14,7 @@ import torch
 
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
                       EvaluationShapingConfig, FlightQualityTracker, RainbowDQNAgent,
+                      append_flight_quality_episode,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
@@ -138,7 +139,10 @@ def main() -> int:
         raise SystemExit("baseline survival rate must be in [0, 1]")
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "evaluation.jsonl"
+    flight_quality_jsonl_path = output / "flight_quality" / "flight_quality_episodes.jsonl"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.write_text("", encoding="utf-8")
+    flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+    flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     shaping_config = EvaluationShapingConfig(
         threat=args.mechanism_threat, timing=args.mechanism_timing,
@@ -200,6 +204,7 @@ def main() -> int:
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
+           "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                      "direction": shaping_config.direction, "overload": shaping_config.overload,
                                      "weight": shaping_config.weight},
@@ -290,6 +295,7 @@ def main() -> int:
                     quality_result = quality[worker].finish(episode=episode, survived=bool(result.info["blue_survived"]))
                     row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
                     quality_episodes.append(quality_result)
+                    append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0

@@ -289,6 +289,9 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_evasion \
 训练和评估现在都会在输出目录的 `flight_quality/` 下维护独立验收产物：
 
 - `flight_quality.json`：逐回合完整时序、异常事件起止时间、硬门槛结论和总体生存率对比；
+
+- `flight_quality_episodes.jsonl`：每个回合结束时立即追加一行完整诊断，即使训练中断也保留已完成回合；
+
 - `flight_quality_summary.csv`：一回合一行的汇总表，便于回归比较和导入表格工具；
 - `episode_XXXXXX.png`：最低分代表回合的六联图（3D/俯视轨迹、高度、航迹倾角与航向角速度、速度与转弯半径、策略/执行动作及安全介入）。
 

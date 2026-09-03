@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from red_swarm_policy.blue_rl.flight_quality import FlightQualityTracker, write_flight_quality_report
+from red_swarm_policy.blue_rl.flight_quality import (
+    FlightQualityTracker,
+    append_flight_quality_episode,
+    write_flight_quality_report,
+)
 
 
 def _state(time_s: float, position: list[float], velocity: list[float]) -> dict[str, object]:
@@ -61,3 +65,16 @@ def test_report_writes_json_and_csv_and_validates_options(tmp_path: Path) -> Non
         write_flight_quality_report([], tmp_path, plot_limit=-1)
     with pytest.raises(ValueError, match="baseline_survival_rate"):
         write_flight_quality_report([], tmp_path, baseline_survival_rate=1.1, plot_limit=0)
+
+
+def test_completed_episodes_are_streamed_as_jsonl(tmp_path: Path) -> None:
+    tracker = FlightQualityTracker()
+    for index in range(11):
+        tracker.add(_state(index * .1, [30.0 * index, 10_000.0, 0.0], [300.0, 0.0, 0.0]),
+                    policy_action=0, executed_action=0)
+    episode = tracker.finish(episode=7, survived=True)
+    path = tmp_path / "flight_quality_episodes.jsonl"
+    append_flight_quality_episode(episode, path)
+    append_flight_quality_episode({**episode, "episode": 8}, path)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["episode"] for row in rows] == [7, 8]
