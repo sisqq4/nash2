@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates-per-transition", type=float, default=1.0,
                         help="Gradient updates scheduled per collected environment transition")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--replay-size", type=int, default=50_000,
+                        help="Maximum number of transitions retained by prioritized replay")
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Print and archive one aggregate row every N completed episodes")
     parser.add_argument("--metrics-path", default=None,
@@ -112,8 +114,9 @@ def main() -> int:
         raise SystemExit("episodes, checkpoint interval and log interval must be positive")
     if args.acmi_interval < 0 or args.parallel_envs < 1 or args.env_worker_threads < 1:
         raise SystemExit("ACMI interval must be non-negative and worker counts positive")
-    if args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0 or args.batch_size < 1:
-        raise SystemExit("timeout and batch size must be positive; update ratio must be non-negative")
+    if (args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0
+            or args.batch_size < 1 or args.replay_size < 1):
+        raise SystemExit("timeout, batch size, and replay size must be positive; update ratio must be non-negative")
     curriculum = CurriculumSchedule(transition_episodes=args.curriculum_transition_episodes) if args.curriculum else None
     if curriculum is not None and args.episodes > curriculum.total_episodes:
         raise SystemExit(f"curriculum defines at most {curriculum.total_episodes} episodes")
@@ -139,6 +142,7 @@ def main() -> int:
     rainbow_config = RainbowDQNConfig(9 + max(training_scenarios) * 4, 29,
                                       observation_schema=env_config.observation_schema,
                                       batch_size=args.batch_size,
+                                      replay_size=args.replay_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,

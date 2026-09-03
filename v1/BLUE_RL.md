@@ -211,7 +211,7 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
 ## 参数设置
 
 命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4 的逗号分隔子集）、`--episodes`、`--seed`、
-`--device`、`--decision-interval`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
+`--device`、`--decision-interval`、`--replay-size`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
 `EnvironmentConfig`；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
 
 ```json
@@ -233,6 +233,7 @@ cd v1
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --missiles 4 --episodes 1000 --seed 42 --device cuda:0 \
   --parallel-envs 16 --env-worker-threads 1 --batch-size 256 \
+  --replay-size 500000 \
   --updates-per-transition 0.5 \
   --log-interval 10 \
   --acmi-interval 10 \
