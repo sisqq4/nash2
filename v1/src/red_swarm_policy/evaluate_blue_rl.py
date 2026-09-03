@@ -13,7 +13,8 @@ import numpy as np
 import torch
 
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
-                      EvaluationShapingConfig, RainbowDQNAgent)
+                      EvaluationShapingConfig, FlightQualityTracker, RainbowDQNAgent,
+                      write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
 
@@ -48,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
                             help=f"Relative {name} score weight before phase scheduling")
     parser.add_argument("--mechanism-detail-log", action="store_true",
                         help="Store per-decision Q vectors and mechanism scores for offline analysis")
+    parser.add_argument("--flight-quality-plot-limit", type=int, default=10,
+                        help="Plot this many lowest-scoring episodes; 0 disables plots")
+    parser.add_argument("--baseline-survival-rate", type=float, default=None,
+                        help="Reference survival rate used to flag a decrease larger than 5 percentage points")
     return parser
 
 
@@ -128,6 +133,9 @@ def main() -> int:
     except ValueError as error: raise SystemExit(str(error)) from error
     if args.episodes < 1 or args.parallel_envs < 1 or args.env_worker_threads < 1 or args.log_interval < 1: raise SystemExit("episode, worker, and log interval counts must be positive")
     if args.acmi_interval < 0 or args.env_worker_timeout_s <= 0: raise SystemExit("invalid ACMI interval or worker timeout")
+    if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
+    if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
+        raise SystemExit("baseline survival rate must be in [0, 1]")
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "evaluation.jsonl"
     jsonl_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.write_text("", encoding="utf-8")
@@ -176,7 +184,8 @@ def main() -> int:
     mechanism_states: dict[int, dict[str, object]] = {}
     shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
     mechanism_interventions: dict[int, int] = {}; mechanism_diagnostics: dict[int, dict[str, object]] = {}
-    mechanism_traces: dict[int, list[dict[str, object]]] = {}
+    mechanism_traces: dict[int, list[dict[str, object]]] = {}; quality: dict[int, FlightQualityTracker] = {}
+    quality_episodes: list[dict[str, Any]] = []
     decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}; initializations = {}
     reward_component_sums: dict[int, Counter[str]] = {}; reward_diagnostic_sums: dict[int, Counter[str]] = {}
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
@@ -206,10 +215,12 @@ def main() -> int:
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
             mechanism_interventions[worker] = 0; shapers[worker].reset()
             mechanism_traces[worker] = []
+            quality[worker] = FlightQualityTracker()
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
         for worker, (observation, reset_info) in pool.reset(assignments).items():
             observations[worker] = observation; initializations[worker] = reset_info["initialization"]
             mechanism_states[worker] = reset_info["mechanism_state"]
+            quality[worker].add(reset_info["flight_quality_state"])
         while observations:
             workers = sorted(observations)
             observation_batch = np.stack([observations[w] for w in workers])
@@ -231,6 +242,12 @@ def main() -> int:
             for worker, action in zip(workers, actions):
                 result = results[worker]; rewards[worker] += result.reward; observations[worker] = result.observation
                 mechanism_states[worker] = dict(result.info["mechanism_state"])
+                diagnostic = mechanism_diagnostics.get(worker, {})
+                raw_action = int(diagnostic.get("raw_action", action))
+                quality[worker].add(result.info["flight_quality_state"], policy_action=raw_action,
+                                    executed_action=int(action),
+                                    safety_intervened=bool(diagnostic.get("safety_filter_intervened", False)),
+                                    safety_reasons=list(diagnostic.get("hard_mask_reasons", [])))
                 decisions[worker] += 1; action_counts[worker][int(action)] += 1
                 for name, value in dict(result.info.get("reward_components", {})).items():
                     reward_component_sums[worker][str(name)] += float(value)
@@ -270,12 +287,16 @@ def main() -> int:
                                          **({"trace": mechanism_traces[worker]}
                                             if args.mechanism_detail_log else {})}}
                     rows.append(row); window_rows.append(row); completed += 1
+                    quality_result = quality[worker].finish(episode=episode, survived=bool(result.info["blue_survived"]))
+                    row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
+                    quality_episodes.append(quality_result)
                     if next_episode <= args.episodes:
                         resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
                         episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
                         action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
                         mechanism_interventions[worker] = 0; mechanism_diagnostics.pop(worker, None)
                         mechanism_traces[worker] = []
+                        quality[worker] = FlightQualityTracker()
                         shapers[worker].reset()
                         reward_diagnostic_sums[worker] = Counter(); next_episode += 1
                     else:
@@ -284,10 +305,12 @@ def main() -> int:
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
                         mechanism_states.pop(worker); mechanism_interventions.pop(worker)
                         mechanism_traces.pop(worker)
+                        quality.pop(worker)
             if resets:
                 for worker, (observation, reset_info) in pool.reset(resets).items():
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
                     mechanism_states[worker] = reset_info["mechanism_state"]
+                    quality[worker].add(reset_info["flight_quality_state"])
             if completed >= next_log or (completed == args.episodes and window_rows):
                 now = time.monotonic(); window_rewards = [float(row["reward"]) for row in window_rows]
                 misses = [float(row["miss_distance_m"]) for row in window_rows]
@@ -331,6 +354,9 @@ def main() -> int:
     if current_learner_state != immutable_learner_state:
         raise RuntimeError("evaluation modified learner state; training and updates are forbidden")
     elapsed = time.monotonic() - started
+    flight_quality_summary = write_flight_quality_report(
+        sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
+        baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
     summary = {"episodes": args.episodes, "missile_scenarios": list(missile_scenarios),
                "survival_rate": statistics["survival_rate"], "statistics": statistics,
                "by_blue_orientation": by_blue_orientation,
@@ -346,6 +372,7 @@ def main() -> int:
                "checkpoint_optimizer_updates": agent.optimizer_updates,
                "checkpoint_target_updates": agent.target_updates,
                "elapsed_s": elapsed,
+               "flight_quality": flight_quality_summary,
                "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
                "results": rows}
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
