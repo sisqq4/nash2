@@ -87,7 +87,16 @@ class ThreeDoFPhysicsLayer:
         previous = np.asarray(state.aircraft_executed_load_body_g, dtype=np.float64)
         axial = float(previous[0] + np.clip(requested[0] - previous[0], -cfg.axial_load_rate_gps * dt, cfg.axial_load_rate_gps * dt))
         normal = float(previous[1] + np.clip(requested[1] - previous[1], -cfg.normal_load_rate_gps * dt, cfg.normal_load_rate_gps * dt))
-        bank_delta = (float(requested[2]) - state.aircraft_executed_bank_rad + math.pi) % (2.0 * math.pi) - math.pi
+        raw_bank_delta = float(requested[2]) - state.aircraft_executed_bank_rad
+        bank_delta = (raw_bank_delta + math.pi) % (2.0 * math.pi) - math.pi
+        # Both signs describe an equally short rotation at exactly 180 degrees.
+        # Preserve the command's sign instead of letting modulo arbitrarily map
+        # every positive half-turn to -pi.
+        if (
+            math.isclose(bank_delta, -math.pi, rel_tol=0.0, abs_tol=1.0e-12)
+            and raw_bank_delta > 0.0
+        ):
+            bank_delta = math.pi
         bank = state.aircraft_executed_bank_rad + float(np.clip(bank_delta, -math.radians(cfg.bank_rate_deg_s) * dt, math.radians(cfg.bank_rate_deg_s) * dt))
         return axial, float(np.clip(normal, -cfg.max_load_factor_g, cfg.max_load_factor_g)), bank
 

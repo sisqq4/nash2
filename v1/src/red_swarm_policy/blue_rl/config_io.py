@@ -8,7 +8,7 @@ from typing import Any, TypeVar
 from ..env.types import EnvironmentConfig
 
 T = TypeVar("T")
-BLUE_MISSION_DURATION_S = 200.0
+BLUE_MISSION_DURATION_S = 180.0
 
 
 def _replace_dataclass(instance: T, values: dict[str, Any], path: str) -> T:

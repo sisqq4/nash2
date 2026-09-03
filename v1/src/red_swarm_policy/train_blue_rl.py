@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--updates-per-transition", type=float, default=1.0,
                         help="Gradient updates scheduled per collected environment transition")
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--replay-size",
+        type=int,
+        default=500_000,
+        help="Maximum number of transitions retained by prioritized replay",
+    )
     parser.add_argument("--log-interval", type=int, default=10,
                         help="Print and archive one aggregate row every N completed episodes")
     parser.add_argument("--metrics-path", default=None,
@@ -132,6 +138,7 @@ def main() -> int:
     rainbow_config = RainbowDQNConfig(6 + max(training_scenarios) * 4, 29,
                                       observation_schema=env_config.observation_schema,
                                       batch_size=args.batch_size,
+                                      replay_size=args.replay_size,
                                       gamma=env_config.shaping_discount, device=args.device)
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,

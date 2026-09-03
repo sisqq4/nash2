@@ -64,7 +64,7 @@ class RainbowDQNConfig:
     learning_rate: float = 2.5e-4
     gamma: float = 0.999
     batch_size: int = 64
-    replay_size: int = 50_000
+    replay_size: int = 500_000
     learning_starts: int = 1_000
     target_update_interval: int = 1_000
     n_step: int = 20
