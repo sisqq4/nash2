@@ -7,21 +7,41 @@ import numpy as np
 
 
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity: int, observation_dim: int, alpha: float = 0.6) -> None:
+    def __init__(self, capacity: int, observation_dim: int, alpha: float = 0.6,
+                 action_dim: int = 29) -> None:
         self.capacity, self.observation_dim, self.alpha = int(capacity), int(observation_dim), float(alpha)
+        self.action_dim = int(action_dim)
         self.observations = np.zeros((capacity, observation_dim), np.float32)
         self.next_observations = np.zeros_like(self.observations)
         self.actions = np.zeros(capacity, np.int64)
         self.rewards = np.zeros(capacity, np.float32)
         self.dones = np.zeros(capacity, np.float32)
+        self.next_action_masks = np.ones((capacity, self.action_dim), dtype=bool)
+        self.next_action_penalties = np.zeros((capacity, self.action_dim), np.float32)
         self.priorities = np.zeros(capacity, np.float32)
         self.position = self.size = 0
         self.max_priority = 1.0
 
-    def add(self, observation: np.ndarray, action: int, reward: float, next_observation: np.ndarray, done: bool) -> None:
+    def add(self, observation: np.ndarray, action: int, reward: float, next_observation: np.ndarray,
+            done: bool, next_action_mask: np.ndarray | None = None,
+            next_action_penalty: np.ndarray | None = None) -> None:
         i = self.position
         self.observations[i], self.next_observations[i] = observation, next_observation
         self.actions[i], self.rewards[i], self.dones[i] = action, reward, done
+        if next_action_mask is None:
+            self.next_action_masks[i] = True
+        else:
+            mask = np.asarray(next_action_mask, dtype=bool)
+            if mask.shape != (self.action_dim,) or not mask.any():
+                raise ValueError(f"next_action_mask must have shape ({self.action_dim},) and allow an action")
+            self.next_action_masks[i] = mask
+        if next_action_penalty is None:
+            self.next_action_penalties[i] = 0.0
+        else:
+            penalty = np.asarray(next_action_penalty, dtype=np.float32)
+            if penalty.shape != (self.action_dim,) or not np.all(np.isfinite(penalty)) or np.any(penalty < 0.0):
+                raise ValueError(f"next_action_penalty must be a finite non-negative ({self.action_dim},) vector")
+            self.next_action_penalties[i] = penalty
         self.priorities[i] = self.max_priority
         self.position = (i + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
@@ -33,7 +53,9 @@ class PrioritizedReplayBuffer:
         weights = (self.size * probabilities[indices]) ** -beta
         weights /= weights.max()
         return (self.observations[indices], self.actions[indices], self.rewards[indices],
-                self.next_observations[indices], self.dones[indices], weights.astype(np.float32), indices)
+                self.next_observations[indices], self.dones[indices],
+                self.next_action_masks[indices], self.next_action_penalties[indices],
+                weights.astype(np.float32), indices)
 
     def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
         values = np.maximum(np.asarray(priorities, np.float32), 1e-6)
@@ -48,6 +70,8 @@ class Transition:
     reward: float
     next_observation: np.ndarray
     done: bool
+    next_action_mask: np.ndarray | None = None
+    next_action_penalty: np.ndarray | None = None
 
 
 class NStepBuffer:
@@ -71,4 +95,5 @@ class NStepBuffer:
         chosen = list(self.items)[:count]
         reward = sum((self.gamma ** i) * item.reward for i, item in enumerate(chosen))
         return Transition(chosen[0].observation, chosen[0].action, reward,
-                          chosen[-1].next_observation, chosen[-1].done)
+                          chosen[-1].next_observation, chosen[-1].done,
+                          chosen[-1].next_action_mask, chosen[-1].next_action_penalty)

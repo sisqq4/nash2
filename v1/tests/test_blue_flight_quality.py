@@ -50,6 +50,27 @@ def test_sustained_vertical_tight_turn_creates_timed_events() -> None:
     assert {event["type"] for event in result["events"]} >= {"near_vertical", "spiral"}
 
 
+def test_low_horizontal_speed_suppresses_false_spiral_metrics() -> None:
+    tracker = FlightQualityTracker()
+    horizontal, vertical = 50.0, 300.0
+    for index in range(21):
+        now = index * .1
+        # Deliberately jump the horizontal azimuth while it is below the
+        # heading-valid speed threshold.  These jumps must not become turns.
+        angle = index * math.pi / 2
+        velocity = [horizontal * math.cos(angle), vertical, horizontal * math.sin(angle)]
+        tracker.add(_state(now, [0.0, 10_000.0 + vertical * now, 0.0], velocity),
+                    policy_action=7, executed_action=7)
+
+    result = tracker.finish(episode=9, survived=False)
+
+    assert result["metrics"]["spiral_event_count"] == 0
+    assert result["metrics"]["steep_low_horizontal_speed_event_count"] == 1
+    assert result["metrics"]["max_abs_heading_rate_deg_s"] is None
+    assert all(value is None for value in result["trace"]["turn_radius_m"])
+    assert {event["type"] for event in result["events"]} >= {"steep_low_horizontal_speed"}
+
+
 def test_report_writes_json_and_csv_and_validates_options(tmp_path: Path) -> None:
     tracker = FlightQualityTracker()
     for index in range(11):

@@ -51,7 +51,12 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
                     result = env.reset(payload["seed"], episode_index=payload["episode_index"],
                                        missile_count=payload.get("missile_count"))
                 elif operation == "step":
-                    observation, reward, terminated, truncated, info = env.step(payload)
+                    if isinstance(payload, dict):
+                        observation, reward, terminated, truncated, info = env.step(
+                            payload["action"], policy_action=payload.get("policy_action")
+                        )
+                    else:
+                        observation, reward, terminated, truncated, info = env.step(payload)
                     result = BlueStepResult(observation, reward, terminated, truncated, info)
                 else:
                     raise ValueError(f"unknown blue environment operation: {operation}")
@@ -146,8 +151,16 @@ class BlueProcessEnvironmentPool:
                                           "missile_count": scenario[0] if scenario else None})
         return self._request(requests, "reset")
 
-    def step(self, actions: dict[int, int]) -> dict[int, BlueStepResult]:
-        return self._request({i: ("step", int(action)) for i, action in actions.items()}, "step")
+    def step(self, actions: dict[int, int], *,
+             policy_actions: dict[int, int] | None = None) -> dict[int, BlueStepResult]:
+        if policy_actions is None:
+            payloads = {i: int(action) for i, action in actions.items()}
+        else:
+            if set(policy_actions) != set(actions):
+                raise ValueError("policy_actions must contain exactly the action worker ids")
+            payloads = {i: {"action": int(action), "policy_action": int(policy_actions[i])}
+                        for i, action in actions.items()}
+        return self._request({i: ("step", payload) for i, payload in payloads.items()}, "step")
 
     def close(self) -> None:
         if self._closed: return

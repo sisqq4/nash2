@@ -12,6 +12,33 @@ from ..env.types import EnvironmentConfig, RedAction
 from .acmi import AcmiRecorder
 
 
+BLUE_ACTION_CONTEXT_DIM = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G) + 3
+
+
+def blue_observation_dim(schema: str, missile_slots: int) -> int:
+    if schema == "legacy_v1":
+        return 6 + 3 * int(missile_slots)
+    if schema == "normalized_v2":
+        return 6 + 4 * int(missile_slots)
+    if schema == "normalized_v3":
+        return 6 + 4 * int(missile_slots) + BLUE_ACTION_CONTEXT_DIM
+    raise ValueError(f"unsupported blue observation schema: {schema}")
+
+
+def blue_action_context(action_index: int, applied_command: np.ndarray) -> list[float]:
+    """Encode all state used by command-rate constraints into normalized inputs."""
+    action = int(action_index)
+    if not 0 <= action < len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G):
+        raise ValueError("previous executed action index is out of range")
+    command = np.asarray(applied_command, dtype=np.float64)
+    if command.shape != (3,) or not np.all(np.isfinite(command)):
+        raise ValueError("applied load command must be a finite three-vector")
+    one_hot = np.zeros(len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G), dtype=np.float64)
+    one_hot[action] = 1.0
+    normalized_command = command / np.array([9.0, 9.0, math.pi], dtype=np.float64)
+    return [*one_hot.tolist(), *normalized_command.tolist()]
+
+
 @dataclass(frozen=True)
 class BlueEscapeEnvConfig:
     """Blue-RL adapter settings; physical/scenario values remain in EnvironmentConfig."""
@@ -44,8 +71,10 @@ class BlueEscapeEnvConfig:
     def validate(self, environment: EnvironmentConfig) -> None:
         if not 1 <= self.missile_count <= self.max_missiles <= 4:
             raise ValueError("blue training supports one to four missiles against one aircraft")
-        if self.observation_schema not in {"legacy_v1", "normalized_v2"}:
-            raise ValueError("observation_schema must be 'legacy_v1' or 'normalized_v2'")
+        if self.observation_schema not in {"legacy_v1", "normalized_v2", "normalized_v3"}:
+            raise ValueError(
+                "observation_schema must be 'legacy_v1', 'normalized_v2', or 'normalized_v3'"
+            )
         if (
             isinstance(self.acmi_episode_interval, bool)
             or not isinstance(self.acmi_episode_interval, (int, np.integer))
@@ -110,7 +139,7 @@ class BlueEscapeEnv:
         # multi-scenario run pads missing missile slots to max_missiles so one
         # policy can consume every selected scenario.
         slots = config.max_missiles if config.pad_observation_to_max_missiles else config.missile_count
-        self.observation_dim = 6 + slots * (4 if config.observation_schema == "normalized_v2" else 3)
+        self.observation_dim = blue_observation_dim(config.observation_schema, slots)
         self.action_dim = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G)
         self.recorder = AcmiRecorder(); self.episode = 0
         self._previous_potential: dict[str, float] = {}
@@ -118,6 +147,8 @@ class BlueEscapeEnv:
         self._learning_active = False
         self._activation_time_s: float | None = None
         self._activation_range_m: float | None = None
+        self._previous_executed_action_index = 0
+        self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
               missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
@@ -144,6 +175,8 @@ class BlueEscapeEnv:
         self._learning_active = False
         self._activation_time_s = None
         self._activation_range_m = None
+        self._previous_executed_action_index = 0
+        self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self._activate_if_threat_observed()
         self._previous_potential = self._threat_potential() if self._learning_active else self._zero_potential()
         info = {
@@ -152,7 +185,8 @@ class BlueEscapeEnv:
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
             "flight_quality_state": self._mechanism_snapshot(),
-            **self._learning_status(learning_transition=False, requested_action=0, executed_action=0),
+            **self._learning_status(learning_transition=False, requested_action=0,
+                                    constrained_action=0, executed_action=0),
         }
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -174,7 +208,9 @@ class BlueEscapeEnv:
                 "max_altitude_m": self.environment_config.aircraft.max_altitude_m,
                 "min_speed_mps": self.environment_config.aircraft.min_speed_mps,
                 "max_speed_mps": self.environment_config.aircraft.max_speed_mps,
-                "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g}
+                "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g,
+                "previous_executed_action_index": self._previous_executed_action_index,
+                "actual_load_command_body_g": self._applied_load_command_body_g.tolist()}
 
     def _initialization_snapshot(self) -> dict[str, object]:
         """Return a JSON-safe, immutable description of the sampled scenario."""
@@ -217,23 +253,41 @@ class BlueEscapeEnv:
             "blue_orientation": orientation,
         }
 
-    def step(self, action: int) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+    def step(self, action: int, *, policy_action: int | None = None) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         if not 0 <= int(action) < self.action_dim: raise ValueError(f"action must be in [0, {self.action_dim})")
-        requested_action = int(action)
+        if policy_action is not None and not 0 <= int(policy_action) < self.action_dim:
+            raise ValueError(f"policy_action must be in [0, {self.action_dim})")
+        constrained_action = int(action)
+        requested_action = constrained_action if policy_action is None else int(policy_action)
         learning_transition = self._learning_active
         # Action zero is [0 axial g, 1 normal g, 0 bank], exactly cancelling
         # gravity for unchanged straight-and-level flight before detection.
-        executed_action = requested_action if learning_transition else 0
+        executed_action = constrained_action if learning_transition else 0
+        target_command = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[executed_action]
+        starting_command = self._applied_load_command_body_g.copy()
+        bank_delta = math.atan2(math.sin(float(target_command[2] - starting_command[2])),
+                                math.cos(float(target_command[2] - starting_command[2])))
         result = None
-        for _ in range(self.frames_per_action):
+        for frame_index in range(self.frames_per_action):
             assert self.inner.state is not None
             red = RedAction(np.zeros(len(self.inner.state.red), np.int64), np.zeros((len(self.inner.state.red), 2)))
-            result = self.inner.step(red_action=red, blue_action={"action_indices": [executed_action]})
+            # Linearly interpolate the post-constraint command over the 0.1 s
+            # decision interval.  This keeps the physical actuator input
+            # continuous while the learner's action remains the discrete target.
+            fraction = (frame_index + 1) / self.frames_per_action
+            applied = starting_command + fraction * (target_command - starting_command)
+            applied[2] = starting_command[2] + fraction * bank_delta
+            self._applied_load_command_body_g = applied.copy()
+            result = self.inner.step(
+                red_action=red,
+                blue_action={"load_command_body_g": [applied.tolist()]},
+            )
             self._activate_if_threat_observed()
             if self._record_current_episode:
                 self.recorder.record(self.inner.state)
             if result.done: break
         assert result is not None and self.inner.state is not None
+        self._previous_executed_action_index = executed_action
         blue_alive = self.inner.state.blue[0].alive
         measured_potential = self._threat_potential()
         potential_before = self._previous_potential["total"]
@@ -284,8 +338,11 @@ class BlueEscapeEnv:
             **self._learning_status(
                 learning_transition=learning_transition,
                 requested_action=requested_action,
+                constrained_action=constrained_action,
                 executed_action=executed_action,
             ),
+            "target_load_command_body_g": target_command.tolist(),
+            "actual_load_command_body_g": self._applied_load_command_body_g.tolist(),
         })
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
@@ -319,7 +376,7 @@ class BlueEscapeEnv:
         return True
 
     def _learning_status(self, *, learning_transition: bool, requested_action: int,
-                         executed_action: int) -> dict[str, object]:
+                         constrained_action: int, executed_action: int) -> dict[str, object]:
         return {
             "learning_active": bool(self._learning_active),
             "learning_transition": bool(learning_transition),
@@ -328,6 +385,7 @@ class BlueEscapeEnv:
             "learning_activation_time_s": self._activation_time_s,
             "learning_activation_range_m": self._activation_range_m,
             "requested_action_index": int(requested_action),
+            "constrained_action_index": int(constrained_action),
             "executed_action_index": int(executed_action),
         }
 
@@ -412,7 +470,7 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         state = self.inner.state
         blue = state.blue[0]
-        if self.config.observation_schema == "normalized_v2":
+        if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:
             # Versioned, dimensionless input.  Horizontal position is relative
             # to the blue aircraft (altitude remains absolute because ground
             # clearance matters).  A per-slot validity bit removes zero-padding
@@ -424,6 +482,11 @@ class BlueEscapeEnv:
                 values.append(1.0)
             if self.config.pad_observation_to_max_missiles:
                 values.extend([0.0] * (4 * (self.config.max_missiles - len(state.red))))
+            if self.config.observation_schema == "normalized_v3":
+                values.extend(blue_action_context(
+                    self._previous_executed_action_index,
+                    self._applied_load_command_body_g,
+                ))
             return np.asarray(values, dtype=np.float32)
         # Legacy checkpoint contract: kilometres and kilometres/second.
         values = [*(blue.position_m / 1000.0), *(blue.velocity_mps / 1000.0)]

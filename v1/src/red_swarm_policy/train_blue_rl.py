@@ -14,8 +14,10 @@ import numpy as np
 import torch
 
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
+                      FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
                       FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
                       append_flight_quality_episode,
+                      blue_observation_dim,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
@@ -49,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--curriculum", action="store_true",
-                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v2 22-D network)")
+                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v3 54-D network)")
     parser.add_argument("--curriculum-transition-episodes", type=int, default=500,
                         help="Episodes used to linearly ramp probabilities at each curriculum stage entry")
     parser.add_argument("--curriculum-eval-interval", type=int, default=500)
@@ -89,6 +91,9 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
         env_config, record_acmi=False, acmi_episode_interval=0,
     ))
     rates: dict[int, float] = {}; mean_times: dict[int, float] = {}
+    saved_envelope = agent.config.flight_envelope_config
+    envelope_config = (FlightEnvelopeConfig(**saved_envelope) if saved_envelope else
+                       FlightEnvelopeConfig(action_prediction_s=env_config.decision_interval_s))
     for scenario in scenarios:
         survived: list[float] = []; times: list[float] = []
         for index in range(episodes):
@@ -97,11 +102,21 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                 missile_count=scenario,
             )
             learning_active = bool(reset_info["learning_active"])
+            mechanism_state = dict(reset_info["flight_quality_state"])
+            constraint_layer = FlightEnvelopeConstraintLayer(envelope_config)
             done = False
             while not done:
-                action = agent.select_action(observation, evaluation=True) if learning_active else 0
-                observation, _, terminated, truncated, info = evaluation_env.step(action)
+                if learning_active:
+                    q_values = agent.expected_action_values(observation, evaluation=True)[0]
+                    action, diagnostic = constraint_layer.select(q_values, mechanism_state)
+                    policy_action = int(diagnostic["raw_action"])
+                else:
+                    action = policy_action = 0
+                observation, _, terminated, truncated, info = evaluation_env.step(
+                    action, policy_action=policy_action
+                )
                 learning_active = bool(info["learning_active"])
+                mechanism_state = dict(info["flight_quality_state"])
                 done = terminated or truncated
             survived.append(float(info["blue_survived"])); times.append(float(info.get("time_s", 0.0)))
         rates[scenario] = float(np.mean(survived)); mean_times[scenario] = float(np.mean(times))
@@ -141,15 +156,19 @@ def main() -> int:
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
                                      pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
-                                     observation_schema="normalized_v2",
+                                     observation_schema="normalized_v3",
                                      decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
-    rainbow_config = RainbowDQNConfig(6 + max(training_scenarios) * 4, 29,
-                                      observation_schema=env_config.observation_schema,
-                                      batch_size=args.batch_size,
-                                      replay_size=args.replay_size,
-                                      gamma=env_config.shaping_discount, device=args.device)
+    envelope_config = FlightEnvelopeConfig(action_prediction_s=args.decision_interval)
+    rainbow_config = RainbowDQNConfig(
+        blue_observation_dim(env_config.observation_schema, max(training_scenarios)), 29,
+        observation_schema=env_config.observation_schema,
+        batch_size=args.batch_size,
+        replay_size=args.replay_size,
+        gamma=env_config.shaping_discount, device=args.device,
+        flight_envelope_config=asdict(envelope_config),
+    )
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
     # starting spawned children after CUDA initialization can indefinitely stall
@@ -195,6 +214,9 @@ def main() -> int:
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
         reward_diagnostics_by_worker: dict[int, Counter[str]] = {}
+        envelope_states: dict[int, dict[str, object]] = {}
+        constraints = {worker: FlightEnvelopeConstraintLayer(envelope_config)
+                       for worker in range(pool_size)}
         quality: dict[int, FlightQualityTracker] = {}; quality_episodes: list[dict[str, Any]] = []
         next_episode = 1; completed = 0; update_credit = 0.0
         next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
@@ -202,7 +224,9 @@ def main() -> int:
         historical_best: dict[int, float] = {}; best_balanced_score = -math.inf
         best_new_rate: dict[int, float] = {}
         window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
-        window_grad_norms: list[float] = []; window_values: list[float] = []; window_actions: Counter[int] = Counter()
+        window_grad_norms: list[float] = []; window_values: list[float] = []
+        window_actions: Counter[int] = Counter(); window_policy_actions: Counter[int] = Counter()
+        window_constraint_interventions = 0
         window_clamp_low: list[float] = []; window_clamp_high: list[float] = []
         window_started = started; window_transition_start = 0; window_update_start = 0
         _emit({"event": "environment_workers", "backend": "process_spawn",
@@ -219,15 +243,26 @@ def main() -> int:
             observations[worker] = observation
             learning_active_by_worker[worker] = bool(info["learning_active"])
             quality[worker].add(info["flight_quality_state"])
+            envelope_states[worker] = dict(info["flight_quality_state"])
+            constraints[worker].reset()
         while observations:
             vector_iterations += 1; workers = sorted(observations)
             active_workers = [worker for worker in workers if learning_active_by_worker[worker]]
             actions = {worker: 0 for worker in workers}
+            policy_actions = {worker: 0 for worker in workers}
+            action_diagnostics: dict[int, dict[str, object]] = {}
             if active_workers:
-                selected = agent.select_actions(np.stack([observations[worker] for worker in active_workers]))
-                actions.update({worker: int(action) for worker, action in zip(active_workers, selected)})
-                window_values.append(agent.last_action_metrics["selected_value_mean"])
-            results = pool.step(actions); resets: dict[int, tuple[int, int]] = {}
+                q_values = agent.expected_action_values(
+                    np.stack([observations[worker] for worker in active_workers]), evaluation=False
+                )
+                selected = [constraints[worker].select(q, envelope_states[worker])
+                            for worker, q in zip(active_workers, q_values)]
+                for worker, q, (action, diagnostic) in zip(active_workers, q_values, selected):
+                    actions[worker] = int(action)
+                    policy_actions[worker] = int(diagnostic["raw_action"])
+                    action_diagnostics[worker] = diagnostic
+                    window_values.append(float(q[action]))
+            results = pool.step(actions, policy_actions=policy_actions); resets: dict[int, tuple[int, int]] = {}
             learning_transition_count = 0
             for worker in workers:
                 result = results[worker]; previous = observations[worker]
@@ -235,12 +270,22 @@ def main() -> int:
                 learning_transition = bool(result.info["learning_transition"])
                 executed_action = int(result.info["executed_action_index"])
                 if learning_transition:
+                    if executed_action != actions[worker]:
+                        raise RuntimeError("replay action must equal the post-constraint executed action")
+                    next_mask, next_penalty, _ = constraints[worker].constraints(
+                        result.info["flight_quality_state"]
+                    )
                     agent.observe_for_env(
-                        worker, previous, actions[worker], result.reward, result.observation, done
+                        worker, previous, executed_action, result.reward, result.observation, done,
+                        next_action_mask=next_mask, next_action_penalty=next_penalty,
                     )
                     learning_transition_count += 1
                     decisions_by_worker[worker] += 1
-                    window_actions[actions[worker]] += 1
+                    window_actions[executed_action] += 1
+                    window_policy_actions[policy_actions[worker]] += 1
+                    window_constraint_interventions += int(
+                        bool(action_diagnostics[worker]["intervened"])
+                    )
                     for name, value in dict(result.info.get("reward_components", {})).items():
                         if name != "threat_potential":
                             reward_components_by_worker[worker][str(name)] += float(value)
@@ -249,9 +294,13 @@ def main() -> int:
                 reward_by_worker[worker] += result.reward
                 observations[worker] = result.observation
                 learning_active_by_worker[worker] = bool(result.info["learning_active"])
+                envelope_states[worker] = dict(result.info["flight_quality_state"])
+                diagnostic = action_diagnostics.get(worker, {}) if learning_transition else {}
                 quality[worker].add(result.info["flight_quality_state"],
-                                    policy_action=actions[worker] if learning_transition else None,
-                                    executed_action=executed_action)
+                                    policy_action=policy_actions[worker] if learning_transition else None,
+                                    executed_action=executed_action,
+                                    safety_intervened=bool(diagnostic.get("intervened", False)),
+                                    safety_reasons=list(diagnostic.get("raw_action_hard_violation_reasons", [])))
                 if done:
                     completed += 1
                     row = {
@@ -297,6 +346,7 @@ def main() -> int:
                         reward_diagnostics_by_worker[worker] = Counter()
                         decisions_by_worker[worker] = 0; next_episode += 1
                         quality[worker] = FlightQualityTracker()
+                        constraints[worker].reset()
                     else:
                         observations.pop(worker); episode_by_worker.pop(worker)
                         learning_active_by_worker.pop(worker)
@@ -304,6 +354,7 @@ def main() -> int:
                         reward_components_by_worker.pop(worker)
                         reward_diagnostics_by_worker.pop(worker)
                         quality.pop(worker)
+                        envelope_states.pop(worker)
             # Replay insertion and loss/gradient computation are both driven
             # exclusively by post-detection transitions.
             update_credit += learning_transition_count * args.updates_per_transition
@@ -380,9 +431,12 @@ def main() -> int:
                         "episodes_per_hour": len(window_episodes) * 3600.0 / max(now - window_started, 1e-9),
                     },
                     "policy_diagnostics": {
+                        "policy_action_histogram": {str(key): value for key, value in sorted(window_policy_actions.items())},
                         "action_histogram": {str(key): value for key, value in sorted(window_actions.items())},
                         "action_entropy": float(-(probabilities * np.log(probabilities + 1e-12)).sum()),
                         "selected_value_mean": _mean(window_values),
+                        "constraint_intervention_count": window_constraint_interventions,
+                        "constraint_intervention_rate": window_constraint_interventions / max(action_total, 1),
                     },
                     "loss_mean": _mean(window_losses),
                     "loss_std": float(np.std(window_losses)) if window_losses else None,
@@ -403,13 +457,16 @@ def main() -> int:
                 while next_log <= completed: next_log += args.log_interval
                 window_episodes = []; window_losses = []; window_grad_norms = []; window_values = []
                 window_clamp_low = []; window_clamp_high = []
-                window_actions = Counter(); window_started = now
+                window_actions = Counter(); window_policy_actions = Counter()
+                window_constraint_interventions = 0; window_started = now
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
                 for worker, (observation, info) in pool.reset(resets).items():
                     observations[worker] = observation
                     learning_active_by_worker[worker] = bool(info["learning_active"])
                     quality[worker].add(info["flight_quality_state"])
+                    envelope_states[worker] = dict(info["flight_quality_state"])
+                    constraints[worker].reset()
         summaries.sort(key=lambda row: int(row["episode"]))
         final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
         elapsed = time.monotonic() - started

@@ -81,20 +81,39 @@ class FlightQualityTracker:
         speed = np.linalg.norm(vel, axis=1); horizontal = np.linalg.norm(vel[:, [0, 2]], axis=1)
         ratio = horizontal / np.maximum(speed, EPS)
         fpa = np.degrees(np.arctan2(vel[:, 1], horizontal))
-        heading = np.unwrap(np.arctan2(vel[:, 2], vel[:, 0])); rate = np.zeros(len(time))
-        rate[1:] = np.degrees(np.diff(heading) / np.maximum(np.diff(time), EPS)); rate[0] = rate[1]
+        raw_heading = np.arctan2(vel[:, 2], vel[:, 0])
+        heading_valid = horizontal >= t.low_horizontal_speed_mps
+        # Heading is undefined as horizontal velocity approaches zero.  Do not
+        # manufacture a large heading rate (and hence a tiny turn radius) from
+        # numerical azimuth jumps in that regime.
+        heading = np.full(len(time), np.nan)
+        rate = np.full(len(time), np.nan)
+        valid_indices = np.flatnonzero(heading_valid)
+        if valid_indices.size:
+            heading[valid_indices] = np.unwrap(raw_heading[valid_indices])
+        valid_pairs = heading_valid[1:] & heading_valid[:-1]
+        rate[1:][valid_pairs] = np.degrees(
+            np.arctan2(np.sin(raw_heading[1:][valid_pairs] - raw_heading[:-1][valid_pairs]),
+                       np.cos(raw_heading[1:][valid_pairs] - raw_heading[:-1][valid_pairs]))
+            / np.maximum(np.diff(time)[valid_pairs], EPS)
+        )
+        finite_rate_indices = np.flatnonzero(np.isfinite(rate))
+        if finite_rate_indices.size and not math.isfinite(float(rate[0])):
+            rate[0] = rate[finite_rate_indices[0]]
         acceleration = np.zeros_like(vel)
         acceleration[1:] = np.diff(vel, axis=0) / np.maximum(np.diff(time), EPS)[:, None]
         acceleration[0] = acceleration[1]
         actual_load = np.linalg.norm(acceleration + np.array([0.0, 9.80665, 0.0]), axis=1) / 9.80665
-        radius = np.full(len(time), math.inf); valid = np.abs(np.radians(rate)) > 1e-4
+        radius = np.full(len(time), math.nan); valid = heading_valid & (np.abs(np.radians(rate)) > 1e-4)
         radius[valid] = horizontal[valid] / np.abs(np.radians(rate[valid]))
         near_mask = np.abs(fpa) >= t.near_vertical_deg
         low_mask = horizontal < t.low_horizontal_speed_mps
-        spiral_mask = ((np.abs(fpa) >= t.spiral_fpa_deg) &
+        steep_low_horizontal_mask = ((~heading_valid) & (np.abs(fpa) >= t.spiral_fpa_deg))
+        spiral_mask = (heading_valid & (np.abs(fpa) >= t.spiral_fpa_deg) &
                        (np.abs(rate) >= t.spiral_heading_rate_deg_s) & (radius <= t.spiral_radius_m))
         near_runs = _runs(near_mask, time, t.near_vertical_min_s); spiral_runs = _runs(spiral_mask, time, t.spiral_min_s)
         low_runs = _runs(low_mask | (ratio < t.low_horizontal_ratio), time, .5)
+        steep_low_runs = _runs(steep_low_horizontal_mask, time, t.spiral_min_s)
         min_alt = float(self.samples[-1]["min_altitude_m"]); max_alt = float(self.samples[-1]["max_altitude_m"])
         boundary_mask = (pos[:, 1] <= min_alt + t.boundary_margin_m) | (pos[:, 1] >= max_alt - t.boundary_margin_m)
         boundary_runs = _runs(boundary_mask, time, t.boundary_min_s)
@@ -143,8 +162,14 @@ class FlightQualityTracker:
             longest_extreme_run = max(longest_extreme_run, current_extreme_run)
             previous_extreme = action if extreme else None
         finite_radius = radius[np.isfinite(radius)]
+        finite_rate = np.abs(rate[np.isfinite(rate)])
+        heading_change = np.abs(np.arctan2(
+            np.sin(np.diff(raw_heading)), np.cos(np.diff(raw_heading))
+        ))
+        valid_heading_change = heading_change[valid_pairs]
         events = ([{"type": "near_vertical", "start_s": float(time[a]), "end_s": float(time[b - 1])} for a, b in near_runs] +
                   [{"type": "spiral", "start_s": float(time[a]), "end_s": float(time[b - 1])} for a, b in spiral_runs] +
+                  [{"type": "steep_low_horizontal_speed", "start_s": float(time[a]), "end_s": float(time[b - 1])} for a, b in steep_low_runs] +
                   [{"type": "reversal", "start_s": float(time[a]), "end_s": float(time[b])} for a, b in reversal_events] +
                   [{"type": "self_return", "start_s": float(time[a]), "end_s": float(time[b])} for a, b in self_return_events] +
                   [{"type": "altitude_boundary", "start_s": float(time[a]), "end_s": float(time[b - 1])} for a, b in boundary_runs])
@@ -156,15 +181,19 @@ class FlightQualityTracker:
             "min_horizontal_speed_ratio": float(ratio.min()),
             "time_horizontal_speed_below_150_mps_s": float(dt[horizontal < 150].sum()),
             "time_horizontal_speed_ratio_below_0_7_s": float(dt[ratio < .7].sum()),
-            "low_horizontal_speed_event_count": len(low_runs), "max_abs_heading_rate_deg_s": float(np.abs(rate).max()),
-            "p95_abs_heading_rate_deg_s": float(np.percentile(np.abs(rate), 95)),
-            "time_heading_rate_above_30_deg_s_s": float(dt[np.abs(rate) >= 30].sum()),
-            "continuous_turn_angle_deg": float(np.abs(np.diff(np.degrees(heading))).sum()),
-            "full_rotation_count": float(np.abs(np.diff(heading)).sum() / (2 * math.pi)),
+            "low_horizontal_speed_event_count": len(low_runs),
+            "steep_low_horizontal_speed_event_count": len(steep_low_runs),
+            "steep_low_horizontal_speed_total_duration_s": sum(float(dt[a:b].sum()) for a, b in steep_low_runs),
+            "heading_metric_valid_fraction": float(heading_valid.mean()),
+            "max_abs_heading_rate_deg_s": float(finite_rate.max()) if finite_rate.size else None,
+            "p95_abs_heading_rate_deg_s": float(np.percentile(finite_rate, 95)) if finite_rate.size else None,
+            "time_heading_rate_above_30_deg_s_s": float(dt[np.isfinite(rate) & (np.abs(rate) >= 30)].sum()),
+            "continuous_turn_angle_deg": float(np.degrees(valid_heading_change).sum()),
+            "full_rotation_count": float(valid_heading_change.sum() / (2 * math.pi)),
             "min_turn_radius_m": float(finite_radius.min()) if len(finite_radius) else None,
             "p05_turn_radius_m": float(np.percentile(finite_radius, 5)) if len(finite_radius) else None,
-            "time_turn_radius_below_1000_m_s": float(dt[radius < 1000].sum()),
-            "tight_turn_event_count": len(_runs(radius < t.tight_radius_m, time, .5)),
+            "time_turn_radius_below_1000_m_s": float(dt[np.isfinite(radius) & (radius < 1000)].sum()),
+            "tight_turn_event_count": len(_runs(np.isfinite(radius) & (radius < t.tight_radius_m), time, .5)),
             "max_estimated_actual_load_g": float(actual_load.max()),
             "time_estimated_actual_load_above_6_g_s": float(dt[actual_load > 6.0].sum()),
             "spiral_event_count": len(spiral_runs),
@@ -201,13 +230,15 @@ class FlightQualityTracker:
                     2 * metrics["safety_intervention_rate"])
         metrics["flight_quality_score"] = float(100 * math.exp(-abnormal))
         verdicts = {"near_vertical": not near_runs, "small_radius_spiral": not spiral_runs,
+                    "steep_low_horizontal_speed": not steep_low_runs,
                     "near_stationary_reversal": not reversal_events and not self_return_events,
                     "altitude_boundary": not boundary_runs,
                     "safety_reliance": metrics["safety_intervention_rate"] < .1}
         trace = {"time_s": time.tolist(), "position_m": pos.tolist(), "velocity_mps": vel.tolist(),
                  "speed_mps": speed.tolist(), "horizontal_speed_mps": horizontal.tolist(),
                  "vertical_speed_mps": vel[:, 1].tolist(), "estimated_actual_load_g": actual_load.tolist(),
-                 "flight_path_angle_deg": fpa.tolist(), "heading_rate_deg_s": rate.tolist(),
+                 "flight_path_angle_deg": fpa.tolist(),
+                 "heading_rate_deg_s": [None if not math.isfinite(x) else float(x) for x in rate],
                  "turn_radius_m": [None if not math.isfinite(x) else float(x) for x in radius],
                  "policy_action": [s["policy_action"] for s in self.samples],
                  "executed_action": [s["executed_action"] for s in self.samples],
@@ -264,7 +295,8 @@ def _plot_episode(episode: dict[str, Any], path: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     trace = episode["trace"]; time = np.asarray(trace["time_s"]); pos = np.asarray(trace["position_m"])
-    fpa = np.asarray(trace["flight_path_angle_deg"]); rate = np.asarray(trace["heading_rate_deg_s"])
+    fpa = np.asarray(trace["flight_path_angle_deg"])
+    rate = np.asarray([np.nan if x is None else x for x in trace["heading_rate_deg_s"]])
     speed = np.asarray(trace["speed_mps"]); horizontal = np.asarray(trace["horizontal_speed_mps"])
     radius = np.asarray([np.nan if x is None else x for x in trace["turn_radius_m"]])
     fig = plt.figure(figsize=(16, 12)); axes = [fig.add_subplot(3, 2, 1, projection="3d")]
@@ -299,7 +331,8 @@ def _plot_episode(episode: dict[str, Any], path: Path) -> None:
     load_axis.set_ylabel("Commanded load (g)")
     for index in np.flatnonzero(trace["safety_intervened"]): axes[5].axvline(time[index], color="black", alpha=.25)
     axes[5].legend(); axes[5].set(ylabel="Action", xlabel="Time (s)")
-    colors = {"near_vertical": "red", "spiral": "purple", "reversal": "orange",
+    colors = {"near_vertical": "red", "spiral": "purple", "steep_low_horizontal_speed": "magenta",
+              "reversal": "orange",
               "self_return": "darkorange", "altitude_boundary": "brown"}
     for event in episode["events"]:
         for axis in axes[2:]: axis.axvspan(event["start_s"], event["end_s"], color=colors[event["type"]], alpha=.12)

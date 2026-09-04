@@ -13,8 +13,10 @@ import numpy as np
 import torch
 
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
-                      EvaluationShapingConfig, FlightQualityTracker, RainbowDQNAgent,
+                      EvaluationShapingConfig, FlightEnvelopeConfig,
+                      FlightEnvelopeConstraintLayer, FlightQualityTracker, RainbowDQNAgent,
                       append_flight_quality_episode,
+                      blue_observation_dim,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
@@ -157,17 +159,30 @@ def main() -> int:
     for parameter in agent.online.parameters(): parameter.requires_grad_(False)
     immutable_learner_state = (agent.total_steps, agent.optimizer_updates, agent.target_updates,
                                agent.replay.size, tuple(parameter._version for parameter in agent.online.parameters()))
+    if agent.config.flight_envelope_config is None:
+        # Backward-compatible evaluation of old checkpoints.  All newly trained
+        # checkpoints carry this dictionary and therefore cannot silently drift.
+        envelope_config = FlightEnvelopeConfig(action_prediction_s=args.decision_interval)
+    else:
+        envelope_config = FlightEnvelopeConfig(**agent.config.flight_envelope_config)
+        if not math.isclose(envelope_config.action_prediction_s, args.decision_interval,
+                            rel_tol=0.0, abs_tol=1.0e-12):
+            raise ValueError(
+                "--decision-interval must match the flight-envelope interval saved in the checkpoint"
+            )
     slots = max(missile_scenarios)
-    legacy_dim, normalized_dim = 6 + slots * 3, 6 + slots * 4
+    schema_dimensions = {
+        schema: blue_observation_dim(schema, slots)
+        for schema in ("legacy_v1", "normalized_v2", "normalized_v3")
+    }
     checkpoint_schema = agent.config.observation_schema
-    if checkpoint_schema == "normalized_v2" and agent.config.observation_dim == normalized_dim:
-        observation_schema = "normalized_v2"
-    elif checkpoint_schema == "legacy_v1" and agent.config.observation_dim == legacy_dim:
-        observation_schema = "legacy_v1"
+    if (checkpoint_schema in schema_dimensions
+            and agent.config.observation_dim == schema_dimensions[checkpoint_schema]):
+        observation_schema = checkpoint_schema
     else:
         raise ValueError(
             f"checkpoint schema/dimension ({checkpoint_schema}, {agent.config.observation_dim}) "
-            f"does not match --missiles; expected legacy ({legacy_dim}) or normalized ({normalized_dim})"
+            f"does not match --missiles; expected {schema_dimensions}"
         )
     config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=slots,
                                  pad_observation_to_max_missiles=len(missile_scenarios) > 1,
@@ -176,7 +191,7 @@ def main() -> int:
                                  expose_evaluation_mechanism_state=True,
                                  acmi_episode_interval=args.acmi_interval,
                                  acmi_directory=str(output / "acmi"))
-    observation_dim = normalized_dim if observation_schema == "normalized_v2" else legacy_dim
+    observation_dim = schema_dimensions[observation_schema]
     action_dim = 29
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
@@ -184,6 +199,7 @@ def main() -> int:
     learning_active_by_worker: dict[int, bool] = {}
     mechanism_states: dict[int, dict[str, object]] = {}
     shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
+    constraints = {worker: FlightEnvelopeConstraintLayer(envelope_config) for worker in range(pool_size)}
     mechanism_interventions: dict[int, int] = {}; mechanism_diagnostics: dict[int, dict[str, object]] = {}
     mechanism_traces: dict[int, list[dict[str, object]]] = {}; quality: dict[int, FlightQualityTracker] = {}
     quality_episodes: list[dict[str, Any]] = []
@@ -202,6 +218,7 @@ def main() -> int:
            "seed": args.seed, "decision_interval_s": args.decision_interval,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
+           "flight_envelope_config": agent.config.flight_envelope_config or envelope_config.__dict__,
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                      "direction": shaping_config.direction, "overload": shaping_config.overload,
                                      "weight": shaping_config.weight},
@@ -216,6 +233,7 @@ def main() -> int:
             episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
             mechanism_interventions[worker] = 0; shapers[worker].reset()
+            constraints[worker].reset()
             mechanism_traces[worker] = []
             quality[worker] = FlightQualityTracker()
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
@@ -228,24 +246,42 @@ def main() -> int:
             workers = sorted(observations)
             active_workers = [worker for worker in workers if learning_active_by_worker[worker]]
             actions = {worker: 0 for worker in workers}
+            policy_actions = {worker: 0 for worker in workers}
             if active_workers:
                 observation_batch = np.stack([observations[w] for w in active_workers])
                 with torch.inference_mode():
-                    if shaping_config.enabled:
-                        q_values = agent.expected_action_values(observation_batch)
-                        selected = [shapers[w].select(q, mechanism_states[w])
-                                    for w, q in zip(active_workers, q_values)]
-                        actions.update({worker: int(item[0])
-                                        for worker, item in zip(active_workers, selected)})
-                        for worker, (_, diagnostic) in zip(active_workers, selected):
-                            mechanism_diagnostics[worker] = diagnostic
-                            mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
-                            mechanism_traces[worker].append(diagnostic)
-                    else:
-                        selected_actions = agent.select_actions(observation_batch, evaluation=True)
-                        actions.update({worker: int(action)
-                                        for worker, action in zip(active_workers, selected_actions)})
-            results = pool.step(actions)
+                    q_values = agent.expected_action_values(observation_batch, evaluation=True)
+                    for worker, q_values_for_worker in zip(active_workers, q_values):
+                        network_raw_action = int(np.argmax(q_values_for_worker))
+                        arbitration_values = q_values_for_worker
+                        mechanism_diagnostic: dict[str, object] = {}
+                        if shaping_config.enabled:
+                            mechanism_action, mechanism_diagnostic = shapers[worker].select(
+                                q_values_for_worker, mechanism_states[worker]
+                            )
+                            # Preserve the optional mechanism arbiter's chosen
+                            # preference, then let the common hard envelope make
+                            # the final safety decision.
+                            arbitration_values = q_values_for_worker.copy()
+                            finite = arbitration_values[np.isfinite(arbitration_values)]
+                            span = max(1.0, float(np.ptp(finite))) if finite.size else 1.0
+                            arbitration_values[mechanism_action] = (
+                                float(np.max(finite)) + span if finite.size else span
+                            )
+                        action, envelope_diagnostic = constraints[worker].select(
+                            arbitration_values, mechanism_states[worker]
+                        )
+                        diagnostic = {**mechanism_diagnostic, **envelope_diagnostic,
+                                      "raw_action": network_raw_action,
+                                      "executed_action": int(action),
+                                      "intervened": int(action) != network_raw_action,
+                                      "mechanism_action": (mechanism_action if shaping_config.enabled else None)}
+                        actions[worker] = int(action)
+                        policy_actions[worker] = network_raw_action
+                        mechanism_diagnostics[worker] = diagnostic
+                        mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
+                        mechanism_traces[worker].append(diagnostic)
+            results = pool.step(actions, policy_actions=policy_actions)
             vector_iterations += 1
             resets = {}
             for worker in workers:
@@ -260,8 +296,8 @@ def main() -> int:
                 quality[worker].add(result.info["flight_quality_state"],
                                     policy_action=raw_action if learning_transition else None,
                                     executed_action=executed_action,
-                                    safety_intervened=bool(diagnostic.get("safety_filter_intervened", False)),
-                                    safety_reasons=list(diagnostic.get("hard_mask_reasons", [])))
+                                    safety_intervened=bool(diagnostic.get("intervened", False)),
+                                    safety_reasons=list(diagnostic.get("raw_action_hard_violation_reasons", [])))
                 if learning_transition:
                     decisions[worker] += 1; action_counts[worker][int(action)] += 1
                     for name, value in dict(result.info.get("reward_components", {})).items():
@@ -311,6 +347,7 @@ def main() -> int:
                         episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
                         action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
                         mechanism_interventions[worker] = 0; mechanism_diagnostics.pop(worker, None)
+                        constraints[worker].reset(); shapers[worker].reset()
                         mechanism_traces[worker] = []
                         quality[worker] = FlightQualityTracker()
                         shapers[worker].reset()
@@ -328,6 +365,7 @@ def main() -> int:
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
                     learning_active_by_worker[worker] = bool(reset_info["learning_active"])
                     mechanism_states[worker] = reset_info["mechanism_state"]
+                    constraints[worker].reset(); shapers[worker].reset()
                     quality[worker].add(reset_info["flight_quality_state"])
             if completed >= next_log or (completed == args.episodes and window_rows):
                 now = time.monotonic(); window_rewards = [float(row["reward"]) for row in window_rows]

@@ -78,6 +78,9 @@ class RainbowDQNConfig:
     per_beta_start: float = 0.4
     per_beta_frames: int = 100_000
     device: str = "cpu"
+    # Serialized into every new checkpoint so evaluation reconstructs exactly
+    # the same predictive constraint layer as behavior collection.
+    flight_envelope_config: dict[str, object] | None = None
 
 
 class RainbowDQNAgent:
@@ -88,7 +91,8 @@ class RainbowDQNAgent:
         self.online, self.target = RainbowNetwork(*args).to(self.device), RainbowNetwork(*args).to(self.device)
         self.target.load_state_dict(self.online.state_dict()); self.target.eval()
         self.optimizer = torch.optim.Adam(self.online.parameters(), lr=config.learning_rate)
-        self.replay = PrioritizedReplayBuffer(config.replay_size, config.observation_dim, config.per_alpha)
+        self.replay = PrioritizedReplayBuffer(config.replay_size, config.observation_dim,
+                                              config.per_alpha, config.action_dim)
         self.n_step = NStepBuffer(config.n_step, config.gamma)
         self._n_step_by_env: dict[int, NStepBuffer] = {0: self.n_step}
         self.total_steps = self.optimizer_updates = self.target_updates = 0
@@ -101,13 +105,15 @@ class RainbowDQNAgent:
     def select_action(self, observation: np.ndarray, *, evaluation: bool = False) -> int:
         return int(self.select_actions(np.asarray(observation)[None], evaluation=evaluation)[0])
 
-    def expected_action_values(self, observations: np.ndarray) -> np.ndarray:
-        """Return all C51 expectations for deterministic evaluation arbitration."""
+    def expected_action_values(self, observations: np.ndarray, *, evaluation: bool = True) -> np.ndarray:
+        """Return all C51 expectations for shared constraint arbitration."""
         array = np.asarray(observations, dtype=np.float32)
         if array.ndim == 1: array = array[None, :]
         if array.ndim != 2 or array.shape[1] != self.config.observation_dim:
             raise ValueError(f"observations must have shape [batch, {self.config.observation_dim}]")
-        self.online.eval()
+        self.online.eval() if evaluation else self.online.train()
+        if not evaluation:
+            self.online.reset_noise()
         with torch.inference_mode():
             tensor = torch.as_tensor(array, dtype=torch.float32, device=self.device)
             return ((self.online(tensor).softmax(-1) * self.support).sum(-1)).cpu().numpy()
@@ -137,26 +143,36 @@ class RainbowDQNAgent:
         self.observe_for_env(0, observation, action, reward, next_observation, done)
 
     def observe_for_env(self, env_id: int, observation: np.ndarray, action: int, reward: float,
-                        next_observation: np.ndarray, done: bool) -> None:
+                        next_observation: np.ndarray, done: bool, *,
+                        next_action_mask: np.ndarray | None = None,
+                        next_action_penalty: np.ndarray | None = None) -> None:
         """Add one transition without mixing n-step sequences across environments."""
         buffer = self._n_step_by_env.setdefault(
             int(env_id), NStepBuffer(self.config.n_step, self.config.gamma)
         )
-        for item in buffer.append(Transition(observation, action, reward, next_observation, done)):
-            self.replay.add(item.observation, item.action, item.reward, item.next_observation, item.done)
+        transition = Transition(observation, action, reward, next_observation, done,
+                                next_action_mask, next_action_penalty)
+        for item in buffer.append(transition):
+            self.replay.add(item.observation, item.action, item.reward, item.next_observation, item.done,
+                            item.next_action_mask, item.next_action_penalty)
         self.total_steps += 1
 
     def update(self) -> float | None:
         c = self.config
         if self.replay.size < max(c.learning_starts, c.batch_size): return None
         beta = c.per_beta_start + min(1.0, self.total_steps / c.per_beta_frames) * (1.0 - c.per_beta_start)
-        obs, actions, rewards, next_obs, dones, weights, indices = self.replay.sample(c.batch_size, beta)
+        (obs, actions, rewards, next_obs, dones, next_masks, next_penalties,
+         weights, indices) = self.replay.sample(c.batch_size, beta)
         obs_t = torch.as_tensor(obs, device=self.device); next_t = torch.as_tensor(next_obs, device=self.device)
         actions_t = torch.as_tensor(actions, device=self.device); rewards_t = torch.as_tensor(rewards, device=self.device)
         dones_t = torch.as_tensor(dones, device=self.device); weights_t = torch.as_tensor(weights, device=self.device)
+        next_masks_t = torch.as_tensor(next_masks, dtype=torch.bool, device=self.device)
+        next_penalties_t = torch.as_tensor(next_penalties, device=self.device)
         log_prob = self.online(obs_t).log_softmax(-1)[torch.arange(c.batch_size, device=self.device), actions_t]
         with torch.no_grad():
-            next_action = (self.online(next_t).softmax(-1) * self.support).sum(-1).argmax(1)
+            next_values = (self.online(next_t).softmax(-1) * self.support).sum(-1) - next_penalties_t
+            next_values = next_values.masked_fill(~next_masks_t, -torch.inf)
+            next_action = next_values.argmax(1)
             next_prob = self.target(next_t).softmax(-1)[torch.arange(c.batch_size, device=self.device), next_action]
             target_z_unclamped = rewards_t[:, None] + (1 - dones_t[:, None]) * (c.gamma ** c.n_step) * self.support
             clamp_low_fraction = (target_z_unclamped < c.value_min).float().mean()

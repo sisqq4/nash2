@@ -6,12 +6,15 @@ import numpy as np
 import pytest
 
 from red_swarm_policy.blue_rl import (
+    BLUE_ACTION_CONTEXT_DIM,
     BlueEscapeEnv,
     BlueEscapeEnvConfig,
     BlueProcessEnvironmentPool,
     BlueRLController,
     EvaluationActionShaper,
     EvaluationShapingConfig,
+    FlightEnvelopeConfig,
+    FlightEnvelopeConstraintLayer,
     RainbowDQNAgent,
     RainbowDQNConfig,
 )
@@ -115,6 +118,37 @@ def test_normalized_v2_observation_is_dimensionless_and_masks_padding() -> None:
     assert env._observation() == pytest.approx(translated)
 
 
+def test_normalized_v3_exposes_previous_executed_action_and_actuator_command() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1, observation_schema="normalized_v3",
+        decision_interval_s=cfg.time_step_s, record_acmi=False,
+    ))
+    observation, reset_info = env.reset(seed=1)
+    context_offset = 6 + 4
+
+    assert observation.shape == (10 + BLUE_ACTION_CONTEXT_DIM,)
+    assert observation[context_offset] == 1.0
+    assert np.count_nonzero(observation[context_offset:context_offset + 29]) == 1
+    np.testing.assert_allclose(observation[-3:], [0.0, 1.0 / 9.0, 0.0])
+    assert reset_info["flight_quality_state"]["previous_executed_action_index"] == 0
+
+    env._learning_active = True
+    env._previous_potential = env._threat_potential()
+    next_observation, _, _, _, info = env.step(7, policy_action=2)
+
+    assert next_observation[context_offset + 7] == 1.0
+    assert np.count_nonzero(next_observation[context_offset:context_offset + 29]) == 1
+    np.testing.assert_allclose(
+        next_observation[-3:], np.asarray(info["actual_load_command_body_g"]) / [9.0, 9.0, np.pi]
+    )
+    assert info["flight_quality_state"]["previous_executed_action_index"] == 7
+    np.testing.assert_allclose(
+        info["flight_quality_state"]["actual_load_command_body_g"],
+        info["actual_load_command_body_g"],
+    )
+
+
 def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
     schedule = CurriculumSchedule()
     assert schedule.total_episodes == 7500
@@ -215,6 +249,168 @@ def test_evaluation_nan_uses_deterministic_fallback() -> None:
     assert 0 <= action < 29
     assert diagnostic["fallback_reason"] == "network_nan"
     assert all(value is None or np.isfinite(value) for value in diagnostic["q_fuse"])
+
+
+def _envelope_snapshot(*, altitude: float = 10_000.0,
+                       velocity: tuple[float, float, float] = (300.0, 0.0, 0.0)) -> dict[str, object]:
+    return {
+        "blue_position_m": [0.0, altitude, 0.0],
+        "blue_velocity_mps": list(velocity),
+        "min_altitude_m": 8_000.0, "max_altitude_m": 12_000.0,
+        "min_speed_mps": 100.0, "max_speed_mps": 600.0,
+        "max_load_factor_g": 9.0,
+    }
+
+
+def test_shared_envelope_uses_8500_to_11500_soft_altitude_band() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    mask, penalty, details = layer.constraints(
+        _envelope_snapshot(altitude=11_450.0, velocity=(300.0, 40.0, 0.0))
+    )
+
+    assert mask.any()
+    assert details["extrapolated_altitude_m"][13] > 11_500.0
+    assert details["altitude_cost"][13] > 0.0
+    assert penalty[13] >= details["altitude_cost"][13]
+    assert FlightEnvelopeConfig().altitude_safety_margin_m == 500.0
+    assert FlightEnvelopeConfig().altitude_extrapolation_s == 2.0
+
+
+@pytest.mark.parametrize(("altitude_m", "expected_penalty"), [
+    (8_500.0, 0.0),
+    (8_250.0, 1.0),
+    (8_000.0, 4.0),
+    (11_500.0, 0.0),
+    (11_750.0, 1.0),
+    (12_000.0, 4.0),
+])
+def test_shared_envelope_doubles_altitude_penalty_at_reference_points(
+    altitude_m: float, expected_penalty: float,
+) -> None:
+    layer = FlightEnvelopeConstraintLayer()
+
+    _, _, details = layer.constraints(_envelope_snapshot(altitude=altitude_m))
+
+    assert details["extrapolated_altitude_m"][0] == pytest.approx(altitude_m)
+    assert details["altitude_cost"][0] == pytest.approx(expected_penalty)
+    assert layer.config.altitude_penalty_weight == pytest.approx(4.0)
+
+
+def test_shared_envelope_masks_load_and_roll_rate_reversal() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    layer.previous_action = 7
+    mask, _, details = layer.constraints(_envelope_snapshot())
+
+    assert not mask[10]
+    assert details["load_command_rate_gps"][10] > layer.config.hard_load_command_rate_gps
+    assert details["roll_command_rate_deg_s"][10] > layer.config.hard_roll_command_rate_deg_s
+    assert {"load_command_rate", "roll_command_rate"} <= set(details["hard_mask_reasons"])
+
+
+def test_shared_envelope_uses_visible_action_context_instead_of_private_history() -> None:
+    snapshot = _envelope_snapshot()
+    snapshot.update({
+        "previous_executed_action_index": 7,
+        "actual_load_command_body_g": [0.0, 9.0, np.arccos(1.0 / 9.0)],
+    })
+    first = FlightEnvelopeConstraintLayer(); first.previous_action = 0
+    second = FlightEnvelopeConstraintLayer(); second.previous_action = 10
+
+    first_mask, first_penalty, first_details = first.constraints(snapshot)
+    second_mask, second_penalty, second_details = second.constraints(snapshot)
+
+    np.testing.assert_array_equal(first_mask, second_mask)
+    np.testing.assert_allclose(first_penalty, second_penalty)
+    np.testing.assert_allclose(
+        first_details["starting_load_command_body_g"],
+        snapshot["actual_load_command_body_g"],
+    )
+    assert first_details["previous_executed_action_index"] == 7
+    np.testing.assert_allclose(
+        first_details["load_command_rate_gps"], second_details["load_command_rate_gps"]
+    )
+
+
+def test_heading_recovery_rejects_frozen_acceleration_false_positive() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    velocity = np.array([-12.751093610092154, 328.06811387774457, 78.32180460216358])
+    snapshot = _envelope_snapshot(velocity=tuple(velocity))
+    snapshot.update({
+        "previous_executed_action_index": 0,
+        "actual_load_command_body_g": [0.0, 1.0, 0.0],
+    })
+
+    _, _, details = layer.constraints(snapshot)
+
+    # The old v+a*t approximation classified actions 4 and 15 as recoverable.
+    # Reintegrating the rotating velocity frame over the full two-second
+    # window shows that neither has a physically feasible recovery path.
+    assert not details["heading_recoverable"][4]
+    assert not details["heading_recoverable"][15]
+    assert details["heading_recovery_action"][15] == -1
+    assert np.isinf(details["heading_recovery_time_s"][15])
+    # The dynamic checker still finds genuine recoveries and reports the first
+    # feasible recovery action/time rather than making every steep state fail.
+    assert details["heading_recoverable"][16]
+    assert 0.0 < details["heading_recovery_time_s"][16] <= 2.0
+    assert 0 <= details["heading_recovery_action"][16] < 29
+
+
+def test_replay_attributes_transition_to_post_constraint_action() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    q_values = np.zeros(29); q_values[2] = 100.0  # sqrt(9^2 + 1^2) exceeds the 9-g hard limit.
+    executed, diagnostic = layer.select(q_values, _envelope_snapshot())
+    assert diagnostic["raw_action"] == 2
+    assert executed != 2
+
+    agent = RainbowDQNAgent(RainbowDQNConfig(2, 29, n_step=1, learning_starts=100))
+    observation = np.zeros(2, dtype=np.float32)
+    next_mask, next_penalty, _ = layer.constraints(_envelope_snapshot())
+    agent.observe_for_env(0, observation, executed, 1.0, observation, False,
+                          next_action_mask=next_mask, next_action_penalty=next_penalty)
+
+    assert agent.replay.actions[0] == executed
+    assert agent.replay.actions[0] != diagnostic["raw_action"]
+    np.testing.assert_array_equal(agent.replay.next_action_masks[0], next_mask)
+    np.testing.assert_allclose(agent.replay.next_action_penalties[0], next_penalty)
+
+
+def test_checkpoint_round_trips_shared_envelope_configuration(tmp_path) -> None:
+    envelope = FlightEnvelopeConfig(altitude_safety_margin_m=600.0)
+    agent = RainbowDQNAgent(RainbowDQNConfig(
+        2, 29, hidden_dim=16,
+        flight_envelope_config=envelope.__dict__.copy(),
+    ))
+    path = tmp_path / "blue.pt"
+    agent.save(str(path))
+
+    restored = RainbowDQNAgent.load(str(path))
+
+    assert restored.config.flight_envelope_config == envelope.__dict__
+    FlightEnvelopeConfig(**restored.config.flight_envelope_config).validate()
+
+
+def test_blue_env_records_raw_constrained_and_continuously_applied_commands() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(missile_count=1, record_acmi=False))
+    env.reset(seed=2)
+    env._learning_active = True
+    env._previous_potential = env._threat_potential()
+    applied: list[np.ndarray] = []
+    original_step = env.inner.step
+
+    def recording_step(*args: object, **kwargs: object):
+        applied.append(np.asarray(kwargs["blue_action"]["load_command_body_g"][0]))
+        return original_step(*args, **kwargs)
+
+    env.inner.step = recording_step  # type: ignore[method-assign]
+    _, _, _, _, info = env.step(7, policy_action=2)
+
+    assert info["requested_action_index"] == 2
+    assert info["constrained_action_index"] == info["executed_action_index"] == 7
+    assert len(applied) == env.frames_per_action
+    assert 0.0 < applied[0][2] < applied[-1][2]
+    np.testing.assert_allclose(applied[-1], info["target_load_command_body_g"])
 
 
 def test_evaluation_final_statistics_include_distributions() -> None:
