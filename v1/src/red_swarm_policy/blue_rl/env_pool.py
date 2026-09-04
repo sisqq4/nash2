@@ -53,7 +53,9 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
                 elif operation == "step":
                     if isinstance(payload, dict):
                         observation, reward, terminated, truncated, info = env.step(
-                            payload["action"], policy_action=payload.get("policy_action")
+                            payload["action"], policy_action=payload.get("policy_action"),
+                            action_mask=payload.get("action_mask"),
+                            fallback_required=bool(payload.get("fallback_required", False)),
                         )
                     else:
                         observation, reward, terminated, truncated, info = env.step(payload)
@@ -152,13 +154,25 @@ class BlueProcessEnvironmentPool:
         return self._request(requests, "reset")
 
     def step(self, actions: dict[int, int], *,
-             policy_actions: dict[int, int] | None = None) -> dict[int, BlueStepResult]:
-        if policy_actions is None:
+             policy_actions: dict[int, int] | None = None,
+             action_masks: dict[int, np.ndarray] | None = None,
+             fallback_required: dict[int, bool] | None = None) -> dict[int, BlueStepResult]:
+        if policy_actions is None and action_masks is None and fallback_required is None:
             payloads = {i: int(action) for i, action in actions.items()}
         else:
+            policy_actions = ({i: int(action) for i, action in actions.items()}
+                              if policy_actions is None else policy_actions)
+            action_masks = ({} if action_masks is None else action_masks)
+            fallback_required = ({} if fallback_required is None else fallback_required)
             if set(policy_actions) != set(actions):
                 raise ValueError("policy_actions must contain exactly the action worker ids")
-            payloads = {i: {"action": int(action), "policy_action": int(policy_actions[i])}
+            if action_masks and set(action_masks) != set(actions):
+                raise ValueError("action_masks must contain exactly the action worker ids")
+            if fallback_required and set(fallback_required) != set(actions):
+                raise ValueError("fallback_required must contain exactly the action worker ids")
+            payloads = {i: {"action": int(action), "policy_action": int(policy_actions[i]),
+                            "action_mask": action_masks.get(i),
+                            "fallback_required": bool(fallback_required.get(i, False))}
                         for i, action in actions.items()}
         return self._request({i: ("step", payload) for i, payload in payloads.items()}, "step")
 

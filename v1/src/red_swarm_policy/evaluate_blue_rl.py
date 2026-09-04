@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import asdict
 import json
 import math
 import random
@@ -14,7 +15,8 @@ import torch
 
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
                       EvaluationShapingConfig, FlightEnvelopeConfig,
-                      FlightEnvelopeConstraintLayer, FlightQualityTracker, RainbowDQNAgent,
+                      FlightEnvelopeConstraintLayer, FlightQualityTracker,
+                      MechanismRewardConfig, RainbowDQNAgent,
                       append_flight_quality_episode,
                       blue_observation_dim,
                       write_flight_quality_report)
@@ -173,7 +175,7 @@ def main() -> int:
     slots = max(missile_scenarios)
     schema_dimensions = {
         schema: blue_observation_dim(schema, slots)
-        for schema in ("legacy_v1", "normalized_v2", "normalized_v3")
+        for schema in ("legacy_v1", "normalized_v2", "normalized_v3", "normalized_v4")
     }
     checkpoint_schema = agent.config.observation_schema
     if (checkpoint_schema in schema_dimensions
@@ -184,13 +186,18 @@ def main() -> int:
             f"checkpoint schema/dimension ({checkpoint_schema}, {agent.config.observation_dim}) "
             f"does not match --missiles; expected {schema_dimensions}"
         )
+    mechanism_reward_config = (
+        MechanismRewardConfig(**agent.config.mechanism_reward_config)
+        if agent.config.mechanism_reward_config else MechanismRewardConfig(enabled=False)
+    )
     config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=slots,
                                  pad_observation_to_max_missiles=len(missile_scenarios) > 1,
                                  observation_schema=observation_schema,
                                  decision_interval_s=args.decision_interval,
                                  expose_evaluation_mechanism_state=True,
                                  acmi_episode_interval=args.acmi_interval,
-                                 acmi_directory=str(output / "acmi"))
+                                 acmi_directory=str(output / "acmi"),
+                                 mechanism_reward=mechanism_reward_config)
     observation_dim = schema_dimensions[observation_schema]
     action_dim = 29
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
@@ -219,6 +226,7 @@ def main() -> int:
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
            "flight_envelope_config": agent.config.flight_envelope_config or envelope_config.__dict__,
+           "mechanism_reward_config": asdict(mechanism_reward_config),
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                      "direction": shaping_config.direction, "overload": shaping_config.overload,
                                      "weight": shaping_config.weight},
@@ -281,7 +289,24 @@ def main() -> int:
                         mechanism_diagnostics[worker] = diagnostic
                         mechanism_interventions[worker] += int(bool(diagnostic["intervened"]))
                         mechanism_traces[worker].append(diagnostic)
-            results = pool.step(actions, policy_actions=policy_actions)
+            action_masks = {
+                worker: np.asarray(
+                    mechanism_diagnostics.get(worker, {}).get(
+                        "effective_action_mask", np.ones(29, dtype=bool)
+                    ), dtype=bool,
+                )
+                for worker in workers
+            }
+            fallback_flags = {
+                worker: bool(mechanism_diagnostics.get(worker, {}).get(
+                    "fallback_required", False
+                ))
+                for worker in workers
+            }
+            results = pool.step(
+                actions, policy_actions=policy_actions, action_masks=action_masks,
+                fallback_required=fallback_flags,
+            )
             vector_iterations += 1
             resets = {}
             for worker in workers:

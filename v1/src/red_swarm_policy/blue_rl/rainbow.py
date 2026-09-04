@@ -81,6 +81,8 @@ class RainbowDQNConfig:
     # Serialized into every new checkpoint so evaluation reconstructs exactly
     # the same predictive constraint layer as behavior collection.
     flight_envelope_config: dict[str, object] | None = None
+    # Versioned physical-state estimator used by normalized_v4 and its reward.
+    mechanism_reward_config: dict[str, object] | None = None
 
 
 class RainbowDQNAgent:

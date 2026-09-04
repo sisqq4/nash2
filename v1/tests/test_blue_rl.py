@@ -15,8 +15,11 @@ from red_swarm_policy.blue_rl import (
     EvaluationShapingConfig,
     FlightEnvelopeConfig,
     FlightEnvelopeConstraintLayer,
+    BlueMechanismStateEstimator,
+    MechanismRewardConfig,
     RainbowDQNAgent,
     RainbowDQNConfig,
+    blue_observation_dim,
 )
 from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
 from red_swarm_policy.env import EnvironmentConfig, ScenarioConfig
@@ -147,6 +150,104 @@ def test_normalized_v3_exposes_previous_executed_action_and_actuator_command() -
         info["flight_quality_state"]["actual_load_command_body_g"],
         info["actual_load_command_body_g"],
     )
+
+
+def test_normalized_v4_exposes_physical_mechanism_state_and_padding() -> None:
+    cfg = EnvironmentConfig()
+    env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(
+        missile_count=1, max_missiles=4, pad_observation_to_max_missiles=True,
+        observation_schema="normalized_v4", record_acmi=False,
+    ))
+
+    observation, info = env.reset(seed=5)
+
+    assert observation.shape == (blue_observation_dim("normalized_v4", 4),) == (119,)
+    assert np.all(np.isfinite(observation))
+    mechanism = info["reward_mechanism_state"]
+    assert mechanism["phase"] in {"P0", "P1", "P2"}
+    assert 0.0 <= mechanism["total_threat"] <= 2.0
+    assert len(mechanism["desired_direction_body"]) == 3
+    # Three unavailable rich missile slots contain exactly 13 zeroes each.
+    per_missile_offset = 6
+    assert np.allclose(observation[per_missile_offset + 13:per_missile_offset + 52], 0.0)
+    assert observation.shape[0] > blue_observation_dim("normalized_v3", 4)
+
+
+def _mechanism_snapshot(*, los_velocity_z_mps: float = 0.0,
+                        missile_position_x_m: float = 10_000.0,
+                        missile_velocity_x_mps: float = -900.0,
+                        time_s: float = 0.0) -> dict[str, object]:
+    return {
+        "blue_position_m": [0.0, 10_000.0, 0.0],
+        "blue_velocity_mps": [300.0, 0.0, 0.0],
+        "time_s": time_s,
+        "red_positions_m": [[missile_position_x_m, 10_000.0, 0.0]],
+        "red_velocities_mps": [[missile_velocity_x_mps, 0.0, los_velocity_z_mps]],
+        "red_alive": [True],
+        "red_energy": [1.0],
+        "red_guidance_modes": ["locked"],
+        "min_altitude_m": 8_000.0,
+        "max_altitude_m": 12_000.0,
+        "min_speed_mps": 100.0,
+        "max_speed_mps": 600.0,
+        "max_load_factor_g": 9.0,
+        "previous_executed_action_index": 0,
+        "actual_load_command_body_g": [0.0, 1.0, 0.0],
+    }
+
+
+def test_mechanism_threat_treats_low_los_rate_as_collision_risk() -> None:
+    direct = BlueMechanismStateEstimator().observe(
+        _mechanism_snapshot(los_velocity_z_mps=0.0, missile_position_x_m=5_000.0)
+    )
+    crossing = BlueMechanismStateEstimator().observe(
+        _mechanism_snapshot(los_velocity_z_mps=1000.0, missile_position_x_m=5_000.0)
+    )
+
+    assert direct["total_threat"] > crossing["total_threat"]
+    assert direct["minimum_tgo_s"] < 10.0
+    assert direct["phase"] == "P1"  # emergency t_go bypasses confirmation delay
+
+
+def test_mechanism_penalties_separate_timing_direction_and_load() -> None:
+    estimator = BlueMechanismStateEstimator(MechanismRewardConfig())
+    mechanism = {
+        "evasion_target": 1.0,
+        "desired_direction_inertial": [1.0, 0.0, 0.0],
+        "reference_load_g": 5.0,
+    }
+    mask = np.ones(29, dtype=bool)
+
+    absent = estimator.penalties(mechanism, np.zeros(3), 1.0, 0.1, 0.0,
+                                 action_mask=mask)
+    aligned = estimator.penalties(mechanism, np.array([9.80665, 0.0, 0.0]), 5.0,
+                                  0.1, 0.0, action_mask=mask)
+    wrong = estimator.penalties(mechanism, np.array([-9.80665, 0.0, 0.0]), 9.0,
+                                0.1, 0.0, action_mask=mask)
+
+    assert absent["timing"] > 0.0
+    assert absent["direction"] == absent["overload"] == 0.0
+    assert aligned["timing"] == aligned["direction"] == aligned["overload"] == 0.0
+    assert wrong["direction"] > 0.0
+    assert wrong["overload"] > 0.0
+    assert max(wrong["timing"], wrong["direction"], wrong["overload"]) < 0.001
+
+
+def test_mechanism_penalties_turn_off_when_no_real_action_choice_exists() -> None:
+    estimator = BlueMechanismStateEstimator()
+    mechanism = {
+        "evasion_target": 1.0,
+        "desired_direction_inertial": [1.0, 0.0, 0.0],
+        "reference_load_g": 9.0,
+    }
+    mask = np.zeros(29, dtype=bool); mask[4] = True
+
+    penalties = estimator.penalties(
+        mechanism, np.zeros(3), 1.0, 0.1, 0.0, action_mask=mask
+    )
+
+    assert penalties["choice_gate"] == 0.0
+    assert penalties["total"] == 0.0
 
 
 def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
@@ -329,6 +430,21 @@ def test_shared_envelope_uses_visible_action_context_instead_of_private_history(
     np.testing.assert_allclose(
         first_details["load_command_rate_gps"], second_details["load_command_rate_gps"]
     )
+
+
+def test_emergency_gate_relaxes_only_soft_envelope_costs() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    normal = _envelope_snapshot(altitude=11_400.0, velocity=(300.0, 35.0, 0.0))
+    emergency = dict(normal); emergency["mechanism_emergency_gate"] = 1.0
+
+    normal_mask, normal_cost, normal_details = layer.constraints(normal)
+    emergency_mask, emergency_cost, emergency_details = layer.constraints(emergency)
+
+    np.testing.assert_array_equal(normal_mask, emergency_mask)
+    np.testing.assert_allclose(normal_details["altitude_cost"], emergency_details["altitude_cost"])
+    assert np.all(emergency_cost <= normal_cost + 1.0e-12)
+    assert emergency_details["envelope_cost_gate"] == pytest.approx(0.5)
+    assert emergency_details["command_cost_gate"] == pytest.approx(0.2)
 
 
 def test_heading_recovery_rejects_frozen_acceleration_false_positive() -> None:
@@ -609,6 +725,41 @@ def test_potential_components_sum_and_include_multi_threat_diagnostics() -> None
     )
     assert 0.0 <= potential["range_blend_weight"] <= 1.0
     assert potential["softmin_threat_distance"] > 0.0
+
+
+def test_joint_reward_components_reconstruct_actual_transition_reward() -> None:
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(
+        missile_count=1, observation_schema="normalized_v4", record_acmi=False,
+    ))
+    env.reset(seed=12)
+    assert env.inner.state is not None
+    blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
+    missile.position_m = blue.position_m + np.array([20_000.0, 0.0, 0.0])
+    missile.velocity_mps = blue.velocity_mps + np.array([-1_000.0, 0.0, 0.0])
+    env._learning_active = True
+    env._activation_time_s = env.inner.state.time_s
+    env.mechanism_estimator.reset()
+    env._mechanism_reward_state = env.mechanism_estimator.observe(
+        env._mechanism_snapshot(), env._structural_action_mask()
+    )
+    env._previous_potential = env._joint_potential(env._mechanism_reward_state)
+
+    _, reward, terminated, truncated, info = env.step(
+        7, action_mask=np.ones(29, dtype=bool)
+    )
+
+    assert not (terminated or truncated)
+    components = info["reward_components"]
+    reconstructed = sum(components[name] for name in (
+        "far_away_shaping", "near_tangent_shaping", "near_dive_shaping",
+        "threat_outcome_shaping", "timing_penalty", "direction_penalty",
+        "overload_penalty", "terminal",
+    ))
+    assert reward == pytest.approx(reconstructed)
+    assert components["joint_potential_shaping"] == pytest.approx(
+        components["tactical_shaping"] + components["threat_outcome_shaping"]
+    )
+    assert info["reward_diagnostics"]["choice_gate"] == 1.0
 
 
 def test_blue_threat_potential_is_bounded_and_normalized_across_missile_counts() -> None:

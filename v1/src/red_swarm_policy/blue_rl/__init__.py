@@ -9,6 +9,8 @@ from .env_pool import BlueProcessEnvironmentPool, BlueStepResult
 from .curriculum import CurriculumSchedule, CurriculumStage, DEFAULT_CURRICULUM
 from .evaluation_shaping import EvaluationActionShaper, EvaluationShapingConfig
 from .flight_envelope import FlightEnvelopeConfig, FlightEnvelopeConstraintLayer
+from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfig,
+                               encode_normalized_v4, mechanism_observation_dim)
 
 from .flight_quality import (FlightQualityTracker, append_flight_quality_episode,
                              write_flight_quality_report)
@@ -34,6 +36,10 @@ __all__ = [
     "EvaluationShapingConfig",
     "FlightEnvelopeConfig",
     "FlightEnvelopeConstraintLayer",
+    "BlueMechanismStateEstimator",
+    "MechanismRewardConfig",
+    "encode_normalized_v4",
+    "mechanism_observation_dim",
     "FlightQualityTracker",
     "append_flight_quality_episode",
 

@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     parser.add_argument("--curriculum", action="store_true",
-                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v3 54-D network)")
+                        help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v4 network)")
     parser.add_argument("--curriculum-transition-episodes", type=int, default=500,
                         help="Episodes used to linearly ramp probabilities at each curriculum stage entry")
     parser.add_argument("--curriculum-eval-interval", type=int, default=500)
@@ -113,7 +113,11 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                 else:
                     action = policy_action = 0
                 observation, _, terminated, truncated, info = evaluation_env.step(
-                    action, policy_action=policy_action
+                    action, policy_action=policy_action,
+                    action_mask=np.asarray(diagnostic["effective_action_mask"], dtype=bool)
+                    if learning_active else None,
+                    fallback_required=bool(diagnostic.get("fallback_required", False))
+                    if learning_active else False,
                 )
                 learning_active = bool(info["learning_active"])
                 mechanism_state = dict(info["flight_quality_state"])
@@ -156,7 +160,7 @@ def main() -> int:
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
                                      pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
-                                     observation_schema="normalized_v3",
+                                     observation_schema="normalized_v4",
                                      decision_interval_s=args.decision_interval,
                                      acmi_episode_interval=args.acmi_interval,
                                      acmi_directory=str(output / "acmi"))
@@ -167,7 +171,9 @@ def main() -> int:
         batch_size=args.batch_size,
         replay_size=args.replay_size,
         gamma=env_config.shaping_discount, device=args.device,
+        atoms=61, value_min=-14.0, value_max=12.0,
         flight_envelope_config=asdict(envelope_config),
+        mechanism_reward_config=asdict(env_config.mechanism_reward),
     )
     pool_size = min(args.parallel_envs, args.episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
@@ -262,7 +268,19 @@ def main() -> int:
                     policy_actions[worker] = int(diagnostic["raw_action"])
                     action_diagnostics[worker] = diagnostic
                     window_values.append(float(q[action]))
-            results = pool.step(actions, policy_actions=policy_actions); resets: dict[int, tuple[int, int]] = {}
+            action_masks = {
+                worker: np.asarray(action_diagnostics[worker]["effective_action_mask"], dtype=bool)
+                if worker in action_diagnostics else np.ones(29, dtype=bool)
+                for worker in workers
+            }
+            fallback_flags = {
+                worker: bool(action_diagnostics.get(worker, {}).get("fallback_required", False))
+                for worker in workers
+            }
+            results = pool.step(
+                actions, policy_actions=policy_actions, action_masks=action_masks,
+                fallback_required=fallback_flags,
+            ); resets: dict[int, tuple[int, int]] = {}
             learning_transition_count = 0
             for worker in workers:
                 result = results[worker]; previous = observations[worker]

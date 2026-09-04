@@ -32,7 +32,7 @@ CSV 在全部回合完成后写入。
 基线结果分别写入 `blue_rule_baseline_summary.json` 和
 `blue_rule_baseline_trials.csv`。
 
-## 仅测试启用的机理塑形与消融
+## 旧 checkpoint 的仅测试机理塑形与消融
 
 `evaluate_blue_rl` 可在完整 29 维 C51 动作价值上独立启用四类物理评分：
 `--mechanism-threat`（短时威胁缓解）、`--mechanism-timing`（带迟滞的 P0/P1/P2
@@ -40,8 +40,9 @@ CSV 在全部回合完成后写入。
 （随威胁及阶段变化的过载）。`--mechanism-weight` 调整每项归一化评分的融合权重，默认
 为 `0.35`。
 
-所有开关默认关闭，且训练入口不提供这些选项，因此不会改变已有训练、奖励或回放数据。无开关
-为 Rainbow-only 基线，单独开启可做逐项消融，全部开启为完整融合。评估 JSON 记录启用项、
+所有开关仍默认关闭，只用于复现实装四项训练奖励之前的旧 checkpoint 消融。新
+`normalized_v4` checkpoint 已经在训练奖励和观测中内生化四项机理，正常评估不应再打开这些
+动作整形开关，以免重复施加偏好。无开关为策略本体基线，评估 JSON 记录启用项、
 网络原始/最终动作、阶段、威胁和介入率；启用任一机理时，平台结构过载、速度和高度物理
 包线组成唯一硬动作掩码，其他机理偏好均为软评分。
 
@@ -71,8 +72,8 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 
 `red_swarm_policy.blue_rl` 将 nash1.6 的离散蓝方逃逸强化学习结构移植到 v1：采用 29 个 v1
 蓝机动作、Rainbow DQN（Dueling、NoisyNet、C51、PER、n-step、Double DQN）并提供固定长度的
-单机/1–4 枚来弹观测。单场景观测与 nash1.6 一致，为蓝机绝对位置、速度和每枚红弹相对位置；
-联合训练则按所选最大来弹数补零到固定长度，从而由同一个策略随机学习多个场景。该子系统只复用 v1 的场景生成、三自由度动力学、导引头、裁决和参数；
+单机/1–4 枚来弹观测。当前训练输入使用下述 `normalized_v4` 物理/机理状态；联合训练按所选最大来弹数
+补零到固定长度，从而由同一个策略随机学习多个场景。该子系统只复用 v1 的场景生成、三自由度动力学、导引头、裁决和参数；
 没有复制 nash1.6 的场景数值。
 
 训练环境 `BlueEscapeEnv` 与红方分层训练环境相对独立。所有红弹固定分配给唯一蓝机且残差过载恒为
@@ -99,57 +100,64 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 100 m/s、0.35、70°。动作相对上一个**实际执行动作**的载荷矢量变化率和滚转指令变化率也分别设软/硬门槛
 30/100 g/s 与 240/1200 deg/s，用于阻止瞬时左右翻转或正负载荷翻转。硬动作排除后，以
 `Q - 高度软代价 - 包线软代价 - 指令变化软代价` 选择实际动作；若初始状态已经使安全集为空，则只开放
-确定性的最小风险恢复动作。执行端把约束后的离散目标在一个 0.1 s 决策区间内逐 0.005 s 物理帧线性插值。
+确定性的最小风险恢复动作。P1/P2 紧急门只把包线软代价最多降到 50%、指令变化软代价最多降到 20%，
+高度软代价和全部硬掩码始终不变。执行端把约束后的离散目标在一个 0.1 s 决策区间内逐 0.005 s 物理帧
+线性插值。
 
 新 checkpoint 会保存完整的飞行包线配置，评估时自动恢复，并拒绝与保存值不一致的决策周期。PER/n-step
 回放保存约束后的实际动作以及 n-step 末状态的硬动作掩码和软代价；Double-DQN 的下一动作选择也使用它们，
 不会把回报归因给未执行的 RL 原始动作。日志和飞行品质轨迹分别保留 `requested_action_index`、
 `constrained_action_index`、`executed_action_index`、目标载荷和物理层实际载荷。
 
-新训练使用 `normalized_v3` 观测。它在 `normalized_v2` 的飞机/来弹状态后追加上一次实际执行动作的 29 维
-one-hot，以及当前连续执行指令 `[轴向载荷/9, 法向载荷/9, 滚转角/pi]`。约束层也从同一个状态快照读取
-`previous_executed_action_index` 和 `actual_load_command_body_g`，因此载荷/滚转变化率不再依赖网络看不到的
-约束器私有历史。1v1 的输入维度为 42，补齐到 1v4 的联合输入维度为 54；回放中的当前/下一观测自然包含
-各自的实际动作上下文。旧 `normalized_v2` 与 `legacy_v1` checkpoint 仍按保存的原始输入契约加载，但新训练
-不会再生成缺失动作上下文的 `normalized_v2` 模型。
+新训练使用 `normalized_v4` 观测。除蓝机状态和 32 维实际动作上下文外，每个来弹槽包含相对位置、
+相对速度、距离、闭合速度、`t_go`、LOS 角速率、能量、制导状态和有效位；全局部分包含滤波威胁及
+变化率、多弹包围指标、P0/P1/P2 阶段及驻留/确认状态、主威胁切换迟滞、机体系期望方向、离散参考
+过载、包线余度和紧急门。1v1 输入为 74 维，补齐到 1v4 的联合输入为 119 维。这样奖励状态机使用的
+状态不再隐藏在环境内部。旧 `normalized_v3`（42/46/50/54 维）、`normalized_v2` 和 `legacy_v1`
+checkpoint 仍按保存的输入契约加载。
 
-蓝方奖励在每个 **0.1 s 决策边界**计算一次，而不再在 0.005 s 物理帧上反复惩罚不可避免的弹目接近。
-其有界多弹威胁势函数采用 soft-min 权重：远距阶段奖励速度指向远离来弹的方向；进入 30 km 附近后，
-平滑转为奖励与来袭方向近似切向的速度以及俯冲分量。势函数尺度默认为 2，并使用与 DQN 一致的
-`gamma * Phi(next) - Phi(current)`；终止状态的势函数严格置零，避免终局残留势函数改变奖励方向，因此 shaping 不会掩盖
-终局的生存优先级。裁决结果分别映射为明确脱靶/物理失效 `+10`（另有不超过 `+1` 的快速完成奖励）、
-蓝机被击中 `-10`（按生存进度最多减轻 `1`）、mission timeout `+2`。日志逐回合保存
-`reward_components` 和每枚导弹的 `red_loss_reasons`，避免把超时和真正脱靶混为同一成功类型。
+蓝方奖励在每个 **0.1 s 决策边界**计算一次。旧的远离/切向/俯冲三项势函数全部保留，尺度由 2
+下调到 1；另加入由距离、闭合速度、`t_go`、低 LOS 角速率碰撞特征、导弹能量/制导状态和多弹包围度
+构成的威胁结果势函数。四个势分量统一使用 `gamma * Phi(next) - Phi(current)`，终止状态统一令
+`Phi=0`。P1 紧急阶段只把旧战术势权重平滑降到最低 25%，避免“继续飞远/俯冲”压过眼前规避，但不删除
+旧奖励内容。
+
+其余三项采用同一个 P0（低威胁）、P1（规避）、P2（释放）迟滞状态机，并作为小预算的直接代价：
+时机代价比较实际净加速度激活度与阶段目标；方向代价只比较净加速度单位方向与多弹 maximin 方向，
+留有 20° 死区；过载代价用速度、水平速度比例和航迹倾角形成的包线余度计算连续参考值，再投影到可行
+离散动作。三项分别按整回合预算 0.60/0.45/0.55 除以剩余时域，不按物理帧重复计罚；硬约束只剩一个
+可选动作或进入 fallback 时全部关闭。最终仍以生存裁决为主：脱靶/物理失效 `+10`（另有不超过 `+1`
+的快速完成奖励）、蓝机被击中 `-10`（按生存进度最多减轻 `1`）、timeout `+2`。
 
 建议奖励重构后的训练计划先做 terminal-only 与新 threat-potential 的相同 seed 消融，再逐步扩展到 1v2～1v4；
 每阶段使用独立 evaluation seeds 比较生存率、终止/失效原因、脱靶距离、完成时间与动作分布。C51 support
-随新奖励调整为 `[-12, 12]`；正式长跑仍应依据投影前 n-step return 分位数复核边界，而不是依据 episode
+随新奖励调整为 61 atoms、`[-14, 12]`；正式长跑仍应依据投影前 n-step return 分位数复核边界，而不是依据 episode
 总回报机械扩大 support。
 
 蓝方训练和评估入口统一把 mission timeout 与 missile guidance timeout 设置为 200 s。针对平均上千个
 决策步的轨迹，Rainbow 默认采用 `gamma=0.999`、`n_step=20`，并将学习率降低到 `2.5e-4` 以减轻后期
-策略漂移。每个 decision 的 `reward_components` 分别记录 `far_away_shaping`、`near_tangent_shaping` 和
-`near_dive_shaping`；`reward_diagnostics` 另外记录 `range_blend_weight`、`softmin_threat_distance`、
-`potential_before`、`potential_after`。训练窗口同时报告 C51 上下界 clamp 比例。
+策略漂移。每个 decision 的 `reward_components` 分别记录旧三项势差、`threat_outcome_shaping`，以及
+`timing_penalty`、`direction_penalty`、`overload_penalty`；`reward_diagnostics` 另外记录威胁、变化率、
+包围度、阶段、紧急门、三类误差和可选动作门。训练窗口同时报告 C51 上下界 clamp 比例。
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --missiles 1,2,3,4 --episodes 1000
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl outputs/blue_rl/train/blue_rainbow.pt --missiles 1,2,3,4
 ```
 
-## 当前 normalized_v3 推荐命令
+## 当前 normalized_v4 推荐命令
 
-以下命令均从 `v1/` 目录执行。新启动的训练会自动使用 `normalized_v3`，无需额外指定 schema；checkpoint
+以下命令均从 `v1/` 目录执行。新启动的训练会自动使用 `normalized_v4`，无需额外指定 schema；checkpoint
 会保存 schema，评估入口会自动校验，不能手工混用旧的 `legacy_v1` 输入。
 
-先做快速 smoke，确认环境进程、54 维联合观测、replay、更新和 checkpoint 全链路可运行：
+先做快速 smoke，确认环境进程、119 维联合观测、replay、更新和 checkpoint 全链路可运行：
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --missiles 1,2,3,4 --episodes 8 --seed 42 --device cpu \
   --parallel-envs 2 --batch-size 8 --updates-per-transition 0.25 \
   --checkpoint-interval 8 --log-interval 2 --acmi-interval 0 \
-  --output outputs/blue_rl/smoke_normalized_v3
+  --output outputs/blue_rl/smoke_normalized_v4
 ```
 
 推荐的课程训练（默认课程完整长度为 7500 回合）：
@@ -160,18 +168,18 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --parallel-envs 16 --env-worker-threads 1 \
   --batch-size 256 --updates-per-transition 0.5 \
   --checkpoint-interval 500 --log-interval 10 --acmi-interval 0 \
-  --output outputs/blue_rl/curriculum_normalized_v3
+  --output outputs/blue_rl/curriculum_normalized_v4
 ```
 
 固定独立 seed 对最终 checkpoint 做 1v1～1v4 联合评估：
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
-  outputs/blue_rl/curriculum_normalized_v3/blue_rainbow.pt \
+  outputs/blue_rl/curriculum_normalized_v4/blue_rainbow.pt \
   --missiles 1,2,3,4 --episodes 4000 --seed 10042 --device cuda:0 \
   --parallel-envs 16 --env-worker-threads 1 \
   --log-interval 100 --acmi-interval 0 \
-  --output outputs/blue_rl/eval_normalized_v3
+  --output outputs/blue_rl/eval_normalized_v4
 ```
 
 代码回归测试和命令行检查：
@@ -185,12 +193,11 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl --help
 
 ## 课程学习（可选，原训练方式不变）
 
-课程模式通过单独的 `--curriculum` 开关启用。新训练统一使用版本化 `normalized_v3` 观测：蓝机水平位置置于
-相对原点、绝对高度除以 20 km、速度除以 2000 m/s、弹机相对位置除以 200 km，并在每个导弹槽后附加一个
-有效位，并追加 32 维动作上下文。因此课程模式从第一回合起固定使用 `max_missiles=4`、54 维观测和
-29 维动作；无效槽严格补零。
+课程模式通过单独的 `--curriculum` 开关启用。新训练统一使用版本化 `normalized_v4` 观测，因此课程模式
+从第一回合起固定使用 `max_missiles=4`、119 维观测和 29 维动作；无效来弹槽的 13 个物理特征严格补零。
 旧训练环境接口仍默认 `legacy_v1`，评估和常规运行会根据 checkpoint 输入维度自动选用旧的 9/12/15/18 维
-schema、`normalized_v2` 的 10/14/18/22 维 schema，或 `normalized_v3` 的 42/46/50/54 维 schema。
+schema、`normalized_v2` 的 10/14/18/22 维、`normalized_v3` 的 42/46/50/54 维，或
+`normalized_v4` 的 74/89/104/119 维 schema。
 旧 checkpoint 不会被静默解释为新输入。
 
 默认八阶段共 **7500** 回合（原建议表各行相加是 7500，而不是文字中的 8500），保留所有旧难度复习，

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +10,9 @@ from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.environment import RedBlueEngagementEnv
 from ..env.types import EnvironmentConfig, RedAction
 from .acmi import AcmiRecorder
+from .flight_envelope import FlightEnvelopeConstraintLayer
+from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfig,
+                               encode_normalized_v4, mechanism_observation_dim)
 
 
 BLUE_ACTION_CONTEXT_DIM = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G) + 3
@@ -22,6 +25,8 @@ def blue_observation_dim(schema: str, missile_slots: int) -> int:
         return 6 + 4 * int(missile_slots)
     if schema == "normalized_v3":
         return 6 + 4 * int(missile_slots) + BLUE_ACTION_CONTEXT_DIM
+    if schema == "normalized_v4":
+        return 6 + mechanism_observation_dim(int(missile_slots)) + BLUE_ACTION_CONTEXT_DIM
     raise ValueError(f"unsupported blue observation schema: {schema}")
 
 
@@ -59,7 +64,7 @@ class BlueEscapeEnvConfig:
     terminal_timeout_reward: float = 2.0
     survival_progress_bonus: float = 1.0
     fast_success_bonus: float = 1.0
-    shaping_scale: float = 2.0
+    shaping_scale: float = 1.0
     shaping_discount: float = 0.999
     near_range_m: float = 30000.0
     range_transition_m: float = 8000.0
@@ -67,13 +72,16 @@ class BlueEscapeEnvConfig:
     far_away_weight: float = 1.0
     near_tangent_weight: float = 0.65
     near_dive_weight: float = 0.35
+    mechanism_reward: MechanismRewardConfig = field(default_factory=MechanismRewardConfig)
 
     def validate(self, environment: EnvironmentConfig) -> None:
         if not 1 <= self.missile_count <= self.max_missiles <= 4:
             raise ValueError("blue training supports one to four missiles against one aircraft")
-        if self.observation_schema not in {"legacy_v1", "normalized_v2", "normalized_v3"}:
+        if self.observation_schema not in {
+            "legacy_v1", "normalized_v2", "normalized_v3", "normalized_v4"
+        }:
             raise ValueError(
-                "observation_schema must be 'legacy_v1', 'normalized_v2', or 'normalized_v3'"
+                "observation_schema must be legacy_v1 or normalized_v2/v3/v4"
             )
         if (
             isinstance(self.acmi_episode_interval, bool)
@@ -109,6 +117,7 @@ class BlueEscapeEnvConfig:
             or self.initial_altitude_range_m[1] > environment.aircraft.max_altitude_m
         ):
             raise ValueError("blue reward scales, ranges, or tactical weights are invalid")
+        self.mechanism_reward.validate()
 
 
 class BlueEscapeEnv:
@@ -149,6 +158,8 @@ class BlueEscapeEnv:
         self._activation_range_m: float | None = None
         self._previous_executed_action_index = 0
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
+        self.mechanism_estimator = BlueMechanismStateEstimator(config.mechanism_reward)
+        self._mechanism_reward_state: dict[str, object] = {}
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
               missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
@@ -177,14 +188,22 @@ class BlueEscapeEnv:
         self._activation_range_m = None
         self._previous_executed_action_index = 0
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
+        self.mechanism_estimator.reset()
+        self._mechanism_reward_state = self.mechanism_estimator.observe(
+            self._mechanism_snapshot(), self._structural_action_mask()
+        )
         self._activate_if_threat_observed()
-        self._previous_potential = self._threat_potential() if self._learning_active else self._zero_potential()
+        self._previous_potential = (
+            self._joint_potential(self._mechanism_reward_state)
+            if self._learning_active else self._zero_joint_potential()
+        )
         info = {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
             "flight_quality_state": self._mechanism_snapshot(),
+            "reward_mechanism_state": dict(self._mechanism_reward_state),
             **self._learning_status(learning_transition=False, requested_action=0,
                                     constrained_action=0, executed_action=0),
         }
@@ -210,7 +229,15 @@ class BlueEscapeEnv:
                 "max_speed_mps": self.environment_config.aircraft.max_speed_mps,
                 "max_load_factor_g": self.environment_config.aircraft.max_load_factor_g,
                 "previous_executed_action_index": self._previous_executed_action_index,
-                "actual_load_command_body_g": self._applied_load_command_body_g.tolist()}
+                "actual_load_command_body_g": self._applied_load_command_body_g.tolist(),
+                "mechanism_emergency_gate": float(
+                    self._mechanism_reward_state.get("emergency_gate", 0.0)
+                    if self.config.observation_schema == "normalized_v4" else 0.0
+                )}
+
+    def _structural_action_mask(self) -> np.ndarray:
+        loads = np.linalg.norm(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[:, :2], axis=1)
+        return loads <= self.environment_config.aircraft.max_load_factor_g + 1.0e-9
 
     def _initialization_snapshot(self) -> dict[str, object]:
         """Return a JSON-safe, immutable description of the sampled scenario."""
@@ -253,13 +280,24 @@ class BlueEscapeEnv:
             "blue_orientation": orientation,
         }
 
-    def step(self, action: int, *, policy_action: int | None = None) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+    def step(self, action: int, *, policy_action: int | None = None,
+             action_mask: np.ndarray | None = None,
+             fallback_required: bool = False) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
         if not 0 <= int(action) < self.action_dim: raise ValueError(f"action must be in [0, {self.action_dim})")
         if policy_action is not None and not 0 <= int(policy_action) < self.action_dim:
             raise ValueError(f"policy_action must be in [0, {self.action_dim})")
+        if action_mask is not None:
+            action_mask = np.asarray(action_mask, dtype=bool)
+            if action_mask.shape != (self.action_dim,):
+                raise ValueError(f"action_mask must have shape ({self.action_dim},)")
         constrained_action = int(action)
         requested_action = constrained_action if policy_action is None else int(policy_action)
         learning_transition = self._learning_active
+        mechanism_before = dict(self._mechanism_reward_state)
+        if learning_transition and action_mask is not None:
+            mechanism_before = self.mechanism_estimator.restrict_targets_to_action_mask(
+                self._mechanism_snapshot(), mechanism_before, action_mask
+            )
         # Action zero is [0 axial g, 1 normal g, 0 bank], exactly cancelling
         # gravity for unchanged straight-and-level flight before detection.
         executed_action = constrained_action if learning_transition else 0
@@ -268,6 +306,9 @@ class BlueEscapeEnv:
         bank_delta = math.atan2(math.sin(float(target_command[2] - starting_command[2])),
                                 math.cos(float(target_command[2] - starting_command[2])))
         result = None
+        integrated_acceleration = np.zeros(3, dtype=np.float64)
+        integrated_load_g = 0.0
+        elapsed_transition_s = 0.0
         for frame_index in range(self.frames_per_action):
             assert self.inner.state is not None
             red = RedAction(np.zeros(len(self.inner.state.red), np.int64), np.zeros((len(self.inner.state.red), 2)))
@@ -278,6 +319,14 @@ class BlueEscapeEnv:
             applied = starting_command + fraction * (target_command - starting_command)
             applied[2] = starting_command[2] + fraction * bank_delta
             self._applied_load_command_body_g = applied.copy()
+            velocity = self.inner.state.blue[0].velocity_mps.copy()
+            net_acceleration = FlightEnvelopeConstraintLayer._accelerations_for_commands(
+                velocity[None, :], applied[None, :]
+            )[0]
+            dt = self.environment_config.time_step_s
+            integrated_acceleration += net_acceleration * dt
+            integrated_load_g += float(np.linalg.norm(applied[:2])) * dt
+            elapsed_transition_s += dt
             result = self.inner.step(
                 red_action=red,
                 blue_action={"load_command_body_g": [applied.tolist()]},
@@ -289,40 +338,74 @@ class BlueEscapeEnv:
         assert result is not None and self.inner.state is not None
         self._previous_executed_action_index = executed_action
         blue_alive = self.inner.state.blue[0].alive
-        measured_potential = self._threat_potential()
-        potential_before = self._previous_potential["total"]
+        self._mechanism_reward_state = self.mechanism_estimator.observe(
+            self._mechanism_snapshot(), self._structural_action_mask()
+        )
+        measured_potential = self._joint_potential(self._mechanism_reward_state)
+        potential_before = self._previous_potential.get("total", 0.0)
         if learning_transition:
             # A terminal MDP state has Phi=0.  Using the learner's discount
             # gives policy-invariant shaping: gamma*Phi(s')-Phi(s).
-            current_potential = self._zero_potential() if result.done else measured_potential
+            current_potential = self._zero_joint_potential() if result.done else measured_potential
             shaping = {
-                name: self.config.shaping_discount * current_potential[name] - self._previous_potential[name]
-                for name in ("far_away", "near_tangent", "near_dive")
+                name: (self.config.shaping_discount * current_potential[name]
+                       - self._previous_potential.get(name, 0.0))
+                for name in ("far_away", "near_tangent", "near_dive", "threat_outcome")
             }
+            average_acceleration = integrated_acceleration / max(elapsed_transition_s, 1.0e-9)
+            average_load_g = integrated_load_g / max(elapsed_transition_s, 1.0e-9)
+            elapsed_learning_s = max(
+                0.0,
+                float(self.inner.state.time_s) - float(self._activation_time_s or self.inner.state.time_s),
+            )
+            penalties = self.mechanism_estimator.penalties(
+                mechanism_before,
+                average_acceleration,
+                average_load_g,
+                elapsed_transition_s,
+                elapsed_learning_s,
+                action_mask=action_mask,
+                fallback_required=fallback_required,
+            )
             terminal_reward = self._terminal_reward(result.info) if result.done else 0.0
         else:
             # The transition that first crosses the detection boundary belongs
             # to straight-flight warmup.  It establishes the first RL state but
             # is never rewarded or inserted into replay.
             current_potential = (
-                measured_potential if self._learning_active and not result.done else self._zero_potential()
+                measured_potential if self._learning_active and not result.done
+                else self._zero_joint_potential()
             )
-            shaping = {"far_away": 0.0, "near_tangent": 0.0, "near_dive": 0.0}
+            shaping = {
+                "far_away": 0.0, "near_tangent": 0.0, "near_dive": 0.0,
+                "threat_outcome": 0.0,
+            }
+            penalties = {
+                "timing": 0.0, "direction": 0.0, "overload": 0.0,
+                "total": 0.0, "choice_gate": 0.0, "evasion_activation": 0.0,
+                "timing_error": 0.0, "direction_error": 0.0, "overload_error": 0.0,
+            }
             terminal_reward = 0.0
-        shaping_reward = sum(shaping.values())
+        legacy_shaping_reward = sum(shaping[name] for name in ("far_away", "near_tangent", "near_dive"))
+        shaping_reward = legacy_shaping_reward + shaping["threat_outcome"]
         potential_after = current_potential["total"]
         self._previous_potential = current_potential
-        reward = shaping_reward + terminal_reward
+        reward = shaping_reward - penalties["total"] + terminal_reward
         terminated, truncated = bool(result.terminated), bool(result.truncated)
         info = dict(result.info); info.update({
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "blue_survived": blue_alive,
             "reward_components": {
-                "tactical_shaping": float(shaping_reward),
+                "tactical_shaping": float(legacy_shaping_reward),
+                "joint_potential_shaping": float(shaping_reward),
                 "far_away_shaping": float(shaping["far_away"]),
                 "near_tangent_shaping": float(shaping["near_tangent"]),
                 "near_dive_shaping": float(shaping["near_dive"]),
+                "threat_outcome_shaping": float(shaping["threat_outcome"]),
+                "timing_penalty": -float(penalties["timing"]),
+                "direction_penalty": -float(penalties["direction"]),
+                "overload_penalty": -float(penalties["overload"]),
                 "terminal": float(terminal_reward),
             },
             "reward_diagnostics": {
@@ -331,10 +414,24 @@ class BlueEscapeEnv:
                 "potential_before": float(potential_before),
                 "potential_after": float(potential_after),
                 "measured_potential_after": float(measured_potential["total"]),
+                "legacy_potential_multiplier": float(measured_potential["legacy_multiplier"]),
+                "total_threat": float(self._mechanism_reward_state["total_threat"]),
+                "threat_rate_per_s": float(self._mechanism_reward_state["threat_rate_per_s"]),
+                "encirclement": float(self._mechanism_reward_state["C_enc"]),
+                "phase_index": float({"P0": 0, "P1": 1, "P2": 2}[
+                    str(self._mechanism_reward_state["phase"])
+                ]),
+                "emergency_gate": float(self._mechanism_reward_state["emergency_gate"]),
+                "evasion_activation": float(penalties["evasion_activation"]),
+                "timing_error": float(penalties["timing_error"]),
+                "direction_error": float(penalties["direction_error"]),
+                "overload_error": float(penalties["overload_error"]),
+                "choice_gate": float(penalties["choice_gate"]),
             },
             # Kept separate from the normalized observation so diagnostics can
             # evolve without changing a checkpoint's observation schema.
             "flight_quality_state": self._mechanism_snapshot(),
+            "reward_mechanism_state": dict(self._mechanism_reward_state),
             **self._learning_status(
                 learning_transition=learning_transition,
                 requested_action=requested_action,
@@ -394,6 +491,40 @@ class BlueEscapeEnv:
         return {
             "far_away": 0.0, "near_tangent": 0.0, "near_dive": 0.0,
             "total": 0.0, "range_blend_weight": 0.0, "softmin_threat_distance": 0.0,
+        }
+
+    @staticmethod
+    def _zero_joint_potential() -> dict[str, float]:
+        return {
+            "far_away": 0.0, "near_tangent": 0.0, "near_dive": 0.0,
+            "threat_outcome": 0.0, "total": 0.0,
+            "range_blend_weight": 0.0, "softmin_threat_distance": 0.0,
+            "legacy_multiplier": 1.0,
+        }
+
+    def _joint_potential(self, mechanism: dict[str, object]) -> dict[str, float]:
+        """Fuse the retained tactical potential with threat-outcome potential."""
+        legacy = self._threat_potential()
+        emergency_gate = float(np.clip(mechanism.get("emergency_gate", 0.0), 0.0, 1.0))
+        multiplier = (
+            1.0 - self.config.mechanism_reward.legacy_emergency_suppression * emergency_gate
+            if self.config.mechanism_reward.enabled else 1.0
+        )
+        components = {
+            name: multiplier * legacy[name]
+            for name in ("far_away", "near_tangent", "near_dive")
+        }
+        threat = float(np.clip(mechanism.get("total_threat", 0.0), 0.0, 2.0))
+        components["threat_outcome"] = (
+            self.config.mechanism_reward.threat_potential_scale * (1.0 - threat / 2.0)
+            if self.config.mechanism_reward.enabled else 0.0
+        )
+        return {
+            **components,
+            "total": float(sum(components.values())),
+            "range_blend_weight": legacy["range_blend_weight"],
+            "softmin_threat_distance": legacy["softmin_threat_distance"],
+            "legacy_multiplier": multiplier,
         }
 
     def _threat_potential(self) -> dict[str, float]:
@@ -470,19 +601,25 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         state = self.inner.state
         blue = state.blue[0]
-        if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:
+        if self.config.observation_schema in {"normalized_v2", "normalized_v3", "normalized_v4"}:
             # Versioned, dimensionless input.  Horizontal position is relative
             # to the blue aircraft (altitude remains absolute because ground
             # clearance matters).  A per-slot validity bit removes zero-padding
             # ambiguity in mixed 1v1--1v4 training.
             values = [0.0, blue.position_m[1] / 20000.0, 0.0,
                       *(blue.velocity_mps / 2000.0)]
-            for red in state.red:
-                values.extend((red.position_m - blue.position_m) / 200000.0)
-                values.append(1.0)
-            if self.config.pad_observation_to_max_missiles:
-                values.extend([0.0] * (4 * (self.config.max_missiles - len(state.red))))
-            if self.config.observation_schema == "normalized_v3":
+            if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:
+                for red in state.red:
+                    values.extend((red.position_m - blue.position_m) / 200000.0)
+                    values.append(1.0)
+                if self.config.pad_observation_to_max_missiles:
+                    values.extend([0.0] * (4 * (self.config.max_missiles - len(state.red))))
+            else:
+                slots = self.config.max_missiles if self.config.pad_observation_to_max_missiles else self._missile_count
+                values.extend(encode_normalized_v4(
+                    self._mechanism_snapshot(), self._mechanism_reward_state, slots
+                ))
+            if self.config.observation_schema in {"normalized_v3", "normalized_v4"}:
                 values.extend(blue_action_context(
                     self._previous_executed_action_index,
                     self._applied_load_command_body_g,

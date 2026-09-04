@@ -195,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         agent = RainbowDQNAgent.load(args.blue_checkpoint, str(device))
         schema_dimensions = {
             schema: blue_observation_dim(schema, args.red_count)
-            for schema in ("legacy_v1", "normalized_v2", "normalized_v3")
+            for schema in ("legacy_v1", "normalized_v2", "normalized_v3", "normalized_v4")
         }
         checkpoint_schema = agent.config.observation_schema
         if (checkpoint_schema in schema_dimensions
