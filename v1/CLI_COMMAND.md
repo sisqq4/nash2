@@ -1,5 +1,9 @@
 # Stage 1 v3 and Stage 2 high-level CLI
 
+Training now also generates analysis plots after the existing saves complete.
+See [TRAINING_ANALYSIS.md](TRAINING_ANALYSIS.md) for independent JSON/JSONL plotting,
+output paths, smoothing, and `--no-training-plots`.
+
 This document is the reproducible command reference for the completed Stage 1
 low-level residual-guidance training and the audited Stage 2 high-level PPO
 training transition.

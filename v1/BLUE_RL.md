@@ -322,3 +322,8 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_evasion \
 默认仅绘制品质分最低的 10 个回合，可用 `--flight-quality-plot-limit` 调整或设为 `0` 关闭图片。
 传入修改前测试的 `--baseline-survival-rate` 后，报告还会直接标记当前生存率是否下降超过 5 个百分点；
 未提供基线时该结论为 `null`，避免把缺失对照误报成“未下降”。
+
+## 训练曲线分析
+
+训练结束后默认额外生成 reward、loss、蓝方逃脱率及已有训练诊断指标图，保留原有训练、
+测试和保存流程。独立分析日志、输出目录与关闭选项见 [TRAINING_ANALYSIS.md](TRAINING_ANALYSIS.md)。

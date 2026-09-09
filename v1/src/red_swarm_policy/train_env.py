@@ -14,6 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .analyze_training import write_training_analysis_safely
 from .cli_utils import parse_float_pair, parse_float_range, parse_float_sequence
 from .core.config import PPOConfig, SwarmModelConfig
 from .env import (
@@ -1297,6 +1298,9 @@ def _rollout_policy_diagnostics(batch: Any) -> dict[str, Any]:
 
 
 def train(args: argparse.Namespace) -> int:
+    plot_smoothing_window = getattr(args, "plot_smoothing_window", 20)
+    if plot_smoothing_window < 1:
+        raise ValueError("plot_smoothing_window must be positive")
     device, device_label = _select_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -2917,6 +2921,19 @@ def train(args: argparse.Namespace) -> int:
         trainer.execution_actor_optimizer.param_groups[0]["lr"]
     )
     _write_run_manifest(run_manifest_path, manifest)
+    if not getattr(args, "no_training_plots", False):
+        analysis_source = Path(args.metrics_path) if args.metrics_path else {"iterations": metric_rows}
+        training_plots_dir = getattr(args, "training_plots_dir", None)
+        if training_plots_dir:
+            analysis_output = Path(training_plots_dir)
+        elif args.metrics_path:
+            analysis_metrics_path = Path(args.metrics_path)
+            analysis_output = analysis_metrics_path.with_name(analysis_metrics_path.stem + "_analysis")
+        else:
+            analysis_output = run_manifest_path.parent / "training_analysis"
+        write_training_analysis_safely(
+            analysis_source, analysis_output, smoothing_window=plot_smoothing_window,
+        )
     return 0
 
 
@@ -3261,6 +3278,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume-checkpoint", default=None, help="Load model, optimizer, trainer, iteration, and RNG state.")
     parser.add_argument("--metrics-path", default="outputs/env_training_metrics.json")
     parser.add_argument(
+        "--no-training-plots", action="store_true",
+        help="Skip the analysis plots normally generated after training is saved",
+    )
+    parser.add_argument(
+        "--plot-smoothing-window", type=int, default=20,
+        help="Positive trailing smoothing window for training analysis (default: 20)",
+    )
+    parser.add_argument(
+        "--training-plots-dir", default=None,
+        help="Analysis directory; defaults beside metrics as METRICS_STEM_analysis",
+    )
+    parser.add_argument(
         "--run-manifest-path",
         default=None,
         help="Reproducibility manifest path; defaults beside --metrics-path.",
@@ -3271,6 +3300,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.plot_smoothing_window < 1:
+        parser.error("--plot-smoothing-window must be positive")
     if args.parallel_envs <= 0:
         parser.error("--parallel-envs must be positive")
     if args.env_worker_threads <= 0:

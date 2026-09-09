@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .analyze_training import write_training_analysis_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
                       FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
                       FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
@@ -47,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Final JSON metrics path; defaults to OUTPUT/training_metrics.json")
     parser.add_argument("--jsonl-path", default=None,
                         help="Streaming JSONL path; defaults to OUTPUT/training.jsonl")
+    parser.add_argument("--no-training-plots", action="store_true",
+                        help="Skip the analysis plots normally generated after training is saved")
+    parser.add_argument("--plot-smoothing-window", type=int, default=20,
+                        help="Positive trailing smoothing window for training analysis (default: 20)")
+    parser.add_argument("--training-plots-dir", default=None,
+                        help="Analysis output directory; defaults to OUTPUT/training_analysis")
     parser.add_argument("--acmi-interval", type=int, default=1,
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
@@ -130,6 +137,8 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.plot_smoothing_window < 1:
+        raise SystemExit("--plot-smoothing-window must be positive")
     try: missile_scenarios = parse_missile_scenarios(args.missiles)
     except ValueError as error: raise SystemExit(str(error)) from error
     if args.episodes < 1 or args.checkpoint_interval < 1 or args.log_interval < 1:
@@ -510,6 +519,12 @@ def main() -> int:
         metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],
                                             "curriculum_evaluations": [row for row in event_rows if row["event"] == "curriculum_evaluation"],
                                             "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
+    if not args.no_training_plots:
+        write_training_analysis_safely(
+            metrics_path,
+            Path(args.training_plots_dir) if args.training_plots_dir else output / "training_analysis",
+            smoothing_window=args.plot_smoothing_window,
+        )
     return 0
 
 
