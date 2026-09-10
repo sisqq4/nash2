@@ -21,6 +21,7 @@ from typing import Any
 
 import numpy as np
 
+from .analyze_blue_evaluations import write_evaluation_analysis_safely
 from .blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
@@ -49,6 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-interval", type=int, default=1,
                         help="Print and archive progress every N completed episodes")
     parser.add_argument("--output", type=Path, default=Path("outputs/blue_rl/rule_baseline"))
+    parser.add_argument("--no-result-plots", action="store_true",
+                        help="Skip the additional aggregate result figures generated after saving evaluation")
+    parser.add_argument("--result-plots-dir", type=Path, default=None,
+                        help="Aggregate result figures directory; defaults to OUTPUT/evaluation_analysis")
     return parser
 
 
@@ -248,6 +253,8 @@ def main(argv: list[str] | None = None) -> int:
     _emit({"event": "baseline_complete", "completed_episodes": len(rows),
            "summary_json": str(summary_path), "trials_csv": str(trials_path)}, progress_path)
 
+    if not args.no_result_plots:
+        write_evaluation_analysis_safely(summary_path, args.result_plots_dir)
     return 0
 
 

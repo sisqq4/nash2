@@ -1,10 +1,33 @@
 # 蓝方测试结果离线提取与对比
 
-`red_swarm_policy.analyze_blue_evaluations` 只读取已经生成的测试 JSON，不加载模型、不创建环境，
-因此不会改变现有训练和测试过程。它同时支持 Rainbow 测试的 `evaluation.json`、规则基线汇总，
+`red_swarm_policy.analyze_blue_evaluations` 只读取已经生成的测试 JSON，不加载模型、不创建环境。
+`evaluate_blue_rl` 和 `evaluate_blue_rule_baseline` 在原有测试和保存全部结束后默认调用它，
+额外输出到测试 `--output` 目录下的 `evaluation_analysis/`。原有 JSON、CSV、JSONL、ACMI、
+flight_quality 文件的保存逻辑与格式保持不变。它同时支持 Rainbow 测试的 `evaluation.json`、规则基线汇总，
 以及消融批次中每个 case 的 `evaluation.json`。
 
 ## 基线与强化学习对比
+
+两个测试命令新增 `--no-result-plots` 用于关闭本次新增的汇总绘图，
+`--result-plots-dir PATH` 用于指定独立输出目录。原 `--flight-quality-plot-limit` 仅控制原逐回合
+轨迹图，不控制新增汇总图。自动绘图异常只输出 stderr 提示，不改变测试返回结果或已保存文件。
+
+例如默认 Rainbow 测试目录为 `outputs/blue_rl/test`，图片就位于
+`outputs/blue_rl/test/evaluation_analysis/`。独立调用仍使用 `--output` 指定分析目录。
+
+Windows PowerShell 独立绘图示例（在 `v1` 目录执行）：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m red_swarm_policy.analyze_blue_evaluations rainbow=outputs/blue_rl/test --output outputs/blue_rl/test/evaluation_analysis
+```
+
+Python 调用：
+
+```python
+from red_swarm_policy.analyze_blue_evaluations import write_evaluation_analysis_safely
+write_evaluation_analysis_safely("outputs/blue_rl/test/evaluation.json")
+```
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.analyze_blue_evaluations \
@@ -44,11 +67,41 @@ PYTHONPATH=src python -m red_swarm_policy.analyze_blue_evaluations \
   25%/50%/75% 分位点、主威胁切换次数、奖励、仿真时间、决策步数与命中数。
 * `episodes.csv`：逐回合关键字段，包括策略标签、场景维度、逃脱结果、脱靶量、主威胁切换、
   命中数、终止原因与机理介入率，便于自行重分组或进行显著性检验。
-* `miss_distance_distribution.png`：各策略脱靶量概率密度分布。
-* `escape_rate_by_missile_count.png`：不同红弹数量下各策略逃脱率柱状图。
+* `escape_rate_overall.png`、`escape_rate_by_missile_count.png`、`escape_rate_by_blue_orientation.png`：
+  总体、按红弹数量、按初始朝向的蓝方逃脱率，标出样本数和 95% Wilson 区间。
+* `escape_rate_by_missile_count_and_orientation.png`：红弹数量 × 初始朝向的逃脱率热力图，
+  每格显示逃脱率和样本数，未观测组合标注 N/A。
+* `miss_distance_distribution.png` 及 `_by_missile_count`、`_by_blue_orientation`、
+  `_by_missile_count_and_orientation` 版本：总体及三类分组的**固定 1 米分箱**脱靶量概率图。
+  每组包含长尾在内的全部样本；有不小于 50 米的记录时额外输出对应的 `_0_50m.png` 细节图。
+* `miss_distance_histogram_1m.csv`：每个策略、分组的精确箱下界、上界、数量、概率和分母。
+  按 `[0,1)、[1,2)、[2,3)…` 计数，恰好 1 米归入 `[1,2)`，恰好 2 米归入 `[2,3)`。
+  仅存储非空箱，未列出的箱计数为 0；不会丢弃远距离样本或将它们合并成一个尾箱。
+* `flight_quality_score_distribution.png`：飞行质量评分分布；`flight_quality_score_by_*.png`
+  分别给出按弹数、朝向、弹数 × 朝向的评分箱线图。
+* `flight_quality_metrics.png`：已有飞行质量指标的箱线图，包括评分、最大航迹倾角、最小水平速度、
+  水平速度比例、估计实际过载、动作切换频率、安全介入率、近高度边界时间、螺旋和陡峭低水平速度时长。
+* `flight_quality_failure_rate_*.png`：总体及三类分组的已有验收项不通过比例；
+  `flight_quality_event_rates.png`：出现各类已记录异常事件的回合比例。
+* `plot_statistics.json`：上述图表清单、总体及所有分组的精确统计，包含飞行质量指标的有效/缺失数、
+  验收项观测分母、不通过数和区间、事件次数与涉及回合数。
+
+每张图最多放 6 个子图，更多分组自动分页为 `_02.png`、`_03.png` 等；以
+`plot_statistics.json.figures` 为本次生成的完整清单。重复绘制覆盖同名派生文件；旧分页图不会自动删除，
+重新分析不同输入集合时建议使用新分析目录。
 
 图片和 JSON/CSV 分别保存：图片用于直观检查，数值文件用于后续统计分析，不互相替代。
-若服务器没有绘图库，可用 `--no-plots` 仅生成数值产物。
+若服务器没有 matplotlib，可用 `--no-plots` 仅生成全部数值产物，包括新增的 1 米分箱和飞行质量统计。
+`--miss-distance-bins` 保留兼容旧命令，但不再改变箱宽；所有脱靶量分布固定为 1 米一档。
+
+脱靶量沿用逐回合 `miss_distance_m`，每回合一个观测，包含被命中和逃脱回合，不按来弹数量重复计数。
+纵轴是该组全部回合中落入对应 1 米箱的比例；0–50 米细节图也使用同一个分母，不重新归一化。
+完整范围跨度较大时，点标记用于标明很窄的非空 1 米箱，完整计数可查 CSV。
+
+飞行质量只读取已有的 `flight_quality.metrics/verdicts/events`，不重新计算轨迹、不改变阈值。
+原 `verdicts=True` 表示通过，图中“不通过率”统计 False；缺少该项记录的回合不计入分母。
+旧测试文件和当前规则基线可能没有逐回合飞行质量记录，此时生成缺失提示图，不解释为评分 0、
+评分 100 或全部通过。原 `flight_quality/episode_*.png` 逐回合轨迹图继续按原选项保存。
 
 ## 数据完整性说明
 
@@ -98,8 +151,8 @@ PYTHONPATH=src python -m red_swarm_policy.analyze_blue_evaluations \
 ```
 
 维度越多，`metrics.csv` 和 `analysis.json` 中的 `stratified` 行越多、每组样本通常越少；总体行
-不受维度选项影响。两张图片仍分别展示所有输入的总体脱靶分布，以及按红弹数量划分的逃脱率，
-不会因为额外维度而重复生成大量图片。
+不受维度选项影响。新增图表和 `plot_statistics.json` 固定覆盖总体、弹数、朝向和弹数 × 朝向，
+不受 `--dimensions` 影响；额外自定义维度仍在原数值表格中体现。
 
 ### 多种机理/消融场景
 

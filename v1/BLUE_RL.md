@@ -1,5 +1,9 @@
 # 蓝方强化学习子系统
 
+测试结束后默认在输出目录的 `evaluation_analysis/` 中生成按弹数、朝向分组的逃脱率图、
+1 米分箱脱靶量分布和已有飞行质量统计图。原始结果保留不变；选项及独立绘图方式见
+[BLUE_EVALUATION_ANALYSIS.md](BLUE_EVALUATION_ANALYSIS.md)。
+
 ## 双方均不学习的规则基线
 
 蓝方测试新增独立基线场景，并通过与 Rainbow 测试相同的 `BlueEscapeEnv` 适配层运行：蓝方使用 v1 现有的
@@ -327,3 +331,5 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_evasion \
 
 训练结束后默认额外生成 reward、loss、蓝方逃脱率及已有训练诊断指标图，保留原有训练、
 测试和保存流程。独立分析日志、输出目录与关闭选项见 [TRAINING_ANALYSIS.md](TRAINING_ANALYSIS.md)。
+蓝方训练现在还会在 `training_analysis/results/` 生成按弹数/朝向分组的结果、1 米脱靶量分布和
+飞行质量汇总图；初始朝向另存于 metrics 旁的 `*_episode_metadata.json`，原训练日志格式不变。

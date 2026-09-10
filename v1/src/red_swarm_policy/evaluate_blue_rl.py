@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .analyze_blue_evaluations import write_evaluation_analysis_safely
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
                       EvaluationShapingConfig, FlightEnvelopeConfig,
                       FlightEnvelopeConstraintLayer, FlightQualityTracker,
@@ -58,6 +59,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Plot this many lowest-scoring episodes; 0 disables plots")
     parser.add_argument("--baseline-survival-rate", type=float, default=None,
                         help="Reference survival rate used to flag a decrease larger than 5 percentage points")
+    parser.add_argument("--no-result-plots", action="store_true",
+                        help="Skip the additional aggregate result figures generated after saving evaluation")
+    parser.add_argument("--result-plots-dir", default=None,
+                        help="Aggregate result figures directory; defaults to OUTPUT/evaluation_analysis")
     return parser
 
 
@@ -466,7 +471,10 @@ def main() -> int:
            "replay_transitions_added": 0,
            "elapsed_s": elapsed, "episodes_per_hour": summary["episodes_per_hour"],
            "evaluation_path": str(output / "evaluation.json")}, jsonl_path)
-    print(json.dumps(summary, indent=2)); return 0
+    print(json.dumps(summary, indent=2))
+    if not args.no_result_plots:
+        write_evaluation_analysis_safely(output / "evaluation.json", args.result_plots_dir)
+    return 0
 
 
 if __name__ == "__main__": raise SystemExit(main())

@@ -11,6 +11,7 @@ import argparse
 import csv
 from collections import Counter, defaultdict
 import json
+import sys
 import math
 from pathlib import Path
 import statistics
@@ -29,7 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated row fields (nested fields use dots); use 'none' for overall only")
     parser.add_argument("--baseline", default=None,
                         help="Label used for delta columns (default: first input)")
-    parser.add_argument("--miss-distance-bins", type=int, default=20)
+    parser.add_argument("--miss-distance-bins", type=int, default=20,
+                        help="Legacy option retained for compatibility; miss-distance bins are always 1 m")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--skip-invalid-inputs", action="store_true",
                         help="Skip unreadable/incompatible inputs and record them in analysis.json")
@@ -117,7 +119,11 @@ def inspect_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     invalid_miss = sum("miss_distance_m" in row and
                        (isinstance(row["miss_distance_m"], bool) or
                         not isinstance(row["miss_distance_m"], (int, float)) or
-                        not math.isfinite(row["miss_distance_m"])) for row in rows)
+                        not math.isfinite(row["miss_distance_m"]) or row["miss_distance_m"] < 0) for row in rows)
+    invalid_count = sum("missile_count" in row and (isinstance(row["missile_count"], bool) or
+                        not isinstance(row["missile_count"], int) or row["missile_count"] < 1) for row in rows)
+    invalid_orientation = sum("blue_orientation" in row and (
+        not isinstance(row["blue_orientation"], str) or not row["blue_orientation"].strip()) for row in rows)
     switch_available = sum(isinstance(_switch_value(row), (int, float)) and
                            not isinstance(_switch_value(row), bool) for row in rows)
     warnings = []
@@ -128,6 +134,7 @@ def inspect_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         )
     return {"missing_required_fields": missing, "invalid_blue_survived": invalid_survival,
             "invalid_miss_distance_m": invalid_miss,
+            "invalid_missile_count": invalid_count, "invalid_blue_orientation": invalid_orientation,
             "main_threat_switches_available": switch_available,
             "main_threat_switches_missing": len(rows) - switch_available,
             "warnings": warnings}
@@ -140,11 +147,14 @@ def validate_rows(rows: list[dict[str, Any]], source: Path) -> None:
     missing = quality["missing_required_fields"]
     assert isinstance(missing, dict)
     bad = [name for name, count in missing.items() if count]
-    if bad or quality["invalid_blue_survived"] or quality["invalid_miss_distance_m"]:
+    if (bad or quality["invalid_blue_survived"] or quality["invalid_miss_distance_m"]
+            or quality["invalid_missile_count"] or quality["invalid_blue_orientation"]):
         raise ValueError(
             f"{source} is not a compatible Blue evaluation artifact: missing={bad}, "
             f"invalid_blue_survived={quality['invalid_blue_survived']}, "
-            f"invalid_miss_distance_m={quality['invalid_miss_distance_m']}"
+            f"invalid_miss_distance_m={quality['invalid_miss_distance_m']}, "
+            f"invalid_missile_count={quality['invalid_missile_count']}, "
+            f"invalid_blue_orientation={quality['invalid_blue_orientation']}"
         )
 
 
@@ -286,37 +296,36 @@ def _episode_rows(inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
 
 
 def _plots(output: Path, inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
-           bins: int) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+           bins: int, *, make_plots: bool = True) -> None:
+    from .evaluation_plots import write_evaluation_plots
+    write_evaluation_plots(output, inputs, make_plots=make_plots)
 
-    labels = [item[0] for item in inputs]
-    rows_by_label = {label: rows for label, _, rows in inputs}
-    fig, axis = plt.subplots(figsize=(9, 5))
-    for label in labels:
-        values = _finite(rows_by_label[label], "miss_distance_m")
-        if values:
-            axis.hist(values, bins=bins, density=True, histtype="step", linewidth=2, label=label)
-    axis.set(xlabel="Miss distance (m)", ylabel="Probability density", title="Miss-distance distribution")
-    axis.legend(); axis.grid(alpha=.25); fig.tight_layout()
-    fig.savefig(output / "miss_distance_distribution.png", dpi=160); plt.close(fig)
 
-    missile_counts = sorted({int(row["missile_count"]) for _, _, rows in inputs for row in rows
-                             if isinstance(row.get("missile_count"), int)})
-    if missile_counts:
-        fig, axis = plt.subplots(figsize=(9, 5)); width = .8 / len(labels)
-        x = list(range(len(missile_counts)))
-        for index, label in enumerate(labels):
-            rates = [summarize([row for row in rows_by_label[label]
-                                if row.get("missile_count") == count])["escape_rate"] or 0.0
-                     for count in missile_counts]
-            positions = [value + (index - (len(labels) - 1) / 2) * width for value in x]
-            axis.bar(positions, rates, width, label=label)
-        axis.set_xticks(x, [str(value) for value in missile_counts]); axis.set_ylim(0, 1)
-        axis.set(xlabel="Red missile count", ylabel="Escape rate", title="Escape rate by missile count")
-        axis.legend(); axis.grid(axis="y", alpha=.25); fig.tight_layout()
-        fig.savefig(output / "escape_rate_by_missile_count.png", dpi=160); plt.close(fig)
+def _write_analysis(output: Path, inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
+                    report: dict[str, Any], flat: list[dict[str, Any]], dimensions: Sequence[str],
+                    *, plots: bool = True, bins: int = 20) -> None:
+    if any(output.resolve() == source.resolve().parent for _, source, _ in inputs):
+        raise ValueError("Use a separate analysis directory to preserve original evaluation files")
+    output.mkdir(parents=True, exist_ok=True)
+    (output / "analysis.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_csv(output / "metrics.csv", flat)
+    _write_csv(output / "episodes.csv", _episode_rows(inputs, dimensions))
+    _plots(output, inputs, bins, make_plots=plots)
+
+
+def write_evaluation_analysis_safely(source: str | Path, output: str | Path | None = None) -> dict[str, Any] | None:
+    """Run only after original results have been saved; plotting failures are non-fatal."""
+    try:
+        item = load_input(f"evaluation={source}")
+        validate_rows(item[2], item[1])
+        destination = Path(output) if output is not None else item[1].parent / "evaluation_analysis"
+        report, flat = extract([item], DEFAULT_DIMENSIONS, item[0])
+        report["skipped_inputs"] = []
+        _write_analysis(destination, [item], report, flat, DEFAULT_DIMENSIONS)
+        return report
+    except Exception as error:
+        print(f"[evaluation analysis] Plot generation skipped: {type(error).__name__}: {error}", file=sys.stderr)
+        return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -346,13 +355,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         report, flat = extract(inputs, dimensions, baseline)
     except (OSError, ValueError, json.JSONDecodeError) as error:
         raise SystemExit(str(error)) from error
-    args.output.mkdir(parents=True, exist_ok=True)
     report["skipped_inputs"] = skipped_inputs
-    (args.output / "analysis.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    _write_csv(args.output / "metrics.csv", flat)
-    _write_csv(args.output / "episodes.csv", _episode_rows(inputs, dimensions))
-    if not args.no_plots:
-        _plots(args.output, inputs, args.miss_distance_bins)
+    _write_analysis(args.output, inputs, report, flat, dimensions,
+                    plots=not args.no_plots, bins=args.miss_distance_bins)
     print(json.dumps({"output": str(args.output), "inputs": labels, "groups": len(flat)}, ensure_ascii=False))
     return 0
 
