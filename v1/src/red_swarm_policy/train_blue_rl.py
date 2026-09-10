@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from .analyze_training import write_training_analysis_safely
+from .analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
                       FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
                       FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
@@ -225,6 +226,7 @@ def main() -> int:
         episode_stages = {episode: curriculum.stage_at(episode)[1].name
                           for episode in range(1, args.episodes + 1)} if curriculum is not None else {}
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
+        episode_orientations: dict[int, str] = {}
         learning_active_by_worker: dict[int, bool] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
@@ -255,6 +257,7 @@ def main() -> int:
             decisions_by_worker[worker] = 0; next_episode += 1
             quality[worker] = FlightQualityTracker()
         for worker, (observation, info) in pool.reset(assignments).items():
+            record_episode_orientation(episode_orientations, episode_by_worker[worker], info)
             observations[worker] = observation
             learning_active_by_worker[worker] = bool(info["learning_active"])
             quality[worker].add(info["flight_quality_state"])
@@ -489,6 +492,7 @@ def main() -> int:
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
                 for worker, (observation, info) in pool.reset(resets).items():
+                    record_episode_orientation(episode_orientations, episode_by_worker[worker], info)
                     observations[worker] = observation
                     learning_active_by_worker[worker] = bool(info["learning_active"])
                     quality[worker].add(info["flight_quality_state"])
@@ -525,6 +529,12 @@ def main() -> int:
             Path(args.training_plots_dir) if args.training_plots_dir else output / "training_analysis",
             smoothing_window=args.plot_smoothing_window,
         )
+    write_blue_training_results_safely(
+        metrics_path,
+        (Path(args.training_plots_dir) if args.training_plots_dir else output / "training_analysis") / "results",
+        episode_orientations=episode_orientations,
+        make_plots=not args.no_training_plots,
+    )
     return 0
 
 

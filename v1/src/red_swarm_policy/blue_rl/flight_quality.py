@@ -290,16 +290,24 @@ def write_flight_quality_report(episodes: list[dict[str, Any]], output: Path,
     return aggregate
 
 
-def _plot_episode(episode: dict[str, Any], path: Path) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+def _build_episode_figure(episode: dict[str, Any]) -> Any:
+    """Render recorded values with separate units and without changing the GUI backend."""
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    def legend(axis: Any, other: Any) -> None:
+        handles, labels = axis.get_legend_handles_labels()
+        extra_handles, extra_labels = other.get_legend_handles_labels()
+        axis.legend(handles + extra_handles, labels + extra_labels, fontsize=8)
+
     trace = episode["trace"]; time = np.asarray(trace["time_s"]); pos = np.asarray(trace["position_m"])
     fpa = np.asarray(trace["flight_path_angle_deg"])
     rate = np.asarray([np.nan if x is None else x for x in trace["heading_rate_deg_s"]])
     speed = np.asarray(trace["speed_mps"]); horizontal = np.asarray(trace["horizontal_speed_mps"])
     radius = np.asarray([np.nan if x is None else x for x in trace["turn_radius_m"]])
-    fig = plt.figure(figsize=(16, 12)); axes = [fig.add_subplot(3, 2, 1, projection="3d")]
+    fig = Figure(figsize=(16, 12), layout="constrained")
+    FigureCanvasAgg(fig)
+    axes = [fig.add_subplot(3, 2, 1, projection="3d")]
     axes += [fig.add_subplot(3, 2, index) for index in range(2, 7)]
     axes[0].plot(pos[:, 0], pos[:, 2], pos[:, 1], color="royalblue"); axes[0].set(xlabel="North x (m)", ylabel="East z (m)", zlabel="Altitude y (m)")
     axes[1].plot(pos[:, 0], pos[:, 2]); axes[1].set(xlabel="North x (m)", ylabel="East z (m)", title="Horizontal trajectory")
@@ -314,23 +322,48 @@ def _plot_episode(episode: dict[str, Any], path: Path) -> None:
     axes[2].plot(time, pos[:, 1]); axes[2].set(ylabel="Altitude (m)")
     for altitude, style in ((trace["min_altitude_m"], "--"), (trace["max_altitude_m"], "--")):
         axes[2].axhline(altitude, color="black", ls=style, alpha=.6)
-    axes[3].plot(time, fpa, label="FPA (deg)"); axes[3].plot(time, rate, label="heading rate (deg/s)", alpha=.7)
+    axes[3].plot(time, fpa, color="royalblue", label="Flight-path angle (deg)")
+    axes[3].set_ylabel("Flight-path angle (deg)")
+    heading_axis = axes[3].twinx()
+    heading_axis.plot(time, rate, color="darkorange", label="Heading rate (deg/s)", alpha=.7)
+    heading_axis.set_ylabel("Heading rate (deg/s)")
+    finite_rate = rate[np.isfinite(rate)]
+    heading_limit = max(1.0, float(np.abs(finite_rate).max()) * 1.05) if finite_rate.size else 1.0
+    heading_axis.set_ylim(-heading_limit, heading_limit)
     for threshold in (-45, -30, 30, 45): axes[3].axhline(threshold, color="red" if abs(threshold) == 45 else "gold", ls="--")
     axes[3].fill_between(time, fpa, 45, where=fpa >= 45, color="red", alpha=.18)
     axes[3].fill_between(time, fpa, -45, where=fpa <= -45, color="red", alpha=.18)
-    axes[3].legend()
-    axes[4].plot(time, speed, label="total"); axes[4].plot(time, horizontal, label="horizontal"); axes[4].legend(); axes[4].set(ylabel="Speed (m/s)")
-    axes[4].plot(time, np.abs(trace["vertical_speed_mps"]), label="|vertical|", alpha=.7); axes[4].legend()
-    radius_axis = axes[4].twinx(); radius_axis.plot(time, radius, color="purple", alpha=.35); radius_axis.set(ylabel="Turn radius (m)", ylim=(0, 5000))
+    legend(axes[3], heading_axis)
+    axes[4].plot(time, speed, label="Total speed"); axes[4].plot(time, horizontal, label="Horizontal speed")
+    axes[4].set(ylabel="Speed (m/s)")
+    axes[4].plot(time, np.abs(trace["vertical_speed_mps"]), label="|Vertical speed|", alpha=.7)
+    radius_axis = axes[4].twinx()
+    radius_axis.plot(time, radius, color="purple", alpha=.6, label="Turn radius")
+    radius_axis.set_ylabel("Turn radius (m)")
+    finite_radius = radius[np.isfinite(radius)]
+    if finite_radius.size:
+        radius_axis.set_ylim(0, max(1.0, float(finite_radius.max()) * 1.05))
+    else:
+        radius_axis.set_yticks([])
+        axes[4].text(.02, .02, "Turn radius unavailable", transform=axes[4].transAxes, fontsize=8)
+    legend(axes[4], radius_axis)
     axes[5].step(time, [np.nan if x is None else x for x in trace["policy_action"]], where="post", label="policy")
     axes[5].step(time, [np.nan if x is None else x for x in trace["executed_action"]], where="post", label="executed", alpha=.7)
     load_axis = axes[5].twinx(); load_axis.plot(time, [np.nan if x is None else x for x in trace["commanded_load_g"]],
                                                color="green", alpha=.45, label="commanded load")
     load_axis.plot(time, trace["estimated_actual_load_g"], color="darkgreen", ls="--", alpha=.6,
                    label="estimated actual load")
-    load_axis.set_ylabel("Commanded load (g)")
+    load_axis.set_ylabel("Load (g)")
+    loads = np.asarray([np.nan if value is None else value for key in
+                        ("commanded_load_g", "estimated_actual_load_g") for value in trace[key]])
+    finite_loads = loads[np.isfinite(loads)]
+    if finite_loads.size:
+        load_axis.set_ylim(0, max(1.0, float(finite_loads.max()) * 1.1))
     for index in np.flatnonzero(trace["safety_intervened"]): axes[5].axvline(time[index], color="black", alpha=.25)
-    axes[5].legend(); axes[5].set(ylabel="Action", xlabel="Time (s)")
+    legend(axes[5], load_axis)
+    axes[5].set(ylabel="Action")
+    for axis in axes[2:]:
+        axis.set_xlabel("Time (s)")
     colors = {"near_vertical": "red", "spiral": "purple", "steep_low_horizontal_speed": "magenta",
               "reversal": "orange",
               "self_return": "darkorange", "altitude_boundary": "brown"}
@@ -340,4 +373,12 @@ def _plot_episode(episode: dict[str, Any], path: Path) -> None:
         axes[0].plot(pos[selected, 0], pos[selected, 2], pos[selected, 1], color=colors[event["type"]], lw=3)
         axes[1].plot(pos[selected, 0], pos[selected, 2], color=colors[event["type"]], lw=3)
     fig.suptitle(f"Blue flight quality — episode {episode['episode']} — score {episode['metrics']['flight_quality_score']:.1f}")
-    fig.tight_layout(); fig.savefig(path, dpi=140); plt.close(fig)
+    return fig
+
+
+def _plot_episode(episode: dict[str, Any], path: Path) -> None:
+    fig = _build_episode_figure(episode)
+    try:
+        fig.savefig(path, dpi=140)
+    finally:
+        fig.clear()

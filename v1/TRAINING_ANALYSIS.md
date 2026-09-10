@@ -10,7 +10,8 @@
 metrics、JSONL、flight_quality、run_manifest 的保存代码和格式保持原样；
 测试入口及 `train_env --validation-only` 不调用新模块。
 
-- `train_blue_rl`：默认保存到 `--output` 目录下的 `training_analysis/`。
+- `train_blue_rl`：训练曲线默认保存到 `--output` 目录下的 `training_analysis/`，
+  按弹数、朝向及联合场景的结果分布图保存在其中的 `results/` 子目录。
 - `train_env`：默认保存到 metrics 文件同级的 `<metrics文件名去扩展名>_analysis/`。
   例如 `outputs/env_training_metrics.json` 对应 `outputs/env_training_metrics_analysis/`。
   关闭 metrics 保存时，使用已有内存指标，保存到 run_manifest 同级的 `training_analysis/`。
@@ -26,6 +27,43 @@ metrics、JSONL、flight_quality、run_manifest 的保存代码和格式保持�
 自动绘图异常只输出 stderr 提示，不改变训练返回结果，也不影响已经保存的文件。
 绘图不改变训练随机数状态，不设置全局 pyplot 后端，不打开交互窗口。
 自动调用发生在训练正常结束或原有提前停止收尾后；意外中断时，可独立读取已经落盘的 JSONL。
+
+## 蓝方训练结果分组与飞行质量图
+
+蓝方训练结束后还会调用 `red_swarm_policy.analyze_blue_training_results`，在
+`training_analysis/results/` 中生成以下汇总图及精确统计：
+
+- 总体、按弹数、按初始朝向的逃脱率图，以及弹数 × 朝向热力图。
+- 总体及上述分组的固定 1 米分箱脱靶量分布，包含所有远距离样本；有长尾时另附 0–50 米细节图。
+- 飞行质量评分分布、分组评分箱线图、关键指标分布、验收项不通过比例、异常事件涉及回合比例。
+- `plot_statistics.json` 和 `miss_distance_histogram_1m.csv`，保存各图精确数据及样本分母。
+
+这些统计使用训练中实际采集的回合，包含探索以及训练期间不断变化的策略，不能当作固定 checkpoint
+的独立测试成绩。详细图表文件名和 1 米分箱口径见 [BLUE_EVALUATION_ANALYSIS.md](BLUE_EVALUATION_ANALYSIS.md)。
+
+原训练 JSON 没有初始朝向字段，因此额外将已有 `reset` 返回的初始朝向按 episode ID 保存到
+metrics 文件旁的 `<metrics文件名去扩展名>_episode_metadata.json`，默认是
+`training_metrics_episode_metadata.json`。不修改原 JSON 行或重新生成场景。
+附加文件记录 metrics 的 SHA-256，离线绘图时会核对，避免旧文件误配到新的训练结果。
+`--no-training-plots` 同时关闭训练曲线和结果汇总绘图，但仍保存这个附加文件供以后使用。
+
+独立绘制已有蓝方训练结果（在 `v1` 目录运行）：
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m red_swarm_policy.analyze_blue_training_results outputs/blue_rl/train/training_metrics.json
+```
+
+可用 `--output PATH` 指定汇总图目录；移动过的朝向附加文件可用 `--episode-metadata PATH` 指定。
+使用自定义 `--metrics-path` 时，附加文件始终跟随 metrics 路径；自动生成的图片仍跟随
+`--training-plots-dir` 或训练 `--output`。旧日志没有朝向数据时标注 `<not recorded>`，
+仍生成总体、弹数及飞行质量统计；不会凭空推断初始朝向。只有 JSONL 聚合记录而没有逐回合数据时，
+请使用原训练曲线模块，不生成缺乏分组依据的结果统计。
+
+原有 `flight_quality/episode_*.png` 继续按 `--flight-quality-plot-limit` 选择评分最低的回合。
+其中转弯半径轴已改为覆盖全部有效记录的自适应范围；没有有效值时显示 unavailable。
+指令过载与估计实际过载具有完整图例，右轴统一标为 `Load (g)`；航迹倾角与航向角速度分别使用
+度和度/秒坐标轴。这些修正也适用于蓝方测试使用的同一逐回合绘图函数，原数值评估不变。
 
 ## 独立调用
 

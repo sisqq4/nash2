@@ -9,9 +9,61 @@ import pytest
 
 from red_swarm_policy.blue_rl.flight_quality import (
     FlightQualityTracker,
+    _build_episode_figure,
+    _plot_episode,
     append_flight_quality_episode,
     write_flight_quality_report,
 )
+
+
+def test_episode_plot_shows_large_radii_separate_units_and_all_load_legends(tmp_path: Path) -> None:
+    import matplotlib
+    import numpy as np
+
+    tracker = FlightQualityTracker()
+    for index in range(11):
+        tracker.add(_state(index * .1, [30.0 * index, 10_000.0, 0.0], [300.0, 0.0, 0.0]),
+                    policy_action=0, executed_action=0)
+    episode = tracker.finish(episode=1, survived=True)
+    episode["trace"]["turn_radius_m"] = [None, *[10000. * index for index in range(1, 11)]]
+    episode["trace"]["estimated_actual_load_g"] = [2.] * 11
+    original = json.dumps(episode, allow_nan=False)
+    backend = matplotlib.get_backend()
+    figure = _build_episode_figure(episode)
+    try:
+        axes = {axis.get_ylabel(): axis for axis in figure.axes}
+        radius_axis = axes["Turn radius (m)"]
+        assert radius_axis.get_ylim()[1] > 100000.
+        np.testing.assert_allclose(radius_axis.lines[0].get_ydata()[1:], list(range(10000, 100001, 10000)))
+        assert "Flight-path angle (deg)" in axes and "Heading rate (deg/s)" in axes
+        assert axes["Heading rate (deg/s)"].get_ylim()[0] <= -1.
+        assert axes["Heading rate (deg/s)"].get_ylim()[1] >= 1.
+        assert "Load (g)" in axes and "Commanded load (g)" not in axes
+        assert axes["Load (g)"].get_ylim()[0] == 0.
+        assert axes["Load (g)"].get_ylim()[1] > 2.
+        legends = [text.get_text() for axis in figure.axes if axis.get_legend()
+                   for text in axis.get_legend().get_texts()]
+        assert {"commanded load", "estimated actual load", "Turn radius"} <= set(legends)
+        figure.canvas.draw()
+    finally:
+        figure.clear()
+    _plot_episode(episode, tmp_path / "episode.png")
+    assert (tmp_path / "episode.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert json.dumps(episode, allow_nan=False) == original
+    assert matplotlib.get_backend() == backend
+
+
+def test_missing_turn_radius_is_marked_unavailable() -> None:
+    tracker = FlightQualityTracker()
+    for index in range(11):
+        tracker.add(_state(index * .1, [30.0 * index, 10_000.0, 0.0], [300.0, 0.0, 0.0]))
+    episode = tracker.finish(episode=1, survived=True)
+    episode["trace"]["turn_radius_m"] = [None] * 11
+    figure = _build_episode_figure(episode)
+    try:
+        assert "Turn radius unavailable" in [text.get_text() for axis in figure.axes for text in axis.texts]
+    finally:
+        figure.clear()
 
 
 def _state(time_s: float, position: list[float], velocity: list[float]) -> dict[str, object]:
