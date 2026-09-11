@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
+from .episode_telemetry import RedTelemetryTracker
 
 EPS = 1.0e-9
 
@@ -57,21 +58,32 @@ class FlightQualityTracker:
     def __init__(self, thresholds: FlightQualityThresholds | None = None) -> None:
         self.thresholds = thresholds or FlightQualityThresholds()
         self.samples: list[dict[str, Any]] = []
+        self._red_telemetry: RedTelemetryTracker | None = None
 
     def add(self, state: dict[str, object], *, policy_action: int | None = None,
             executed_action: int | None = None, safety_intervened: bool = False,
             safety_reasons: list[str] | None = None) -> None:
+        red_positions = state.get("red_positions_m", [])
+        if "red_ids" in state:
+            if self._red_telemetry is None:
+                if self.samples:
+                    raise ValueError("red telemetry must start with the initial episode sample")
+                self._red_telemetry = RedTelemetryTracker(list(state["red_ids"]))
+            red_positions = self._red_telemetry.add(state)["red_positions_m"]
+        elif self._red_telemetry is not None:
+            raise ValueError("red telemetry cannot be omitted mid-episode")
         self.samples.append({"time_s": float(state["time_s"]),
                              "position_m": list(state["blue_position_m"]),
                              "velocity_mps": list(state["blue_velocity_mps"]),
-                             "red_positions_m": state.get("red_positions_m", []),
+                             "red_positions_m": red_positions,
                              "min_altitude_m": float(state.get("min_altitude_m", -math.inf)),
                              "max_altitude_m": float(state.get("max_altitude_m", math.inf)),
                              "policy_action": policy_action, "executed_action": executed_action,
                              "safety_intervened": bool(safety_intervened),
                              "safety_reasons": list(safety_reasons or [])})
 
-    def finish(self, *, episode: int, survived: bool) -> dict[str, Any]:
+    def finish(self, *, episode: int, survived: bool,
+               metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         if len(self.samples) < 2:
             raise ValueError("flight-quality diagnostics require at least two samples")
         t = self.thresholds
@@ -248,8 +260,15 @@ class FlightQualityTracker:
                  "safety_reasons": [s["safety_reasons"] for s in self.samples],
                  "min_altitude_m": min_alt, "max_altitude_m": max_alt,
                  "red_positions_m": [s["red_positions_m"] for s in self.samples]}
-        return {"episode": episode, "blue_survived": survived, "metrics": metrics,
-                "verdicts": verdicts, "events": sorted(events, key=lambda e: e["start_s"]), "trace": trace}
+        result = {"episode": episode, "blue_survived": survived, "metrics": metrics,
+                  "verdicts": verdicts, "events": sorted(events, key=lambda e: e["start_s"]), "trace": trace}
+        if self._red_telemetry is not None:
+            trace.update(self._red_telemetry.trace())
+            result["schema_version"] = 2
+            result["red_termination_events"] = self._red_telemetry.termination_events
+        if metadata is not None:
+            result["metadata"] = metadata
+        return result
 
 
 def append_flight_quality_episode(episode: dict[str, Any], path: Path) -> None:
@@ -314,7 +333,16 @@ def _build_episode_figure(episode: dict[str, Any]) -> Any:
     red = trace["red_positions_m"]
     red_count = max((len(frame) for frame in red), default=0)
     for slot in range(red_count):
-        missile = np.asarray([frame[slot] if slot < len(frame) else [np.nan] * 3 for frame in red])
+        missile = np.asarray([frame[slot] if slot < len(frame) else [np.nan] * 3 for frame in red], dtype=float)
+        if "red_state_valid" in trace:
+            missile[~np.asarray(trace["red_state_valid"], dtype=bool)[:, slot]] = np.nan
+            red_id = trace["red_ids"][slot]
+            terminal = next((event for event in episode.get("red_termination_events", [])
+                             if event["red_id"] == red_id), None)
+            if terminal is not None:
+                missile = missile[time < terminal["time_s"]]
+                if terminal.get("position_valid", False):
+                    missile = np.vstack([missile, np.asarray(terminal["position_m"], dtype=float)])
         axes[0].plot(missile[:, 0], missile[:, 2], missile[:, 1], color="firebrick", alpha=.35)
         axes[1].plot(missile[:, 0], missile[:, 2], color="firebrick", alpha=.25)
     axes[0].scatter(*pos[0, [0, 2, 1]], color="green", marker="o"); axes[0].scatter(*pos[-1, [0, 2, 1]], color="black", marker="x")

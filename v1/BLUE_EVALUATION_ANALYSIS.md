@@ -3,8 +3,46 @@
 `red_swarm_policy.analyze_blue_evaluations` 只读取已经生成的测试 JSON，不加载模型、不创建环境。
 `evaluate_blue_rl` 和 `evaluate_blue_rule_baseline` 在原有测试和保存全部结束后默认调用它，
 额外输出到测试 `--output` 目录下的 `evaluation_analysis/`。原有 JSON、CSV、JSONL、ACMI、
-flight_quality 文件的保存逻辑与格式保持不变。它同时支持 Rainbow 测试的 `evaluation.json`、规则基线汇总，
+flight_quality 文件的已有字段继续保留，模型测试的状态记录扩展见下节。它同时支持 Rainbow 测试的 `evaluation.json`、规则基线汇总，
 以及消融批次中每个 case 的 `evaluation.json`。
+
+## 模型测试中的逐回合实体状态记录
+
+`evaluate_blue_rl` 默认保存以下扩展，不需要增加命令行参数；关闭 ACMI、汇总图或逐回合图片也不会关闭数据记录。
+此扩展用于模型测试（包括调用同一入口的消融测试），训练及规则基线入口保持原有输出。
+
+每回合完成后写入 `flight_quality/flight_quality_episodes.jsonl`；全部测试完成后，相同记录按回合编号排序，
+汇总到 `flight_quality/flight_quality.json` 的 `episodes` 中。扩展记录标记 `schema_version: 2`。
+
+| 字段 | 含义 |
+| --- | --- |
+| `trace.red_ids` | 当前回合的固定实体编号，从 0 开始，与该回合红弹数组槽位对应；失效后不移除、不重排 |
+| `trace.time_s` | 红蓝双方共用的仿真时间，保留环境的实际起始时间，不强制从 0 开始 |
+| `trace.step_count` | 与每个采样时刻对应的物理步编号 |
+| `trace.sample_interval_s` | 与上一条记录的实际时间差；初始记录为 0，回合提前结束时可短于常规决策间隔 |
+| `trace.red_positions_m` | `[采样点][固定槽位][x,y,z]`，惯性坐标，x 向北、y 向上、z 向东，单位米 |
+| `trace.red_velocities_mps` | 同一结构的速度向量，单位米/秒 |
+| `trace.red_alive` | `[采样点][固定槽位]`，实体是否仍存活；缺失状态为 `null` |
+| `trace.red_loss_reasons` | 同一结构的失效原因；没有已记录原因为 `null` |
+| `trace.red_position_valid` / `red_velocity_valid` | 对应向量的三个分量是否齐全且为有限数值 |
+| `trace.red_state_valid` | 存活且位置、速度均有效；失效后即使保留冻结数值，此标记仍为 `false` |
+| `red_termination_events` | 各实体失效时的物理步事件，包含编号、时间、步编号、原因、最终位置和速度，以及同一时刻的蓝机位置和速度 |
+
+常规记录频率与环境决策步一致，包含初始帧和回合结束帧；终止事件在每个物理步后单独观察并记录，
+所以事件时间可以位于两个常规采样点之间。事件时间表示物理步判定时刻，并非更细的连续时间估计。
+仍存活但因整个回合结束而停止记录的实体不会被伪造为失效事件。
+
+缺失或非有限的向量分量保存为 JSON `null`，不以 0 填充；原始有效性与存活状态分开保存。
+轨迹只保存当前回合实际存在的实体，不保存模型观测中的补齐槽位。逐回合图片读取有效标记，
+并使用单独保存的终止位置结束相应轨迹，避免把失效后的冻结位置作为后续活动轨迹。
+
+运行开始时，`flight_quality/evaluation_metadata.json` 保存一次完整环境配置、适配器配置、测试选项、
+坐标及采样约定、Python/NumPy/PyTorch 版本、模型文件路径及 SHA-256，以及源码文件与源码整体 SHA-256。
+源码摘要标识实际运行时文件内容，包含尚未提交的源码改动。每回合 `metadata` 保存运行编号 `run_id`、
+元数据文件名 `manifest`、实际随机种子（`--seed + episode`）、实体数量、初始化信息和回合终止原因；
+初始状态向量可从该回合 `trace` 的第 0 条读取。元数据文件与逐回合文件应一起保留。
+
+旧结果不会自动补出缺失字段；旧版记录仍可被既有绘图和分析逻辑读取。
 
 ## 基线与强化学习对比
 

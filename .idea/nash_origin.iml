@@ -4,6 +4,7 @@
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/v1/outputs" />
       <excludeFolder url="file://$MODULE_DIR$/v1/outputs/stage1_v3_batch64" />
+      <excludeFolder url="file://$MODULE_DIR$/v5" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.10 (DQN)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -73,6 +73,7 @@ class BlueEscapeEnvConfig:
     near_tangent_weight: float = 0.65
     near_dive_weight: float = 0.35
     mechanism_reward: MechanismRewardConfig = field(default_factory=MechanismRewardConfig)
+    record_red_telemetry: bool = False
 
     def validate(self, environment: EnvironmentConfig) -> None:
         if not 1 <= self.missile_count <= self.max_missiles <= 4:
@@ -160,6 +161,8 @@ class BlueEscapeEnv:
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self.mechanism_estimator = BlueMechanismStateEstimator(config.mechanism_reward)
         self._mechanism_reward_state: dict[str, object] = {}
+        self._telemetry_red_alive: list[bool] = []
+        self._red_termination_events: list[dict[str, object]] = []
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
               missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
@@ -181,6 +184,8 @@ class BlueEscapeEnv:
         self.inner.reset(seed=seed, style="many_to_one", red_count=self._missile_count,
                          blue_count=1, start_mode="post_boost")
         assert self.inner.state is not None
+        self._telemetry_red_alive = [bool(red.alive) for red in self.inner.state.red]
+        self._red_termination_events = []
         if self._record_current_episode:
             self.recorder.record(self.inner.state)
         self._learning_active = False
@@ -202,7 +207,7 @@ class BlueEscapeEnv:
             "pure_pn": True,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
             "initialization": self._initialization_snapshot(),
-            "flight_quality_state": self._mechanism_snapshot(),
+            "flight_quality_state": self._flight_quality_snapshot(),
             "reward_mechanism_state": dict(self._mechanism_reward_state),
             **self._learning_status(learning_transition=False, requested_action=0,
                                     constrained_action=0, executed_action=0),
@@ -234,6 +239,35 @@ class BlueEscapeEnv:
                     self._mechanism_reward_state.get("emergency_gate", 0.0)
                     if self.config.observation_schema == "normalized_v4" else 0.0
                 )}
+
+    def _flight_quality_snapshot(self) -> dict[str, object]:
+        snapshot = self._mechanism_snapshot()
+        if self.config.record_red_telemetry:
+            assert self.inner.state is not None
+            snapshot.update({
+                "step_count": int(self.inner.state.step_count),
+                # Physics preserves list slots, including inactive entities.
+                "red_ids": list(range(len(self.inner.state.red))),
+                "red_loss_reasons": [red.loss_reason or None for red in self.inner.state.red],
+                "red_termination_events": list(self._red_termination_events),
+            })
+        return snapshot
+
+    def _record_red_terminations(self) -> None:
+        """Observe state changes only; never change simulation state or decisions."""
+        assert self.inner.state is not None
+        state = self.inner.state
+        for slot, red in enumerate(state.red):
+            if self._telemetry_red_alive[slot] and not red.alive:
+                self._red_termination_events.append({
+                    "red_id": slot, "time_s": float(state.time_s),
+                    "step_count": int(state.step_count), "reason": red.loss_reason or None,
+                    "alive": False, "position_m": red.position_m.tolist(),
+                    "velocity_mps": red.velocity_mps.tolist(),
+                    "blue_position_m": state.blue[0].position_m.tolist(),
+                    "blue_velocity_mps": state.blue[0].velocity_mps.tolist(),
+                })
+            self._telemetry_red_alive[slot] = bool(red.alive)
 
     def _structural_action_mask(self) -> np.ndarray:
         loads = np.linalg.norm(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[:, :2], axis=1)
@@ -309,6 +343,7 @@ class BlueEscapeEnv:
         integrated_acceleration = np.zeros(3, dtype=np.float64)
         integrated_load_g = 0.0
         elapsed_transition_s = 0.0
+        self._red_termination_events = []
         for frame_index in range(self.frames_per_action):
             assert self.inner.state is not None
             red = RedAction(np.zeros(len(self.inner.state.red), np.int64), np.zeros((len(self.inner.state.red), 2)))
@@ -331,6 +366,8 @@ class BlueEscapeEnv:
                 red_action=red,
                 blue_action={"load_command_body_g": [applied.tolist()]},
             )
+            if self.config.record_red_telemetry:
+                self._record_red_terminations()
             self._activate_if_threat_observed()
             if self._record_current_episode:
                 self.recorder.record(self.inner.state)
@@ -430,7 +467,7 @@ class BlueEscapeEnv:
             },
             # Kept separate from the normalized observation so diagnostics can
             # evolve without changing a checkpoint's observation schema.
-            "flight_quality_state": self._mechanism_snapshot(),
+            "flight_quality_state": self._flight_quality_snapshot(),
             "reward_mechanism_state": dict(self._mechanism_reward_state),
             **self._learning_status(
                 learning_transition=learning_transition,

@@ -22,6 +22,7 @@ from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, Evaluatio
                       blue_observation_dim,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
+from .blue_rl.episode_telemetry import write_evaluation_metadata
 from .cli_utils import parse_missile_scenarios
 
 
@@ -200,6 +201,7 @@ def main() -> int:
                                  observation_schema=observation_schema,
                                  decision_interval_s=args.decision_interval,
                                  expose_evaluation_mechanism_state=True,
+                                 record_red_telemetry=True,
                                  acmi_episode_interval=args.acmi_interval,
                                  acmi_directory=str(output / "acmi"),
                                  mechanism_reward=mechanism_reward_config)
@@ -207,6 +209,13 @@ def main() -> int:
     action_dim = 29
     if agent.config.observation_dim != observation_dim or agent.config.action_dim != action_dim:
         raise ValueError(f"checkpoint dimensions ({agent.config.observation_dim}, {agent.config.action_dim}) do not match the requested scenarios ({observation_dim}, {action_dim}); check --missiles")
+    recording_metadata_path = output / "flight_quality" / "evaluation_metadata.json"
+    recording_metadata = write_evaluation_metadata(
+        recording_metadata_path, checkpoint=Path(args.checkpoint),
+        environment_config=asdict(environment_config), adapter_config=asdict(config),
+        evaluation_options={**vars(args), "flight_envelope_config": asdict(envelope_config),
+                            "numpy_version": np.__version__, "torch_version": str(torch.__version__)},
+    )
     pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
     learning_active_by_worker: dict[int, bool] = {}
     mechanism_states: dict[int, dict[str, object]] = {}
@@ -230,6 +239,8 @@ def main() -> int:
            "seed": args.seed, "decision_interval_s": args.decision_interval,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
+           "recording_metadata_path": str(recording_metadata_path),
+           "run_id": recording_metadata["run_id"],
            "flight_envelope_config": agent.config.flight_envelope_config or envelope_config.__dict__,
            "mechanism_reward_config": asdict(mechanism_reward_config),
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
@@ -336,7 +347,8 @@ def main() -> int:
                         reward_diagnostic_sums[worker][str(name)] += float(value)
                 if result.terminated or result.truncated:
                     episode = episode_by_worker[worker]
-                    row = {"episode": episode, "missile_count": episode_scenarios[episode],
+                    row = {"episode": episode, "seed": args.seed + episode,
+                           "missile_count": episode_scenarios[episode],
                            "reward": rewards[worker], **result.info,
                            "initialization": initializations[worker],
                            "blue_orientation": initializations[worker]["blue_orientation"],
@@ -368,7 +380,16 @@ def main() -> int:
                                          **({"trace": mechanism_traces[worker]}
                                             if args.mechanism_detail_log else {})}}
                     rows.append(row); window_rows.append(row); completed += 1
-                    quality_result = quality[worker].finish(episode=episode, survived=bool(result.info["blue_survived"]))
+                    quality_result = quality[worker].finish(
+                        episode=episode, survived=bool(result.info["blue_survived"]),
+                        metadata={"run_id": recording_metadata["run_id"],
+                                  "manifest": recording_metadata_path.name,
+                                  "seed": args.seed + episode,
+                                  "missile_count": episode_scenarios[episode],
+                                  "initialization": initializations[worker],
+                                  "initial_state_trace_index": 0,
+                                  "termination_reason": result.info["termination_reason"]},
+                    )
                     row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
                     quality_episodes.append(quality_result)
                     append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
@@ -459,6 +480,8 @@ def main() -> int:
                "checkpoint_target_updates": agent.target_updates,
                "elapsed_s": elapsed,
                "flight_quality": flight_quality_summary,
+               "run_id": recording_metadata["run_id"],
+               "recording_metadata_path": str(recording_metadata_path),
                "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
                "results": rows}
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
