@@ -21,6 +21,7 @@ from red_swarm_policy.blue_rl import (
     RainbowDQNAgent,
     RainbowDQNConfig,
     blue_observation_dim,
+    parse_mechanism_rewards,
 )
 from red_swarm_policy.blue_rl.config_io import (
     configure_blue_mission_duration,
@@ -274,6 +275,55 @@ def test_mechanism_penalties_separate_timing_direction_and_load() -> None:
     assert max(wrong["timing"], wrong["direction"], wrong["overload"]) < 0.001
 
 
+def test_mechanism_reward_selection_is_independent_and_keeps_legacy_defaults() -> None:
+    assert parse_mechanism_rewards("all") == ("threat", "timing", "direction", "overload")
+    assert parse_mechanism_rewards("direction,threat,direction") == ("threat", "direction")
+    assert parse_mechanism_rewards("none") == ()
+    with pytest.raises(ValueError, match="unknown reward mechanisms"):
+        parse_mechanism_rewards("threat,unknown")
+
+    assert MechanismRewardConfig().active_mechanisms() == (
+        "threat", "timing", "direction", "overload"
+    )
+    mechanism = {
+        "evasion_target": 1.0,
+        "desired_direction_inertial": [1.0, 0.0, 0.0],
+        "reference_load_g": 5.0,
+    }
+    mask = np.ones(29, dtype=bool)
+    transitions = {
+        "timing": (np.zeros(3), 1.0),
+        "direction": (np.array([-9.80665, 0.0, 0.0]), 5.0),
+        "overload": (np.array([9.80665, 0.0, 0.0]), 9.0),
+    }
+    for enabled_name in ("timing", "direction", "overload"):
+        estimator = BlueMechanismStateEstimator(
+            MechanismRewardConfig().with_mechanisms((enabled_name,))
+        )
+        acceleration, load_g = transitions[enabled_name]
+        penalties = estimator.penalties(
+            mechanism, acceleration, load_g, 0.1, 0.0, action_mask=mask,
+        )
+        for name in ("timing", "direction", "overload"):
+            assert (penalties[name] > 0.0) == (name == enabled_name)
+
+
+def test_reward_baseline_keeps_original_potential_and_terminal_reward() -> None:
+    reward_config = MechanismRewardConfig().with_mechanisms(())
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(
+        record_acmi=False, mechanism_reward=reward_config,
+    ))
+    env.reset(seed=8)
+    legacy = env._threat_potential()
+    joint = env._joint_potential({"total_threat": 1.5, "emergency_gate": 1.0})
+
+    assert joint["threat_outcome"] == 0.0
+    assert joint["legacy_multiplier"] == 1.0
+    for name in ("far_away", "near_tangent", "near_dive"):
+        assert joint[name] == pytest.approx(legacy[name])
+    assert env._terminal_reward({"termination_reason": "timeout", "time_s": 180.0}) == 2.0
+
+
 def test_mechanism_penalties_turn_off_when_no_real_action_choice_exists() -> None:
     estimator = BlueMechanismStateEstimator()
     mechanism = {
@@ -332,6 +382,10 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
 
     args = build_parser().parse_args(["--replay-size", "500000"])
     assert args.replay_size == 500_000
+    assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
+    assert build_parser().parse_args([
+        "--reward-mechanisms", "timing,overload"
+    ]).reward_mechanisms == ("timing", "overload")
 
 
 def test_evaluation_mechanisms_are_independent_and_deterministic() -> None:

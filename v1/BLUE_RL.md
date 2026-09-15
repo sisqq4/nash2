@@ -9,8 +9,8 @@
 蓝方测试新增独立基线场景，并通过与 Rainbow 测试相同的 `BlueEscapeEnv` 适配层运行：蓝方使用 v1 现有的
 `BlueEvasionController(BlueEvasionRuleMachine)`，红方使用容量约束的规则分配与
 零残差严格三维纯比例导引（PPN，系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
-回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。入口独立于原有
-蓝方训练、Rainbow 评估和机理消融流程，因此不会改变已有训练及测试设置。
+回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。该命令仍可独立运行，
+六组奖励消融批处理会复用它执行第一组测试；原有蓝方训练和 Rainbow 评估入口保持不变。
 
 以下命令在 1～4 枚来弹场景各运行 100 回合，并输出逐回合 CSV 和汇总 JSON；汇总配置会显式
 记录 `baseline=true`、双方学习开关均为 `false`，以及双方 checkpoint 均为空：
@@ -37,9 +37,9 @@ CSV 在全部回合完成后写入。
 `reference` 可用于纯参考运行，`shadow` 会同时计算两种实现并输出一致性统计。
 
 
-与智能策略比较时应使用相同的来弹数量、每场景回合数和连续 seed 起点，以确保初始化样本配对；
-基线结果分别写入 `blue_rule_baseline_summary.json` 和
-`blue_rule_baseline_trials.csv`。
+独立执行规则机时，`--episodes-per-scenario` 保留按来弹数分组的旧模式。需要与 Rainbow 逐回合配对时，
+改用 `--episodes TOTAL`：两者会使用相同的 `Random(seed)` 来弹抽样以及 `seed + episode` 初始化序列。
+基线结果分别写入 `blue_rule_baseline_summary.json` 和 `blue_rule_baseline_trials.csv`。
 
 ## 旧 checkpoint 的仅测试机理塑形与消融
 
@@ -149,10 +149,70 @@ checkpoint 仍按保存的输入契约加载。
 可选动作或进入 fallback 时全部关闭。最终仍以生存裁决为主：脱靶/物理失效 `+10`（另有不超过 `+1`
 的快速完成奖励）、蓝机被击中 `-10`（按生存进度最多减轻 `1`）、timeout `+2`。
 
-建议奖励重构后的训练计划先做 terminal-only 与新 threat-potential 的相同 seed 消融，再逐步扩展到 1v2～1v4；
+建议奖励重构后的训练计划使用相同 seed，依次比较基础奖励、威胁势、时机、方向和过载机理，再逐步扩展到 1v2～1v4；
 每阶段使用独立 evaluation seeds 比较生存率、终止/失效原因、脱靶距离、完成时间与动作分布。C51 support
 随新奖励调整为 61 atoms、`[-14, 12]`；正式长跑仍应依据投影前 n-step return 分位数复核边界，而不是依据 episode
 总回报机械扩大 support。
+
+## 六组奖励消融批量训练与测试
+
+`run_blue_rl_reward_ablations` 的默认 `core` 套件依次运行以下六个条件：
+
+1. `00_rule_baseline`：蓝方使用 `BlueEvasionRuleMachine`，不创建学习器、回放缓存或 checkpoint，只执行规则机测试。
+2. `01_rl_baseline`：Rainbow-DQN 只使用原有远离、切向、俯冲势函数和终局奖励，不加入四项逃逸机理。
+3. `05_rl_all_mechanisms`：四项机理全部启用，先完成完整模型对照。
+4. `02_rl_threat`：在 RL 基础奖励上加入威胁结果势函数。
+5. `03_rl_threat_timing`：继续加入规避时机惩罚。
+6. `04_rl_threat_timing_direction`：继续加入规避方向惩罚。
+
+目录编号表达实验定义，实际执行优先级固定为 `00 → 01 → 05 → 02 → 03 → 04`；manifest 的
+`execution_order` 会保存这一顺序。
+
+五个 RL 条件使用相同训练参数与训练 seed，各自训练完成后由现有 `evaluate_blue_rl` 测试；规则机条件调用现有
+`evaluate_blue_rule_baseline`。规则机没有可训练参数，因此 manifest 中训练状态明确记录为 `not_applicable`。
+批处理给规则机传入 `--reward-mechanisms none`，使其奖励统计与 RL 基础奖励一致，但该奖励不参与规则动作选择。
+独立运行规则基线时不传该参数，仍保持原有四项全开的统计行为。
+
+这些开关只控制四项训练奖励：`normalized_v4` 的状态字段以及统一飞行包线约束仍在所有 RL 条件中保持一致，
+从而只比较奖励差异。单独执行训练时 `--reward-mechanisms` 默认 `all`；单独评估时默认恢复 checkpoint 中保存的选择。
+
+输出根目录包含 `reward_ablation_manifest.json`，每个条件拥有独立目录。RL 条件的 `train/` 保存最终及周期
+checkpoint、`training_metrics.json`、`training.jsonl`、逐回合结果、ACMI、飞行质量报告和
+`training_analysis/` 图片；`evaluation/` 保存 `evaluation.json`、进度 JSONL、ACMI、飞行质量报告和
+`evaluation_analysis/` 图片。规则机的 `evaluation/` 保存汇总 JSON、逐回合 CSV、进度 JSONL、ACMI 和
+`evaluation_analysis/` 图片。manifest 会记录每个阶段的必需文件和本轮生成的 PNG；缺失、或复用目录中只有旧文件时，
+该阶段会标记失败。除非显式传入 `--no-plots`，批处理不会关闭任何现有绘图钩子。
+
+`--eval-episodes` 默认同时作为每个 RL 条件和规则机条件的总测试回合数；规则机在该模式下使用与
+`evaluate_blue_rl` 相同的 `Random(eval_seed)` 弹数抽样和 `eval_seed + episode` 初始化 seed，因此六组测试样本
+逐回合配对。若希望规则机按每种来弹数量等量分组测试，可通过 `--rule-episodes-per-scenario` 明确指定，此时
+仅规则机切回原有的分组模式。
+
+PowerShell 示例：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m red_swarm_policy.run_blue_rl_reward_ablations `
+  --suite core `
+  --missiles 1,2,3 `
+  --train-episodes 1000 `
+  --eval-episodes 1000 `
+  --train-seed 2000 `
+  --eval-seed 10042 `
+  --device cuda:0 `
+  --parallel-envs 16 `
+  --env-worker-threads 1 `
+  --batch-size 256 `
+  --replay-size 500000 `
+  --updates-per-transition 0.5 `
+  --checkpoint-interval 10 `
+  --log-interval 10 `
+  --acmi-interval 50 `
+  --output outputs/blue_rl/reward_ablations_six_cases
+```
+
+正式运行前可加入 `--dry-run` 检查六组命令和输出位置。原有单次训练、Rainbow 测试、规则机测试以及
+`run_blue_rl_ablations` 的旧 checkpoint 测试期动作仲裁消融入口均保持独立，不受此批处理套件影响。
 
 蓝方训练和评估入口统一把 mission timeout 与 missile guidance timeout 设置为 180 s。针对平均上千个
 决策步的轨迹，Rainbow 默认采用 `gamma=0.999`、`n_step=20`，并将学习率降低到 `2.5e-4` 以减轻后期

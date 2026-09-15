@@ -7,7 +7,7 @@ threat outcome, maneuver timing, maneuver direction, and overload matching.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Any
 
@@ -20,6 +20,22 @@ from .flight_envelope import FlightEnvelopeConstraintLayer
 
 _EPS = 1.0e-9
 _UP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+MECHANISM_REWARD_NAMES = ("threat", "timing", "direction", "overload")
+
+
+def parse_mechanism_rewards(value: str) -> tuple[str, ...]:
+    """Parse ``all``, ``none``, or a comma-separated mechanism selection."""
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return MECHANISM_REWARD_NAMES
+    if normalized in {"", "none"}:
+        return ()
+    names = tuple(dict.fromkeys(part.strip() for part in normalized.split(",") if part.strip()))
+    unknown = sorted(set(names) - set(MECHANISM_REWARD_NAMES))
+    if unknown:
+        choices = ", ".join(MECHANISM_REWARD_NAMES)
+        raise ValueError(f"unknown reward mechanisms {unknown}; choose from {choices}, all, or none")
+    return tuple(name for name in MECHANISM_REWARD_NAMES if name in names)
 
 
 @dataclass(frozen=True)
@@ -27,6 +43,10 @@ class MechanismRewardConfig:
     """Numerical contract for the four training-time mechanisms."""
 
     enabled: bool = True
+    threat_enabled: bool = True
+    timing_enabled: bool = True
+    direction_enabled: bool = True
+    overload_enabled: bool = True
     threat_potential_scale: float = 1.0
     threat_filter_time_constant_s: float = 0.2
     threat_range_scale_m: float = 20_000.0
@@ -70,11 +90,30 @@ class MechanismRewardConfig:
     hard_flight_path_angle_deg: float = 70.0
     speed_margin_width_mps: float = 100.0
 
+    def mechanism_enabled(self, name: str) -> bool:
+        if name not in MECHANISM_REWARD_NAMES:
+            raise ValueError(f"unknown mechanism reward {name!r}")
+        return bool(self.enabled and getattr(self, f"{name}_enabled"))
+
+    def active_mechanisms(self) -> tuple[str, ...]:
+        return tuple(name for name in MECHANISM_REWARD_NAMES if self.mechanism_enabled(name))
+
+    def with_mechanisms(self, mechanisms: tuple[str, ...]) -> MechanismRewardConfig:
+        """Return a copy with exactly the requested reward mechanisms active."""
+        selected = parse_mechanism_rewards(",".join(mechanisms))
+        return replace(
+            self,
+            enabled=bool(selected),
+            **{f"{name}_enabled": name in selected for name in MECHANISM_REWARD_NAMES},
+        )
+
     def validate(self) -> None:
         scalar = tuple(
             float(value)
             for name, value in self.__dict__.items()
-            if name not in {"enabled", "phase_on_confirmations", "phase_off_confirmations",
+            if name not in {"enabled", "threat_enabled", "timing_enabled",
+                            "direction_enabled", "overload_enabled",
+                            "phase_on_confirmations", "phase_off_confirmations",
                             "main_threat_confirmations"}
         )
         if not all(math.isfinite(value) for value in scalar):
@@ -671,11 +710,18 @@ class BlueMechanismStateEstimator:
             self.config.reward_horizon_s - max(0.0, float(elapsed_learning_s)),
         )
         scale = max(0.0, float(transition_dt_s)) / horizon * choice_gate
-        timing = self.config.timing_penalty_budget * scale * timing_error
-        direction = (self.config.direction_penalty_budget * scale * activation * target
-                     * direction_error)
-        overload = (self.config.overload_penalty_budget * scale * activation * target
-                    * overload_error)
+        timing = (
+            self.config.timing_penalty_budget * scale * timing_error
+            if self.config.mechanism_enabled("timing") else 0.0
+        )
+        direction = (
+            self.config.direction_penalty_budget * scale * activation * target * direction_error
+            if self.config.mechanism_enabled("direction") else 0.0
+        )
+        overload = (
+            self.config.overload_penalty_budget * scale * activation * target * overload_error
+            if self.config.mechanism_enabled("overload") else 0.0
+        )
         return {
             "timing": float(timing), "direction": float(direction),
             "overload": float(overload), "total": float(timing + direction + overload),

@@ -10,7 +10,8 @@ from .curriculum import CurriculumSchedule, CurriculumStage, DEFAULT_CURRICULUM
 from .evaluation_shaping import EvaluationActionShaper, EvaluationShapingConfig
 from .flight_envelope import FlightEnvelopeConfig, FlightEnvelopeConstraintLayer
 from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfig,
-                               encode_normalized_v4, mechanism_observation_dim)
+                               MECHANISM_REWARD_NAMES, encode_normalized_v4,
+                               mechanism_observation_dim, parse_mechanism_rewards)
 
 from .flight_quality import (FlightQualityTracker, append_flight_quality_episode,
                              write_flight_quality_report)
@@ -39,6 +40,8 @@ __all__ = [
     "FlightEnvelopeConstraintLayer",
     "BlueMechanismStateEstimator",
     "MechanismRewardConfig",
+    "MECHANISM_REWARD_NAMES",
+    "parse_mechanism_rewards",
     "encode_normalized_v4",
     "mechanism_observation_dim",
     "FlightQualityTracker",

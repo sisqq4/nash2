@@ -99,7 +99,7 @@ class MissileConfig:
     drag_coefficient: float | None = None
     drag_mach_breakpoints: tuple[float, ...] = (0.0, 0.8, 0.95, 1.05, 1.2, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0)
     zero_lift_drag_coefficients: tuple[float, ...] = (0.10, 0.11, 0.18, 0.34, 0.30, 0.22, 0.19, 0.17, 0.16, 0.15, 0.15)
-    induced_drag_factor: float = 0.08
+    induced_drag_factor: float = 0.05
     max_load_factor_g: float = 35.0
     max_guidance_bias_g: float = 5.0
     min_speed_mps: float = 100.0

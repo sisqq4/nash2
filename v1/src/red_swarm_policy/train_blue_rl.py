@@ -17,9 +17,11 @@ from .analyze_training import write_training_analysis_safely
 from .analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
                       FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
-                      FlightQualityTracker, RainbowDQNAgent, RainbowDQNConfig,
+                      FlightQualityTracker, MechanismRewardConfig,
+                      RainbowDQNAgent, RainbowDQNConfig,
                       append_flight_quality_episode,
                       blue_observation_dim,
+                      parse_mechanism_rewards,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
@@ -35,6 +37,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--output", default="outputs/blue_rl/train")
     parser.add_argument("--device", default="cpu"); parser.add_argument("--env-config", default=None)
     parser.add_argument("--decision-interval", type=float, default=0.1)
+    parser.add_argument(
+        "--reward-mechanisms", type=parse_mechanism_rewards, default="all",
+        metavar="SELECTION",
+        help=("Training reward mechanisms: all, none, or a comma-separated subset of "
+              "threat,timing,direction,overload (default: all)"),
+    )
     parser.add_argument("--parallel-envs", type=int, default=1,
                         help="Persistent CPU environment processes sampled in parallel")
     parser.add_argument("--env-worker-threads", type=int, default=1)
@@ -169,12 +177,16 @@ def main() -> int:
     flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
-    env_config = BlueEscapeEnvConfig(training_scenarios[0], max_missiles=max(training_scenarios),
-                                     pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
-                                     observation_schema="normalized_v4",
-                                     decision_interval_s=args.decision_interval,
-                                     acmi_episode_interval=args.acmi_interval,
-                                     acmi_directory=str(output / "acmi"))
+    mechanism_reward_config = MechanismRewardConfig().with_mechanisms(args.reward_mechanisms)
+    env_config = BlueEscapeEnvConfig(
+        training_scenarios[0], max_missiles=max(training_scenarios),
+        pad_observation_to_max_missiles=curriculum is not None or len(training_scenarios) > 1,
+        observation_schema="normalized_v4",
+        decision_interval_s=args.decision_interval,
+        acmi_episode_interval=args.acmi_interval,
+        acmi_directory=str(output / "acmi"),
+        mechanism_reward=mechanism_reward_config,
+    )
     envelope_config = FlightEnvelopeConfig(action_prediction_s=args.decision_interval)
     rainbow_config = RainbowDQNConfig(
         blue_observation_dim(env_config.observation_schema, max(training_scenarios)), 29,
@@ -205,6 +217,7 @@ def main() -> int:
             "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
             "training_mode": "rainbow_off_policy", "episodes": args.episodes,
             "guidance_contract": GUIDANCE_CONTRACT,
+            "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
             "seed": args.seed, "decision_interval_s": args.decision_interval,
             "updates_per_transition": args.updates_per_transition, "completed_environment_transitions": 0,
             "completed_optimizer_updates": 0, "completed_target_updates": 0,

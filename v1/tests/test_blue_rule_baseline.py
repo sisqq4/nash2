@@ -4,6 +4,7 @@ import csv
 
 from red_swarm_policy.evaluate_blue_rule_baseline import (
 
+    _build_episode_plan,
     _emit,
 
     _mark_as_blue_rule_baseline,
@@ -17,12 +18,34 @@ def test_blue_rule_baseline_defaults_match_blue_test_scenarios() -> None:
     args = build_parser().parse_args([])
     assert args.missiles == "1,2,3,4"
     assert args.episodes_per_scenario == 100
+    assert args.episodes is None
     assert args.decision_interval == 0.1
+    assert args.reward_mechanisms is None
     assert args.blue_rule_execution_backend == "vectorized_guarded"
 
     assert args.log_interval == 1
 
     assert args.output.as_posix() == "outputs/blue_rl/rule_baseline"
+
+
+def test_blue_rule_baseline_can_report_base_reward_only() -> None:
+    args = build_parser().parse_args([
+        "--reward-mechanisms", "none", "--episodes", "25"
+    ])
+    assert args.reward_mechanisms == ()
+    assert args.episodes == 25
+
+
+def test_blue_rule_random_plan_matches_rainbow_evaluation_schedule() -> None:
+    plan, sampling, seed_schedule = _build_episode_plan(
+        seed_start=2000, episodes_per_scenario=100,
+        missile_counts=(1, 2, 3), episodes=8,
+    )
+    assert [episode for episode, _, _ in plan] == list(range(1, 9))
+    assert [seed for _, seed, _ in plan] == list(range(2001, 2009))
+    assert [missiles for _, _, missiles in plan] == [2, 1, 2, 2, 3, 1, 3, 3]
+    assert sampling == "uniform_random_per_episode"
+    assert "matches evaluate_blue_rl" in seed_schedule
 
 
 def test_blue_rule_baseline_uses_shared_missile_validation() -> None:

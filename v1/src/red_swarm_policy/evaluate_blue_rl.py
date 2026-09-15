@@ -20,6 +20,7 @@ from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, Evaluatio
                       MechanismRewardConfig, RainbowDQNAgent,
                       append_flight_quality_episode,
                       blue_observation_dim,
+                      parse_mechanism_rewards,
                       write_flight_quality_report)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.episode_telemetry import write_evaluation_metadata
@@ -34,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="outputs/blue_rl/test"); parser.add_argument("--device", default="cpu")
     parser.add_argument("--env-config", default=None); parser.add_argument("--decision-interval", type=float, default=0.1)
+    parser.add_argument(
+        "--reward-mechanisms", type=parse_mechanism_rewards, default=None,
+        metavar="SELECTION",
+        help=("Reward components used for evaluation reporting: all, none, or a comma-separated "
+              "subset of threat,timing,direction,overload. By default, restore the checkpoint setting."),
+    )
     parser.add_argument("--parallel-envs", type=int, default=1); parser.add_argument("--env-worker-threads", type=int, default=1)
     parser.add_argument("--env-worker-timeout-s", type=float, default=300.0)
     parser.add_argument("--log-interval", type=int, default=10,
@@ -197,6 +204,8 @@ def main() -> int:
         MechanismRewardConfig(**agent.config.mechanism_reward_config)
         if agent.config.mechanism_reward_config else MechanismRewardConfig(enabled=False)
     )
+    if args.reward_mechanisms is not None:
+        mechanism_reward_config = mechanism_reward_config.with_mechanisms(args.reward_mechanisms)
     config = BlueEscapeEnvConfig(missile_scenarios[0], max_missiles=slots,
                                  pad_observation_to_max_missiles=len(missile_scenarios) > 1,
                                  observation_schema=observation_schema,
@@ -246,6 +255,7 @@ def main() -> int:
            "run_id": recording_metadata["run_id"],
            "flight_envelope_config": agent.config.flight_envelope_config or envelope_config.__dict__,
            "mechanism_reward_config": asdict(mechanism_reward_config),
+           "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
            "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                      "direction": shaping_config.direction, "overload": shaping_config.overload,
                                      "weight": shaping_config.weight},
@@ -474,6 +484,7 @@ def main() -> int:
                "by_scenario": by_scenario, "parallel_envs": pool_size,
                "inference_batch_size": pool_size,
                "evaluation_only": True, "learner_state_unchanged": True,
+               "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
                "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                          "direction": shaping_config.direction, "overload": shaping_config.overload,
                                          "weight": shaping_config.weight},

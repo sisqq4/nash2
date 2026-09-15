@@ -14,6 +14,7 @@ from collections import Counter
 import csv
 import json
 from pathlib import Path
+import random
 
 import time
 
@@ -22,7 +23,8 @@ from typing import Any
 import numpy as np
 
 from .analyze_blue_evaluations import write_evaluation_analysis_safely
-from .blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig
+from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, MechanismRewardConfig,
+                      parse_mechanism_rewards)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
 from .env import BlueEvasionConfig, BlueEvasionRuleMachine
@@ -41,10 +43,21 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--seed-start", type=int, default=DEFAULT_SEED_START)
+    parser.add_argument(
+        "--episodes", type=int, default=None,
+        help=("Optional total episode count using the same uniform scenario sampling and seed "
+              "schedule as evaluate_blue_rl"),
+    )
     parser.add_argument("--episodes-per-scenario", type=int,
                         default=DEFAULT_EPISODES_PER_SCENARIO)
     parser.add_argument("--missiles", default="1,2,3,4")
     parser.add_argument("--decision-interval", type=float, default=0.1)
+    parser.add_argument(
+        "--reward-mechanisms", type=parse_mechanism_rewards, default=None,
+        metavar="SELECTION",
+        help=("Reward components reported for the rule policy: all, none, or a comma-separated "
+              "subset. The default preserves the existing all-mechanism baseline behavior."),
+    )
     parser.add_argument(
         "--blue-rule-execution-backend",
         choices=("reference", "vectorized_guarded", "shadow"),
@@ -111,6 +124,28 @@ def _emit(row: dict[str, object], jsonl_path: Path) -> None:
         stream.write(encoded + "\n")
 
 
+def _build_episode_plan(*, seed_start: int, episodes_per_scenario: int,
+                        missile_counts: tuple[int, ...],
+                        episodes: int | None) -> tuple[list[tuple[int, int, int]], str, str]:
+    """Create either the legacy grouped plan or Rainbow's paired random plan."""
+    if episodes is None:
+        plan = [
+            (scenario_index * episodes_per_scenario + offset + 1,
+             seed_start + scenario_index * episodes_per_scenario + offset,
+             missile_count)
+            for scenario_index, missile_count in enumerate(missile_counts)
+            for offset in range(episodes_per_scenario)
+        ]
+        return (plan, "balanced_grouped_by_scenario",
+                "contiguous globally in listed scenario order")
+    scenario_rng = random.Random(seed_start)
+    plan = [
+        (episode, seed_start + episode, scenario_rng.choice(missile_counts))
+        for episode in range(1, episodes + 1)
+    ]
+    return plan, "uniform_random_per_episode", "seed_start + episode; matches evaluate_blue_rl"
+
+
 def _run_episode(env: BlueEscapeEnv, rule: BlueEvasionRuleMachine, *, episode: int,
                  seed: int, missile_count: int) -> dict[str, object]:
     _, reset_info = env.reset(seed=seed, episode_index=episode, missile_count=missile_count)
@@ -159,24 +194,36 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
              output: Path, log_interval: int = 1,
              jsonl_path: Path | None = None,
              execution_backend: str = "vectorized_guarded",
+             reward_mechanisms: tuple[str, ...] | None = None,
+             episodes: int | None = None,
              ) -> tuple[dict[str, object], list[dict[str, object]]]:
 
     if episodes_per_scenario < 1:
         raise ValueError("episodes-per-scenario must be positive")
+    if episodes is not None and episodes < 1:
+        raise ValueError("episodes must be positive")
     if acmi_interval < 0:
         raise ValueError("acmi-interval must be non-negative")
 
     if log_interval < 1:
         raise ValueError("log-interval must be positive")
     progress_path = output / "blue_rule_baseline_progress.jsonl" if jsonl_path is None else jsonl_path
-    total_episodes = len(missile_counts) * episodes_per_scenario
+    episode_plan, sampling, seed_schedule = _build_episode_plan(
+        seed_start=seed_start, episodes_per_scenario=episodes_per_scenario,
+        missile_counts=missile_counts, episodes=episodes,
+    )
+    total_episodes = len(episode_plan)
     started = time.monotonic()
 
     environment_config = configure_blue_mission_duration(load_environment_config(env_config))
+    mechanism_reward = MechanismRewardConfig()
+    if reward_mechanisms is not None:
+        mechanism_reward = mechanism_reward.with_mechanisms(reward_mechanisms)
     adapter_config = BlueEscapeEnvConfig(
         missile_count=missile_counts[0], max_missiles=max(missile_counts),
         decision_interval_s=decision_interval_s, record_acmi=acmi_interval > 0,
         acmi_episode_interval=acmi_interval, acmi_directory=str(output / "acmi"),
+        mechanism_reward=mechanism_reward,
     )
     env = BlueEscapeEnv(environment_config, adapter_config)
     rule = BlueEvasionRuleMachine(
@@ -185,26 +232,23 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
         execution_backend=execution_backend,
     )
     rows: list[dict[str, object]] = []
-    for scenario_index, missile_count in enumerate(missile_counts):
-        for offset in range(episodes_per_scenario):
-            episode = scenario_index * episodes_per_scenario + offset + 1
-            seed = seed_start + episode - 1
-            rows.append(_run_episode(env, rule, episode=episode, seed=seed,
-                                     missile_count=missile_count))
+    for episode, seed, missile_count in episode_plan:
+        rows.append(_run_episode(env, rule, episode=episode, seed=seed,
+                                 missile_count=missile_count))
 
-            if episode % log_interval == 0 or episode == total_episodes:
-                survived = sum(bool(row["blue_survived"]) for row in rows)
-                elapsed = time.monotonic() - started
-                _emit({
-                    "event": "baseline_progress",
-                    "completed_episodes": episode,
-                    "total_episodes": total_episodes,
-                    "progress_fraction": episode / total_episodes,
-                    "current_missile_count": missile_count,
-                    "survival_rate_so_far": survived / episode,
-                    "elapsed_seconds": elapsed,
-                    "episodes_per_second": episode / elapsed if elapsed > 0.0 else None,
-                }, progress_path)
+        if episode % log_interval == 0 or episode == total_episodes:
+            survived = sum(bool(row["blue_survived"]) for row in rows)
+            elapsed = time.monotonic() - started
+            _emit({
+                "event": "baseline_progress",
+                "completed_episodes": episode,
+                "total_episodes": total_episodes,
+                "progress_fraction": episode / total_episodes,
+                "current_missile_count": missile_count,
+                "survival_rate_so_far": survived / episode,
+                "elapsed_seconds": elapsed,
+                "episodes_per_second": episode / elapsed if elapsed > 0.0 else None,
+            }, progress_path)
 
     by_scenario = []
     for missile_count in missile_counts:
@@ -213,12 +257,15 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
     summary: dict[str, object] = {
         "configuration": {
             "missile_counts": list(missile_counts),
-            "episodes_per_scenario": episodes_per_scenario,
+            "episodes": episodes,
+            "episodes_per_scenario": episodes_per_scenario if episodes is None else None,
             "seed_start": seed_start,
-            "seed_schedule": "contiguous globally in listed scenario order",
+            "scenario_sampling": sampling,
+            "seed_schedule": seed_schedule,
             "decision_interval_s": decision_interval_s,
             "environment": "BlueEscapeEnv",
             "blue_rule_execution_backend": execution_backend,
+            "active_reward_mechanisms": list(mechanism_reward.active_mechanisms()),
         },
         "statistics": _aggregate_results(rows),
         "by_scenario": by_scenario,
@@ -240,8 +287,11 @@ def main(argv: list[str] | None = None) -> int:
             "event": "baseline_start",
             "message": "Blue rule baseline evaluation is running",
             "missile_counts": list(missile_counts),
-            "episodes_per_scenario": args.episodes_per_scenario,
-            "total_episodes": len(missile_counts) * args.episodes_per_scenario,
+            "episodes_per_scenario": (
+                args.episodes_per_scenario if args.episodes is None else None
+            ),
+            "total_episodes": (args.episodes if args.episodes is not None
+                               else len(missile_counts) * args.episodes_per_scenario),
             "seed_start": args.seed_start,
             "output": str(args.output),
         }, progress_path)
@@ -253,6 +303,8 @@ def main(argv: list[str] | None = None) -> int:
 
             log_interval=args.log_interval, jsonl_path=progress_path,
             execution_backend=args.blue_rule_execution_backend,
+            reward_mechanisms=args.reward_mechanisms,
+            episodes=args.episodes,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error

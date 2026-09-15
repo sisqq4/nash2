@@ -615,7 +615,7 @@ class BlueEscapeEnv:
         emergency_gate = float(np.clip(mechanism.get("emergency_gate", 0.0), 0.0, 1.0))
         multiplier = (
             1.0 - self.config.mechanism_reward.legacy_emergency_suppression * emergency_gate
-            if self.config.mechanism_reward.enabled else 1.0
+            if self.config.mechanism_reward.mechanism_enabled("threat") else 1.0
         )
         components = {
             name: multiplier * legacy[name]
@@ -624,7 +624,7 @@ class BlueEscapeEnv:
         threat = float(np.clip(mechanism.get("total_threat", 0.0), 0.0, 2.0))
         components["threat_outcome"] = (
             self.config.mechanism_reward.threat_potential_scale * (1.0 - threat / 2.0)
-            if self.config.mechanism_reward.enabled else 0.0
+            if self.config.mechanism_reward.mechanism_enabled("threat") else 0.0
         )
         return {
             **components,
