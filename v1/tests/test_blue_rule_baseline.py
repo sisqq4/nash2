@@ -18,6 +18,7 @@ def test_blue_rule_baseline_defaults_match_blue_test_scenarios() -> None:
     assert args.missiles == "1,2,3,4"
     assert args.episodes_per_scenario == 100
     assert args.decision_interval == 0.1
+    assert args.blue_rule_execution_backend == "vectorized_guarded"
 
     assert args.log_interval == 1
 
@@ -35,7 +36,8 @@ def test_blue_rule_baseline_metadata_explicitly_disables_learning() -> None:
     assert isinstance(configuration, dict)
     assert configuration["baseline"] is True
     assert configuration["blue_policy"] == "BlueEvasionRuleMachine"
-    assert configuration["red_policy"] == "fixed_target_zero_residual_proportional_navigation"
+    assert configuration["red_policy"] == "fixed_target_zero_residual_pure_proportional_navigation"
+    assert configuration["guidance_contract"] == "pure_proportional_navigation_vm_v1"
     assert configuration["blue_learning_enabled"] is False
     assert configuration["red_learning_enabled"] is False
     assert configuration["blue_checkpoint"] is None

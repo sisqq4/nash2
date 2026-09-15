@@ -223,7 +223,8 @@ class RedBlueEngagementEnv:
         if not self.policy_ready:
             return self._step_boost_frame(blue_action)
 
-        previous = self.state.copy()
+        # Physics treats its input as read-only and returns a fresh public state.
+        previous = self.state
         observation = self.last_observation
         action = self.decision_layer.select_actions(
             self.state,

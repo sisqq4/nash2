@@ -8,7 +8,7 @@
 
 蓝方测试新增独立基线场景，并通过与 Rainbow 测试相同的 `BlueEscapeEnv` 适配层运行：蓝方使用 v1 现有的
 `BlueEvasionController(BlueEvasionRuleMachine)`，红方使用容量约束的规则分配与
-零残差比例导引（PN 系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
+零残差严格三维纯比例导引（PPN，系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
 回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。入口独立于原有
 蓝方训练、Rainbow 评估和机理消融流程，因此不会改变已有训练及测试设置。
 
@@ -22,6 +22,7 @@
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rule_baseline \
   --missiles 1,2,3,4 --episodes-per-scenario 100 \
   --seed-start 20271000 --decision-interval 0.1 \
+  --blue-rule-execution-backend vectorized_guarded \
   --log-interval 1 \
   --output outputs/blue_rl/rule_baseline/holdout_100_seed_20271000
 ```
@@ -30,6 +31,10 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rule_baseline \
 `baseline_start`；默认每完成一个回合输出一条 `baseline_progress`（可用
 `--log-interval N` 调整频率），结束时输出 `baseline_complete`。正式汇总 JSON 和逐回合
 CSV 在全部回合完成后写入。
+
+规则基线默认使用与 v7 相同的 `vectorized_guarded` 候选动作评分：29 个动作批量推进，
+若得分非有限或前两名近似并列则回退到逐动作参考实现，以保留原有 `argmax` 规则。
+`reference` 可用于纯参考运行，`shadow` 会同时计算两种实现并输出一致性统计。
 
 
 与智能策略比较时应使用相同的来弹数量、每场景回合数和连续 seed 起点，以确保初始化样本配对；
@@ -81,12 +86,19 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 没有复制 nash1.6 的场景数值。
 
 训练环境 `BlueEscapeEnv` 与红方分层训练环境相对独立。所有红弹固定分配给唯一蓝机且残差过载恒为
-零，因此只运行 v1 的比例导引，不会调用红方高层或低层网络。训练和测试每回合都写 Tacview ACMI。
+零，因此只运行严格三维 PPN，不会调用红方高层或低层网络。其导引契约固定记录为
+`pure_proportional_navigation_vm_v1`；训练和测试每回合都可写 Tacview ACMI。
 
-蓝机在 9–11 km 高度内生成，初始滚转角和航迹倾角均为 0°，初速度只在水平面内随机取向。
+蓝方训练/测试入口使用与 v7 相同的默认物理合同：任务及导弹制导上限均为 180 s，蓝机在
+8–12 km 高度内生成，红弹诱导阻力因子为 0.05、杀伤半径为 3 m。以上默认值仅作用于
+`blue_rl` 入口，不会覆盖 v1 红方训练的全局默认配置。任务时长与初始高度范围由蓝方入口固定；
+诱导阻力、杀伤半径及其它物理字段可由 `--env-config` 显式覆盖。
+蓝机初始滚转角和航迹倾角均为 0°，初速度只在水平面内随机取向。
 在任一存活来弹与蓝机的三维距离严格小于 60 km 之前，环境固定执行 0 号平飞动作，不调用蓝方
 策略网络、不产生学习奖励、不写 replay，也不计算 loss 或梯度；首次越过探测边界的过渡只用于建立
-第一帧 RL 状态，从下一决策开始机动和训练。触发状态在本回合内不可逆。
+第一帧 RL 状态，从下一决策开始机动和训练。触发状态在本回合内不可逆。触发后，观测与机理估计
+只纳入 60 km 内最近的 checkpoint 槽位数个存活来弹，再按原红弹编号排序；来弹进出探测范围时会
+重映射主威胁槽位，和 v7 的冻结蓝方控制器保持一致。
 
 训练、课程内验证、独立评估和普通 `BlueRLController` 现在共用同一个预测飞行包线约束层。每次决策先用
 与三自由度飞机一致的载荷/重力模型模拟全部 29 个候选动作 0.1 s；预测会从状态快照中的当前连续指令
@@ -107,6 +119,10 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 确定性的最小风险恢复动作。P1/P2 紧急门只把包线软代价最多降到 50%、指令变化软代价最多降到 20%，
 高度软代价和全部硬掩码始终不变。执行端把约束后的离散目标在一个 0.1 s 决策区间内逐 0.005 s 物理帧
 线性插值。
+
+该约束层与 v7 一样缓存同一决策中不变的物理预测、硬掩码和基础代价；机理紧急门变化时只重算
+软代价门控。2 s 恢复搜索也只继续积分尚未失效、且尚未找到首个恢复动作的候选/恢复组合。
+缓存内容与返回诊断深拷贝隔离，`reset()` 会清空缓存，因此优化不改变动作、观测或奖励语义。
 
 新 checkpoint 会保存完整的飞行包线配置，评估时自动恢复，并拒绝与保存值不一致的决策周期。PER/n-step
 回放保存约束后的实际动作以及 n-step 末状态的硬动作掩码和软代价；Double-DQN 的下一动作选择也使用它们，
@@ -138,7 +154,7 @@ checkpoint 仍按保存的输入契约加载。
 随新奖励调整为 61 atoms、`[-14, 12]`；正式长跑仍应依据投影前 n-step return 分位数复核边界，而不是依据 episode
 总回报机械扩大 support。
 
-蓝方训练和评估入口统一把 mission timeout 与 missile guidance timeout 设置为 200 s。针对平均上千个
+蓝方训练和评估入口统一把 mission timeout 与 missile guidance timeout 设置为 180 s。针对平均上千个
 决策步的轨迹，Rainbow 默认采用 `gamma=0.999`、`n_step=20`，并将学习率降低到 `2.5e-4` 以减轻后期
 策略漂移。每个 decision 的 `reward_components` 分别记录旧三项势差、`threat_outcome_shaping`，以及
 `timing_penalty`、`direction_penalty`、`overload_penalty`；`reward_diagnostics` 另外记录威胁、变化率、
@@ -190,6 +206,7 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
 
 ```bash
 PYTHONPATH=src pytest -q tests/test_blue_rl.py
+PYTHONPATH=src pytest -q tests/test_blue_evasion_equivalence.py tests/test_guidance.py
 PYTHONPATH=src pytest -q tests/test_smoke.py tests/test_training_readiness.py
 PYTHONPATH=src python -m red_swarm_policy.train_blue_rl --help
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl --help
@@ -228,21 +245,27 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
 决定，不受并行 worker 完成先后影响。测试联合检查点时，所选集合的最大来弹数必须与训练时一致；例如
 用 `1,2,3,4` 训练的检查点可以测试 `2,4`，但不能只传 `1`（后者是 9 维单场景观测）。
 
-常规仿真中，现有 `BlueEvasionController`（规则机）保持不变；将载入的 Rainbow agent 包装为
+常规仿真中，`BlueEvasionController`（规则机）默认使用 v7 的 guarded 向量化等价实现；将载入的 Rainbow agent 包装为
 `BlueRLController` 即可作为 `RedBlueEngagementEnv(..., blue_policy=controller)` 并列替换。算法与环境通过
 `DiscreteBluePolicy` 协议以及 `PolicyRegistry` 解耦，之后实现离散 PPO 时注册新工厂即可，无需修改环境。
+部署控制器与 v7 一致地为每架蓝机维护独立的威胁/飞行包线状态，在每个决策帧合批推理，允许场景中
+存在超过 checkpoint 槽位数的红弹，并把离散目标动作在整个决策周期内连续插值；因此测试端和训练端
+使用相同的威胁槽位与执行语义。
 
 ## 参数设置
 
 命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4 的逗号分隔子集）、`--episodes`、`--seed`、
-`--device`、`--decision-interval`、`--replay-size`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数默认完整使用
-`EnvironmentConfig`；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
+`--device`、`--decision-interval`、`--replay-size`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数基于
+v7 对齐的蓝方专用默认配置；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
 
 ```json
 {
-  "max_steps": 24000,
   "scenario": {"red_cluster_radius_range_m": [140000.0, 150000.0]},
-  "missile": {"proportional_navigation_gain": 3.5}
+  "missile": {
+    "proportional_navigation_gain": 3.5,
+    "induced_drag_factor": 0.05,
+    "lethal_radius_m": 3.0
+  }
 }
 ```
 

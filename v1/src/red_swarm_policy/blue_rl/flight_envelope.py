@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 import math
 from typing import Any
 
@@ -95,6 +96,8 @@ class FlightEnvelopeConstraintLayer:
 
     def reset(self) -> None:
         self.previous_action = 0
+        self._constraint_key: tuple[object, ...] | None = None
+        self._constraint_cache: tuple[np.ndarray, dict[str, Any]] | None = None
 
     @staticmethod
     def _horizontal_metrics(velocity: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -251,12 +254,6 @@ class FlightEnvelopeConstraintLayer:
         target_commands = np.broadcast_to(
             BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[None, :, :], (count, count, 3)
         )
-        predicted_p = np.broadcast_to(
-            np.asarray(positions, dtype=np.float64)[:, None, :], (count, count, 3)
-        ).copy()
-        predicted_v = np.broadcast_to(
-            np.asarray(velocities, dtype=np.float64)[:, None, :], (count, count, 3)
-        ).copy()
         load_rate, roll_rate = self._command_rates_between(candidate_commands, target_commands)
         target_load = np.linalg.norm(target_commands[..., :2], axis=-1)
         path_feasible = (
@@ -266,13 +263,22 @@ class FlightEnvelopeConstraintLayer:
         )
         path_feasible[valid_now, :] = False
 
+        # Each candidate/recovery pair evolves independently. Keep the original
+        # lexicographic order, but stop integrating pairs already rejected or
+        # belonging to a candidate whose first recovery has been found.
+        candidate_indices, recovery_indices = np.nonzero(path_feasible)
+        predicted_p = np.asarray(positions, dtype=np.float64)[candidate_indices].copy()
+        predicted_v = np.asarray(velocities, dtype=np.float64)[candidate_indices].copy()
+        starts = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[candidate_indices]
+        targets = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[recovery_indices]
+
         remaining = self.config.heading_recovery_window_s
         elapsed = 0.0
-        while remaining > 1.0e-12 and np.any(path_feasible):
+        while remaining > 1.0e-12 and len(candidate_indices):
             dt = min(self.config.integration_step_s, remaining)
             fraction = min(1.0, (elapsed + dt) / self.config.action_prediction_s)
             applied_commands = self._interpolated_commands(
-                candidate_commands, target_commands, fraction
+                starts, targets, fraction
             )
             acceleration = self._accelerations_for_commands(predicted_v, applied_commands)
             predicted_p += predicted_v * dt + 0.5 * acceleration * dt * dt
@@ -280,7 +286,7 @@ class FlightEnvelopeConstraintLayer:
             speed, recovery_horizontal, recovery_ratio, recovery_fpa = self._horizontal_metrics(
                 predicted_v
             )
-            path_feasible &= (
+            physical_valid = (
                 (predicted_p[..., 1] >= min_altitude_m)
                 & (predicted_p[..., 1] <= max_altitude_m)
                 & (speed >= min_speed_mps)
@@ -291,14 +297,19 @@ class FlightEnvelopeConstraintLayer:
                 & (recovery_ratio >= self.config.minimum_horizontal_speed_ratio)
                 & (np.abs(recovery_fpa) <= self.config.maximum_flight_path_angle_deg)
             )
-            newly_recovered = path_feasible & heading_valid & ~recoverable[:, None]
-            recovered_candidates = np.flatnonzero(np.any(newly_recovered, axis=1))
-            for candidate in recovered_candidates:
-                recovery = int(np.flatnonzero(newly_recovered[candidate])[0])
-                recoverable[candidate] = True
-                recovery_time[candidate] = elapsed + dt
-                recovery_action[candidate] = recovery
-                path_feasible[candidate, :] = False
+            newly_recovered = np.flatnonzero(physical_valid & heading_valid)
+            if len(newly_recovered):
+                recovered_candidates, first = np.unique(
+                    candidate_indices[newly_recovered], return_index=True,
+                )
+                recoverable[recovered_candidates] = True
+                recovery_time[recovered_candidates] = elapsed + dt
+                recovery_action[recovered_candidates] = recovery_indices[newly_recovered[first]]
+            keep = physical_valid & ~recoverable[candidate_indices]
+            candidate_indices = candidate_indices[keep]
+            recovery_indices = recovery_indices[keep]
+            predicted_p, predicted_v = predicted_p[keep], predicted_v[keep]
+            starts, targets = starts[keep], targets[keep]
             elapsed += dt
             remaining -= dt
         return recoverable, recovery_time, recovery_action
@@ -314,6 +325,29 @@ class FlightEnvelopeConstraintLayer:
             return np.ones(count, dtype=bool), np.zeros(count), {"hard_mask_reasons": []}
 
         previous_action, previous_command = self._action_context(snapshot)
+        # Only the emergency gate changes between the controller's observation
+        # pass and selection pass. It changes soft weights, never the dynamics
+        # or hard mask. Key every physical input and the full constraint config.
+        key = (
+            self.config, tuple(position), tuple(velocity), previous_action,
+            tuple(previous_command),
+            float(snapshot.get("min_altitude_m", 8000.0)),
+            float(snapshot.get("max_altitude_m", 12000.0)),
+            float(snapshot.get("min_speed_mps", 100.0)),
+            float(snapshot.get("max_speed_mps", 600.0)),
+            float(snapshot.get("max_load_factor_g", 9.0)),
+        )
+        if key == self._constraint_key and self._constraint_cache is not None:
+            mask, cached_details = self._constraint_cache
+            details = deepcopy(cached_details)
+            emergency_gate = float(np.clip(snapshot.get("mechanism_emergency_gate", 0.0), 0.0, 1.0))
+            envelope_gate = 1.0 - 0.50 * emergency_gate
+            command_gate = 1.0 - 0.80 * emergency_gate
+            soft_cost = (details["altitude_cost"] + envelope_gate * details["envelope_cost"]
+                         + command_gate * details["command_cost"])
+            details.update(emergency_gate=emergency_gate, envelope_cost_gate=envelope_gate,
+                           command_cost_gate=command_gate)
+            return mask.copy(), soft_cost, details
         candidate_p, candidate_v = self._predict_repeated_action(
             position, velocity, self.config.action_prediction_s, previous_command
         )
@@ -433,6 +467,9 @@ class FlightEnvelopeConstraintLayer:
             "envelope_cost_gate": envelope_gate,
             "command_cost_gate": command_gate,
         }
+        # Own the cache storage: callers may freely mutate returned diagnostics.
+        self._constraint_key = key
+        self._constraint_cache = (effective_mask.copy(), deepcopy(details))
         return effective_mask, soft_cost, details
 
     def _predict_from_candidates(self, positions: np.ndarray, velocities: np.ndarray,

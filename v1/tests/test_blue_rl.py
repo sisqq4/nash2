@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -21,8 +22,16 @@ from red_swarm_policy.blue_rl import (
     RainbowDQNConfig,
     blue_observation_dim,
 )
-from red_swarm_policy.blue_rl.config_io import configure_blue_mission_duration
-from red_swarm_policy.env import EnvironmentConfig, ScenarioConfig
+from red_swarm_policy.blue_rl.config_io import (
+    configure_blue_mission_duration,
+    load_environment_config,
+)
+from red_swarm_policy.env import (
+    BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G,
+    EnvironmentConfig,
+    RedBlueEngagementEnv,
+    ScenarioConfig,
+)
 from red_swarm_policy.cli_utils import parse_missile_scenarios
 from red_swarm_policy.blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
@@ -52,18 +61,48 @@ class CountingPolicy(FixedPolicy):
         return self.action
 
 
+class BatchedValuePolicy:
+    def __init__(self, missile_slots: int = 3, action: int = 7) -> None:
+        self.config = RainbowDQNConfig(
+            blue_observation_dim("normalized_v4", missile_slots),
+            29,
+            observation_schema="normalized_v4",
+        )
+        self.action = action
+        self.batches: list[np.ndarray] = []
+
+    def expected_action_values(
+        self, observations: np.ndarray, *, evaluation: bool = True
+    ) -> np.ndarray:
+        assert evaluation
+        batch = np.asarray(observations, dtype=np.float32)
+        self.batches.append(batch.copy())
+        values = np.zeros((len(batch), 29), dtype=np.float64)
+        values[:, self.action] = 1.0
+        return values
+
+
 def short_config() -> EnvironmentConfig:
     base = EnvironmentConfig()
     return replace(base, max_steps=base.policy_entry_steps + 1)
 
 
-def test_blue_cli_duration_sets_mission_and_guidance_to_200_seconds() -> None:
+def test_blue_cli_defaults_match_v7_environment_contract() -> None:
+    general_defaults = EnvironmentConfig()
+    assert general_defaults.missile.induced_drag_factor == pytest.approx(0.08)
+    assert general_defaults.missile.lethal_radius_m == pytest.approx(5.0)
     config = configure_blue_mission_duration(EnvironmentConfig(
         scenario=ScenarioConfig(blue_altitude_range_m=(8000.0, 12000.0)),
     ))
-    assert config.max_steps * config.time_step_s == pytest.approx(200.0)
-    assert config.missile.max_guidance_time_s == pytest.approx(200.0)
-    assert config.scenario.blue_altitude_range_m == (9000.0, 11000.0)
+    assert config.max_steps * config.time_step_s == pytest.approx(180.0)
+    assert config.missile.max_guidance_time_s == pytest.approx(180.0)
+    assert config.scenario.blue_altitude_range_m == (8000.0, 12000.0)
+    defaults = load_environment_config(None)
+    assert defaults.missile.induced_drag_factor == pytest.approx(0.05)
+    assert defaults.missile.lethal_radius_m == pytest.approx(3.0)
+    adapter = BlueEscapeEnv(config=BlueEscapeEnvConfig(record_acmi=False))
+    assert adapter.environment_config.missile.induced_drag_factor == pytest.approx(0.05)
+    assert adapter.environment_config.missile.lethal_radius_m == pytest.approx(3.0)
 
 
 def test_rainbow_defaults_match_long_decision_horizon() -> None:
@@ -79,9 +118,11 @@ def test_blue_env_is_fixed_shape_and_uses_pure_pn(tmp_path) -> None:
     observation, info = env.reset(seed=3)
     assert observation.shape == (env.observation_dim,) == (12,)
     assert info["pure_pn"] is True
+    assert info["guidance_contract"] == "pure_proportional_navigation_vm_v1"
     _, _, terminated, truncated, info = env.step(0)
     assert terminated or truncated
     assert info["pure_pn"] is True
+    assert info["guidance_contract"] == "pure_proportional_navigation_vm_v1"
     assert np.allclose(env.inner.previous_action.red.guidance_bias, 0.0)
     assert (tmp_path / "episode_000001.acmi").is_file()
 
@@ -447,6 +488,80 @@ def test_emergency_gate_relaxes_only_soft_envelope_costs() -> None:
     assert emergency_details["command_cost_gate"] == pytest.approx(0.2)
 
 
+def test_envelope_gate_changes_reuse_cached_physical_prediction() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    snapshot = _envelope_snapshot(altitude=11_400.0, velocity=(300.0, 35.0, 0.0))
+    snapshot.update({
+        "previous_executed_action_index": 0,
+        "actual_load_command_body_g": [0.0, 1.0, 0.0],
+    })
+    with patch.object(
+        layer, "_predict_repeated_action", wraps=layer._predict_repeated_action
+    ) as predict:
+        for gate in (0.0, 0.25, 1.0, 0.5):
+            snapshot["mechanism_emergency_gate"] = gate
+            actual = layer.constraints(snapshot)
+            expected = FlightEnvelopeConstraintLayer(layer.config).constraints(snapshot)
+            np.testing.assert_array_equal(actual[0], expected[0])
+            np.testing.assert_allclose(actual[1], expected[1], rtol=2e-15, atol=2e-14)
+        assert predict.call_count == 1
+        layer.reset()
+        layer.constraints(snapshot)
+        assert predict.call_count == 2
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("blue_position_m", [1.0, 9_999.0, 2.0]),
+    ("blue_velocity_mps", [340.0, 10.0, 2.0]),
+    ("previous_executed_action_index", 4),
+    ("actual_load_command_body_g", [0.0, 2.0, 0.2]),
+    ("min_altitude_m", 8_100.0),
+    ("max_altitude_m", 11_900.0),
+    ("min_speed_mps", 101.0),
+    ("max_speed_mps", 599.0),
+    ("max_load_factor_g", 8.0),
+])
+def test_envelope_physical_inputs_invalidate_prediction_cache(field: str, value: object) -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    snapshot = _envelope_snapshot()
+    snapshot.update({
+        "previous_executed_action_index": 0,
+        "actual_load_command_body_g": [0.0, 1.0, 0.0],
+    })
+    with patch.object(
+        layer, "_predict_repeated_action", wraps=layer._predict_repeated_action
+    ) as predict:
+        layer.constraints(snapshot)
+        snapshot[field] = value
+        layer.constraints(snapshot)
+        assert predict.call_count == 2
+
+
+def test_envelope_callers_cannot_mutate_cached_results() -> None:
+    layer = FlightEnvelopeConstraintLayer()
+    snapshot = _envelope_snapshot()
+    snapshot.update({
+        "previous_executed_action_index": 0,
+        "actual_load_command_body_g": [0.0, 1.0, 0.0],
+    })
+    expected_mask, expected_cost, expected_details = layer.constraints(snapshot)
+    mask, cost, details = layer.constraints(snapshot)
+    mask[:] = False
+    cost[:] = 12_345.0
+    details["altitude_cost"][:] = 12_345.0
+    details["hard_checks"]["maximum_load"][:] = False
+    details["hard_mask_reasons"].append("mutated")
+
+    actual_mask, actual_cost, actual_details = layer.constraints(snapshot)
+    np.testing.assert_array_equal(actual_mask, expected_mask)
+    np.testing.assert_allclose(actual_cost, expected_cost, rtol=0.0, atol=0.0)
+    np.testing.assert_array_equal(
+        actual_details["hard_checks"]["maximum_load"],
+        expected_details["hard_checks"]["maximum_load"],
+    )
+    assert "mutated" not in actual_details["hard_mask_reasons"]
+
+
 def test_heading_recovery_rejects_frozen_acceleration_false_positive() -> None:
     layer = FlightEnvelopeConstraintLayer()
     velocity = np.array([-12.751093610092154, 328.06811387774457, 78.32180460216358])
@@ -575,7 +690,7 @@ def test_blue_reset_records_initial_geometry_and_orientation() -> None:
         "away_from_missile_swarm",
     }
     blue = initialization["blue_aircraft"][0]
-    assert 9000.0 <= blue["altitude_m"] <= 11000.0
+    assert 8000.0 <= blue["altitude_m"] <= 12000.0
     assert blue["flight_path_angle_deg"] == pytest.approx(0.0, abs=1.0e-12)
     assert blue["bank_angle_deg"] == pytest.approx(0.0, abs=1.0e-12)
     assert env.inner.state is not None
@@ -592,7 +707,9 @@ def test_controller_is_drop_in_discrete_policy() -> None:
     env.reset(seed=2)
     controller = BlueRLController(FixedPolicy(), cfg, BlueEscapeEnvConfig(missile_count=1))
     action = controller(env.inner.state)
-    assert action["action_indices"].tolist() == [0]
+    np.testing.assert_array_equal(
+        action["load_command_body_g"], BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[[0]]
+    )
 
 
 def test_blue_rl_waits_for_strict_60km_detection_before_maneuver_and_reward() -> None:
@@ -637,6 +754,63 @@ def test_blue_rl_waits_for_strict_60km_detection_before_maneuver_and_reward() ->
     )
 
 
+def test_normalized_v4_uses_v7_visible_nearest_slot_contract() -> None:
+    config = EnvironmentConfig()
+    env = BlueEscapeEnv(config, BlueEscapeEnvConfig(
+        missile_count=3,
+        max_missiles=3,
+        observation_schema="normalized_v4",
+        decision_interval_s=config.time_step_s,
+        record_acmi=False,
+    ))
+    env.reset(seed=11)
+    assert env.inner.state is not None
+    blue = env.inner.state.blue[0]
+    blue.position_m[:] = [0.0, 10_000.0, 0.0]
+    blue.velocity_mps[:] = [350.0, 0.0, 0.0]
+    for red, distance in zip(env.inner.state.red, (60_000.0, 50_000.0, 40_000.0)):
+        red.position_m[:] = [distance, 10_000.0, 0.0]
+        red.velocity_mps[:] = [-1_000.0, 0.0, 0.0]
+        red.alive = True
+
+    env.mechanism_estimator.reset()
+    env._policy_red_slots = ()
+    env._learning_active = False
+    assert env._activate_if_threat_observed()
+    env._mechanism_reward_state = env._refresh_mechanism_state()
+    observation = env._observation()
+
+    # Exactly 60 km is excluded; selected entities are compressed into policy
+    # slots while their original scenario order is retained.
+    assert env._policy_red_slots == (1, 2)
+    assert env._mechanism_snapshot()["red_positions_m"] == [
+        env.inner.state.red[1].position_m.tolist(),
+        env.inner.state.red[2].position_m.tolist(),
+    ]
+    np.testing.assert_array_equal(observation[6 + 2 * 13:6 + 3 * 13], np.zeros(13))
+    assert env._mechanism_reward_state["total_threat"] == pytest.approx(
+        env._mechanism_reward_state["raw_total_threat"]
+    )
+
+
+def test_visible_slot_remap_preserves_primary_entity_identity() -> None:
+    env = BlueEscapeEnv(EnvironmentConfig(), BlueEscapeEnvConfig(
+        missile_count=3, max_missiles=3, observation_schema="normalized_v4",
+        record_acmi=False,
+    ))
+    env.reset(seed=13)
+    env._policy_red_slots = (0, 1, 2)
+    env.mechanism_estimator.primary_slot = 1
+    env.mechanism_estimator.primary_candidate = 2
+    env.mechanism_estimator.primary_candidate_count = 2
+
+    env._remap_policy_slots((1, 2))
+
+    assert env.mechanism_estimator.primary_slot == 0
+    assert env.mechanism_estimator.primary_candidate == 1
+    assert env.mechanism_estimator.primary_candidate_count == 2
+
+
 def test_drop_in_controller_does_not_call_policy_before_detection() -> None:
     cfg = EnvironmentConfig()
     env = BlueEscapeEnv(cfg, BlueEscapeEnvConfig(missile_count=1, record_acmi=False))
@@ -645,17 +819,90 @@ def test_drop_in_controller_does_not_call_policy_before_detection() -> None:
     policy = CountingPolicy(action=7)
     controller = BlueRLController(policy, cfg, BlueEscapeEnvConfig(missile_count=1))
 
-    assert controller(env.inner.state)["action_indices"].tolist() == [0]
+    np.testing.assert_array_equal(
+        controller(env.inner.state)["load_command_body_g"],
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[[0]],
+    )
     assert policy.calls == 0
 
     blue, missile = env.inner.state.blue[0], env.inner.state.red[0]
     missile.position_m = blue.position_m + np.array([60000.0, 0.0, 0.0])
-    assert controller(env.inner.state)["action_indices"].tolist() == [0]
+    np.testing.assert_array_equal(
+        controller(env.inner.state)["load_command_body_g"],
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[[0]],
+    )
     assert policy.calls == 0
 
     missile.position_m = blue.position_m + np.array([59999.0, 0.0, 0.0])
-    assert controller(env.inner.state)["action_indices"].tolist() == [7]
+    action, decision = controller.action_for(env.inner.state)
+    assert decision is not None
+    assert decision.action_indices.tolist() == [7]
+    expected = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0] + (
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[7]
+        - BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
+    ) / controller.decision_steps
+    np.testing.assert_allclose(action["load_command_body_g"][0], expected)
     assert policy.calls == 1
+
+
+def test_controller_matches_v7_multi_aircraft_batch_and_interpolation_contract() -> None:
+    cfg = EnvironmentConfig(
+        scenario=ScenarioConfig(red_count=6, blue_count=2),
+    )
+    environment = RedBlueEngagementEnv(cfg, record_replay=False)
+    environment.reset(seed=21, start_mode="post_boost")
+    assert environment.state is not None
+    state = environment.state
+    for index, blue in enumerate(state.blue):
+        blue.position_m[:] = [0.0, 10_000.0, index * 200_000.0]
+        blue.velocity_mps[:] = [350.0, 0.0, 0.0]
+    for index, red in enumerate(state.red):
+        group = index // 3
+        red.position_m[:] = [50_000.0 - 10_000.0 * (index % 3), 10_000.0,
+                             group * 200_000.0]
+        red.velocity_mps[:] = [-1_000.0, 0.0, 0.0]
+        red.alive = True
+
+    policy = BatchedValuePolicy()
+    controller = BlueRLController(
+        policy,
+        cfg,
+        BlueEscapeEnvConfig(
+            missile_count=3,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    initial_step = state.step_count
+    action, decision = controller.action_for(state)
+
+    assert decision is not None
+    assert decision.modes == ("rainbow", "rainbow")
+    assert decision.diagnostics[0]["red_indices"] == [0, 1, 2]
+    assert decision.diagnostics[1]["red_indices"] == [3, 4, 5]
+    assert policy.batches[0].shape == (2, blue_observation_dim("normalized_v4", 3))
+    assert controller._memories[0] is not controller._memories[1]
+    expected_first = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0] + (
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[decision.action_indices]
+        - BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
+    ) / controller.decision_steps
+    np.testing.assert_allclose(action["load_command_body_g"], expected_first)
+
+    repeated, update = controller.action_for(state)
+    assert update is None
+    np.testing.assert_array_equal(
+        repeated["load_command_body_g"], action["load_command_body_g"]
+    )
+    state.step_count = initial_step + controller.decision_steps - 1
+    held, update = controller.action_for(state)
+    assert update is None
+    np.testing.assert_allclose(
+        held["load_command_body_g"],
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[decision.action_indices],
+    )
+    statistics = controller.runtime_statistics()
+    assert statistics["decision_count"] == 1
+    assert statistics["aircraft_decisions"] == 2
 
 
 def test_acmi_writes_explicit_upright_initial_aircraft_attitude(tmp_path) -> None:

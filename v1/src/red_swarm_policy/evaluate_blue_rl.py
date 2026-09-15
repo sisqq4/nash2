@@ -24,6 +24,7 @@ from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, Evaluatio
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.episode_telemetry import write_evaluation_metadata
 from .cli_utils import parse_missile_scenarios
+from .env import GUIDANCE_CONTRACT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -213,7 +214,8 @@ def main() -> int:
     recording_metadata = write_evaluation_metadata(
         recording_metadata_path, checkpoint=Path(args.checkpoint),
         environment_config=asdict(environment_config), adapter_config=asdict(config),
-        evaluation_options={**vars(args), "flight_envelope_config": asdict(envelope_config),
+        evaluation_options={**vars(args), "guidance_contract": GUIDANCE_CONTRACT,
+                            "flight_envelope_config": asdict(envelope_config),
                             "numpy_version": np.__version__, "torch_version": str(torch.__version__)},
     )
     pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
@@ -237,6 +239,7 @@ def main() -> int:
            "parallel_cpu_envs": pool_size, "env_worker_threads": args.env_worker_threads,
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
+           "guidance_contract": GUIDANCE_CONTRACT,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
            "recording_metadata_path": str(recording_metadata_path),
@@ -465,6 +468,7 @@ def main() -> int:
         sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
         baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
     summary = {"episodes": args.episodes, "missile_scenarios": list(missile_scenarios),
+               "guidance_contract": GUIDANCE_CONTRACT,
                "survival_rate": statistics["survival_rate"], "statistics": statistics,
                "by_blue_orientation": by_blue_orientation,
                "by_scenario": by_scenario, "parallel_envs": pool_size,

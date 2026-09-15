@@ -3,22 +3,20 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 import numpy as np
 import torch
 
+from .blue_rl.config_io import default_blue_environment_config
 from .env import (
     BlueEvasionConfig,
     BlueEvasionController,
     BlueEvasionRuleMachine,
-    EnvironmentConfig,
     RedBlueEngagementEnv,
     SCENARIO_STYLES,
-    ScenarioConfig,
     ScenarioStyle,
-    SensorConfig,
 )
 
 
@@ -32,6 +30,7 @@ class BlueEvasionRunSummary:
     done: bool
     blue_survivors: int
     red_survivors: int
+    blue_rule_statistics: dict[str, object]
     final_info: dict[str, object]
 
     def output_record(self) -> dict[str, object]:
@@ -45,6 +44,7 @@ class BlueEvasionRunSummary:
             "done": self.done,
             "blue_survivors": self.blue_survivors,
             "red_survivors": self.red_survivors,
+            "blue_rule_statistics": self.blue_rule_statistics,
             "final_info": self.final_info,
         }
 
@@ -100,6 +100,11 @@ def run_blue_evasion_episode(
         done=done,
         blue_survivors=sum(blue.alive for blue in state.blue),
         red_survivors=sum(red.alive for red in state.red),
+        blue_rule_statistics=(
+            controller.rule_machine.runtime_statistics()
+            if isinstance(controller, BlueEvasionController)
+            else controller.runtime_statistics()
+        ),
         final_info=final_info,
     )
 
@@ -132,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookahead-s", type=float, default=6.0)
     parser.add_argument("--blue-policy", choices=("rule", "rainbow"), default="rule")
     parser.add_argument("--blue-checkpoint", default=None)
+    parser.add_argument(
+        "--blue-rule-execution-backend",
+        choices=("reference", "vectorized_guarded", "shadow"),
+        default="vectorized_guarded",
+    )
     return parser
 
 
@@ -142,8 +152,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--red-count and --blue-count must be positive")
     if args.blue_policy == "rainbow" and args.blue_checkpoint is None:
         parser.error("--blue-checkpoint is required when --blue-policy=rainbow")
-    if args.blue_policy == "rainbow" and (args.blue_count != 1 or args.red_count > 4):
-        parser.error("Rainbow blue checkpoints support one blue aircraft and one to four missiles")
     if args.duration_s <= 0.0 or args.time_step_s <= 0.0:
         parser.error("--duration-s and --time-step-s must be positive")
     duration_ratio = args.duration_s / args.time_step_s
@@ -151,26 +159,25 @@ def main(argv: list[str] | None = None) -> int:
     if not math.isclose(duration_ratio, duration_steps, rel_tol=0.0, abs_tol=1.0e-9):
         parser.error("--duration-s must be an integer multiple of --time-step-s")
 
-    base_config = EnvironmentConfig()
+    # This is a blue-policy test entry point, so use the v7-matched blue-only
+    # physical defaults without changing v1's red-training EnvironmentConfig.
+    base_config = default_blue_environment_config()
     max_steps = duration_steps
     if args.start_mode == "post_boost":
         max_steps += int(round(base_config.missile.boost_duration_s / args.time_step_s))
-    environment_config = EnvironmentConfig(
+    environment_config = replace(
+        base_config,
         time_step_s=args.time_step_s,
-        bias_update_interval_s=0.1,
-        assignment_update_interval_s=1.0,
         max_steps=max_steps,
         policy_start_mode=args.start_mode,
-        scenario=ScenarioConfig(
+        scenario=replace(
+            base_config.scenario,
             red_count=args.red_count,
             blue_count=args.blue_count,
-            blue_altitude_range_m=(
-                (9000.0, 11000.0)
-                if args.blue_policy == "rainbow"
-                else ScenarioConfig().blue_altitude_range_m
-            ),
         ),
-        sensor=SensorConfig(detection_range_m=args.detection_range_m),
+        sensor=replace(
+            base_config.sensor, detection_range_m=args.detection_range_m
+        ),
     )
     evasion_config = BlueEvasionConfig(
         decision_interval_s=args.decision_interval_s,
@@ -186,33 +193,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.blue_policy == "rule":
         controller = BlueEvasionController(
-            BlueEvasionRuleMachine(environment_config, evasion_config)
+            BlueEvasionRuleMachine(
+                environment_config,
+                evasion_config,
+                execution_backend=args.blue_rule_execution_backend,
+            )
         )
     else:
         from .blue_rl import (BlueEscapeEnvConfig, BlueRLController, RainbowDQNAgent,
                               blue_observation_dim)
 
         agent = RainbowDQNAgent.load(args.blue_checkpoint, str(device))
-        schema_dimensions = {
-            schema: blue_observation_dim(schema, args.red_count)
-            for schema in ("legacy_v1", "normalized_v2", "normalized_v3", "normalized_v4")
-        }
         checkpoint_schema = agent.config.observation_schema
-        if (checkpoint_schema in schema_dimensions
-                and agent.config.observation_dim == schema_dimensions[checkpoint_schema]):
-            observation_schema = checkpoint_schema
-        else:
+        checkpoint_slots = [
+            count
+            for count in range(1, 5)
+            if blue_observation_dim(checkpoint_schema, count)
+            == agent.config.observation_dim
+        ]
+        if len(checkpoint_slots) != 1:
             parser.error(
                 f"checkpoint expects observation_dim={agent.config.observation_dim}, "
-                f"but --red-count={args.red_count} requires one of {schema_dimensions}"
+                "which is not a valid v1 one-to-four-threat observation"
             )
         controller = BlueRLController(
             agent,
             environment_config,
             BlueEscapeEnvConfig(
-                missile_count=args.red_count,
-                observation_schema=observation_schema,
+                missile_count=checkpoint_slots[0],
+                observation_schema=checkpoint_schema,
                 decision_interval_s=args.decision_interval_s,
+                threat_detection_range_m=args.detection_range_m,
                 record_acmi=False,
             ),
         )

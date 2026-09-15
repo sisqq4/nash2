@@ -8,8 +8,27 @@ from typing import Any, TypeVar
 from ..env.types import EnvironmentConfig
 
 T = TypeVar("T")
-BLUE_MISSION_DURATION_S = 200.0
-BLUE_INITIAL_ALTITUDE_RANGE_M = (9000.0, 11000.0)
+BLUE_MISSION_DURATION_S = 180.0
+BLUE_INITIAL_ALTITUDE_RANGE_M = (8000.0, 12000.0)
+BLUE_MISSILE_INDUCED_DRAG_FACTOR = 0.05
+BLUE_MISSILE_LETHAL_RADIUS_M = 3.0
+
+
+def default_blue_environment_config() -> EnvironmentConfig:
+    """Return v7-compatible defaults without changing v1 red-training defaults."""
+    config = EnvironmentConfig()
+    return replace(
+        config,
+        missile=replace(
+            config.missile,
+            induced_drag_factor=BLUE_MISSILE_INDUCED_DRAG_FACTOR,
+            lethal_radius_m=BLUE_MISSILE_LETHAL_RADIUS_M,
+        ),
+        scenario=replace(
+            config.scenario,
+            blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M,
+        ),
+    )
 
 
 def _replace_dataclass(instance: T, values: dict[str, Any], path: str) -> T:
@@ -30,8 +49,8 @@ def _replace_dataclass(instance: T, values: dict[str, Any], path: str) -> T:
 
 
 def load_environment_config(path: str | None) -> EnvironmentConfig:
-    """Load validated, nested overrides while retaining every v1 default."""
-    config = EnvironmentConfig()
+    """Load overrides on top of the v7-compatible Blue training defaults."""
+    config = default_blue_environment_config()
     if path is not None:
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(raw, dict):

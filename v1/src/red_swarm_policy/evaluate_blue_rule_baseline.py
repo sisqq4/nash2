@@ -26,6 +26,7 @@ from .blue_rl import BlueEscapeEnv, BlueEscapeEnvConfig
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .cli_utils import parse_missile_scenarios
 from .env import BlueEvasionConfig, BlueEvasionRuleMachine
+from .env import GUIDANCE_CONTRACT
 from .evaluate_blue_rl import _aggregate_results
 
 DEFAULT_SEED_START = 20271000
@@ -44,6 +45,12 @@ def build_parser() -> argparse.ArgumentParser:
                         default=DEFAULT_EPISODES_PER_SCENARIO)
     parser.add_argument("--missiles", default="1,2,3,4")
     parser.add_argument("--decision-interval", type=float, default=0.1)
+    parser.add_argument(
+        "--blue-rule-execution-backend",
+        choices=("reference", "vectorized_guarded", "shadow"),
+        default="vectorized_guarded",
+        help="Rule scorer backend; guarded vectorization is v7's production default",
+    )
     parser.add_argument("--env-config", default=None)
     parser.add_argument("--acmi-interval", type=int, default=0)
 
@@ -66,11 +73,12 @@ def _mark_as_blue_rule_baseline(summary: dict[str, object]) -> None:
         "baseline": True,
         "purpose": "measure_intelligent_game_strategy_effect",
         "blue_policy": "BlueEvasionRuleMachine",
-        "red_policy": "fixed_target_zero_residual_proportional_navigation",
+        "red_policy": "fixed_target_zero_residual_pure_proportional_navigation",
         "blue_learning_enabled": False,
         "red_learning_enabled": False,
         "blue_checkpoint": None,
         "red_checkpoint": None,
+        "guidance_contract": GUIDANCE_CONTRACT,
     })
 
 
@@ -141,6 +149,7 @@ def _run_episode(env: BlueEscapeEnv, rule: BlueEvasionRuleMachine, *, episode: i
         "action_histogram": {str(key): value for key, value in sorted(action_counts.items())},
         "blue_mode_counts": dict(sorted(blue_mode_counts.items())),
         "reward_component_sums": dict(reward_components),
+        "blue_rule_runtime_statistics": rule.runtime_statistics(),
     }
 
 
@@ -148,7 +157,9 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
              decision_interval_s: float, env_config: str | None, acmi_interval: int,
 
              output: Path, log_interval: int = 1,
-             jsonl_path: Path | None = None) -> tuple[dict[str, object], list[dict[str, object]]]:
+             jsonl_path: Path | None = None,
+             execution_backend: str = "vectorized_guarded",
+             ) -> tuple[dict[str, object], list[dict[str, object]]]:
 
     if episodes_per_scenario < 1:
         raise ValueError("episodes-per-scenario must be positive")
@@ -171,6 +182,7 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
     rule = BlueEvasionRuleMachine(
         environment_config,
         BlueEvasionConfig(decision_interval_s=decision_interval_s),
+        execution_backend=execution_backend,
     )
     rows: list[dict[str, object]] = []
     for scenario_index, missile_count in enumerate(missile_counts):
@@ -206,6 +218,7 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
             "seed_schedule": "contiguous globally in listed scenario order",
             "decision_interval_s": decision_interval_s,
             "environment": "BlueEscapeEnv",
+            "blue_rule_execution_backend": execution_backend,
         },
         "statistics": _aggregate_results(rows),
         "by_scenario": by_scenario,
@@ -239,6 +252,7 @@ def main(argv: list[str] | None = None) -> int:
             env_config=args.env_config, acmi_interval=args.acmi_interval, output=args.output,
 
             log_interval=args.log_interval, jsonl_path=progress_path,
+            execution_backend=args.blue_rule_execution_backend,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error

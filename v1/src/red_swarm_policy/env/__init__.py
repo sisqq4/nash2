@@ -3,7 +3,7 @@ from __future__ import annotations
 from .adjudication import AdjudicationLayer
 from .decision import IntelligentDecisionLayer
 from .environment import RedBlueEngagementEnv
-from .guidance import ProportionalNavigationGuidance
+from .guidance import GUIDANCE_CONTRACT, ProportionalNavigationGuidance
 from .math_utils import EAST_AXIS, NORTH_AXIS, UP_AXIS
 from .observation import ObservationLayer
 from .actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G, blue_aircraft_load_commands_body_g
@@ -68,6 +68,7 @@ __all__ = [
     "EnvironmentObservation",
     "EnvironmentStep",
     "EAST_AXIS",
+    "GUIDANCE_CONTRACT",
     "IntelligentDecisionLayer",
     "JointAction",
     "MissileConfig",

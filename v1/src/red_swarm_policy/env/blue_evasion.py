@@ -1,14 +1,65 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
 from .actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
+from .blue_evasion_kernel import (
+    propagate_aircraft_candidates,
+    score_aircraft_candidates,
+)
 from .math_utils import EPS, G0, UP_AXIS, norm
 from .physics import ThreeDoFPhysicsLayer
 from .types import EngagementState, EnvironmentConfig, ThreeDoFState
+
+
+BlueEvasionExecutionBackend = Literal[
+    "reference",
+    "vectorized_guarded",
+    "shadow",
+]
+BLUE_EVASION_EXECUTION_BACKENDS = (
+    "reference",
+    "vectorized_guarded",
+    "shadow",
+)
+
+
+@dataclass
+class BlueEvasionRuntimeStats:
+    decision_count: int = 0
+    threatened_blue_count: int = 0
+    reference_fallback_count: int = 0
+    near_tie_fallback_count: int = 0
+    nonfinite_fallback_count: int = 0
+    shadow_action_mismatch_count: int = 0
+    max_score_abs_error: float = 0.0
+    min_top2_margin: float = math.inf
+    candidate_kernel_seconds: float = 0.0
+    reference_seconds: float = 0.0
+
+    def output_record(self, backend: str) -> dict[str, object]:
+        return {
+            "execution_backend": backend,
+            "decision_count": self.decision_count,
+            "threatened_blue_count": self.threatened_blue_count,
+            "reference_fallback_count": self.reference_fallback_count,
+            "near_tie_fallback_count": self.near_tie_fallback_count,
+            "nonfinite_fallback_count": self.nonfinite_fallback_count,
+            "shadow_action_mismatch_count": self.shadow_action_mismatch_count,
+            "max_score_abs_error": self.max_score_abs_error,
+            "min_top2_margin": (
+                self.min_top2_margin
+                if math.isfinite(self.min_top2_margin)
+                else None
+            ),
+            "candidate_kernel_seconds": self.candidate_kernel_seconds,
+            "reference_seconds": self.reference_seconds,
+        }
 
 
 @dataclass(frozen=True)
@@ -119,19 +170,74 @@ class BlueEvasionRuleMachine:
         self,
         environment: EnvironmentConfig,
         config: BlueEvasionConfig = BlueEvasionConfig(),
+        *,
+        execution_backend: BlueEvasionExecutionBackend = "vectorized_guarded",
     ) -> None:
         environment.validate()
         config.validate(environment)
+        if execution_backend not in BLUE_EVASION_EXECUTION_BACKENDS:
+            raise ValueError(
+                "execution_backend must be reference, vectorized_guarded, or shadow"
+            )
         self.environment = environment
         self.config = config
+        self.execution_backend = execution_backend
         self.decision_steps = int(round(config.decision_interval_s / environment.time_step_s))
         self._physics = ThreeDoFPhysicsLayer(environment)
         self._previous_indices: np.ndarray | None = None
+        self._runtime_stats = BlueEvasionRuntimeStats()
+        commands = np.asarray(
+            BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G,
+            dtype=np.float64,
+        ).copy()
+        axial_acceleration = commands[:, 0] * G0
+        normal_acceleration = commands[:, 1] * G0
+        cos_bank = np.array(
+            [math.cos(float(command[2])) for command in commands],
+            dtype=np.float64,
+        )
+        sin_bank = np.array(
+            [math.sin(float(command[2])) for command in commands],
+            dtype=np.float64,
+        )
+        max_load_factor_g = environment.aircraft.max_load_factor_g
+        action_effort = np.array(
+            [
+                (
+                    abs(float(command[0])) / max_load_factor_g
+                    + abs(float(command[1]) - 1.0) / max(max_load_factor_g - 1.0, 1.0)
+                    + abs(float(command[2])) / math.pi
+                )
+                / 3.0
+                for command in commands
+            ],
+            dtype=np.float64,
+        )
+        for values in (
+            commands,
+            axial_acceleration,
+            normal_acceleration,
+            cos_bank,
+            sin_bank,
+            action_effort,
+        ):
+            values.setflags(write=False)
+        self._commands = commands
+        self._axial_acceleration_mps2 = axial_acceleration
+        self._normal_acceleration_mps2 = normal_acceleration
+        self._cos_bank = cos_bank
+        self._sin_bank = sin_bank
+        self._action_effort = action_effort
 
     def reset(self) -> None:
         self._previous_indices = None
+        self._runtime_stats = BlueEvasionRuntimeStats()
+
+    def runtime_statistics(self) -> dict[str, object]:
+        return self._runtime_stats.output_record(self.execution_backend)
 
     def decide(self, state: EngagementState) -> BlueEvasionDecision:
+        self._runtime_stats.decision_count += 1
         n_blue = len(state.blue)
         previous = self._previous_indices
         if previous is None or previous.shape != (n_blue,):
@@ -155,24 +261,17 @@ class BlueEvasionRuleMachine:
                 modes.append(mode)
                 continue
 
+            self._runtime_stats.threatened_blue_count += 1
             primary = max(threats, key=lambda item: (item.severity, -item.range_m, -item.red_index))
             primary_indices[blue_index] = primary.red_index
             primary_ranges[blue_index] = primary.range_m
             primary_closing[blue_index] = primary.closing_speed_mps
-            scores = np.array(
-                [
-                    self._score_action(
-                        state,
-                        blue_index,
-                        threats,
-                        action_index,
-                        int(previous[blue_index]),
-                    )
-                    for action_index in range(len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G))
-                ],
-                dtype=np.float64,
+            scores, action_index = self._score_and_select_actions(
+                state,
+                blue_index,
+                threats,
+                int(previous[blue_index]),
             )
-            action_index = int(np.argmax(scores))
             indices[blue_index] = action_index
             selected_scores[blue_index] = scores[action_index]
             critical = (
@@ -196,6 +295,200 @@ class BlueEvasionRuleMachine:
             primary_closing_speeds_mps=primary_closing,
             selected_scores=selected_scores,
         )
+
+    def _score_and_select_actions(
+        self,
+        state: EngagementState,
+        blue_index: int,
+        threats: list[BlueThreatAssessment],
+        previous_index: int,
+    ) -> tuple[np.ndarray, int]:
+        if self.execution_backend == "reference":
+            scores = self._timed_reference_scores(
+                state,
+                blue_index,
+                threats,
+                previous_index,
+            )
+            return scores, int(np.argmax(scores))
+
+        started = time.perf_counter()
+        vectorized_scores = self._score_all_actions_vectorized(
+            state,
+            blue_index,
+            threats,
+            previous_index,
+        )
+        self._runtime_stats.candidate_kernel_seconds += time.perf_counter() - started
+        vectorized_index, near_tie, nonfinite = self._guarded_argmax(vectorized_scores)
+
+        if self.execution_backend == "shadow":
+            reference_scores = self._timed_reference_scores(
+                state,
+                blue_index,
+                threats,
+                previous_index,
+            )
+            reference_index = int(np.argmax(reference_scores))
+            finite = np.isfinite(reference_scores) & np.isfinite(vectorized_scores)
+            if np.any(finite):
+                self._runtime_stats.max_score_abs_error = max(
+                    self._runtime_stats.max_score_abs_error,
+                    float(np.max(np.abs(reference_scores[finite] - vectorized_scores[finite]))),
+                )
+            if vectorized_index != reference_index:
+                self._runtime_stats.shadow_action_mismatch_count += 1
+            if near_tie or nonfinite:
+                self._record_reference_fallback(near_tie=near_tie, nonfinite=nonfinite)
+            return reference_scores, reference_index
+
+        if near_tie or nonfinite:
+            self._record_reference_fallback(near_tie=near_tie, nonfinite=nonfinite)
+            reference_scores = self._timed_reference_scores(
+                state,
+                blue_index,
+                threats,
+                previous_index,
+            )
+            finite = np.isfinite(reference_scores) & np.isfinite(vectorized_scores)
+            if np.any(finite):
+                self._runtime_stats.max_score_abs_error = max(
+                    self._runtime_stats.max_score_abs_error,
+                    float(np.max(np.abs(reference_scores[finite] - vectorized_scores[finite]))),
+                )
+            return reference_scores, int(np.argmax(reference_scores))
+        return vectorized_scores, vectorized_index
+
+    def _timed_reference_scores(
+        self,
+        state: EngagementState,
+        blue_index: int,
+        threats: list[BlueThreatAssessment],
+        previous_index: int,
+    ) -> np.ndarray:
+        started = time.perf_counter()
+        scores = self._score_all_actions_reference(
+            state,
+            blue_index,
+            threats,
+            previous_index,
+        )
+        self._runtime_stats.reference_seconds += time.perf_counter() - started
+        return scores
+
+    def _score_all_actions_reference(
+        self,
+        state: EngagementState,
+        blue_index: int,
+        threats: list[BlueThreatAssessment],
+        previous_index: int,
+    ) -> np.ndarray:
+        return np.array(
+            [
+                self._score_action(
+                    state,
+                    blue_index,
+                    threats,
+                    action_index,
+                    previous_index,
+                )
+                for action_index in range(len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G))
+            ],
+            dtype=np.float64,
+        )
+
+    def _score_all_actions_vectorized(
+        self,
+        state: EngagementState,
+        blue_index: int,
+        threats: list[BlueThreatAssessment],
+        previous_index: int,
+    ) -> np.ndarray:
+        blue = state.blue[blue_index]
+        aircraft = self.environment.aircraft
+        predicted_position, predicted_velocity = propagate_aircraft_candidates(
+            blue.position_m,
+            blue.velocity_mps,
+            axial_acceleration_mps2=self._axial_acceleration_mps2,
+            normal_acceleration_mps2=self._normal_acceleration_mps2,
+            cos_bank=self._cos_bank,
+            sin_bank=self._sin_bank,
+            time_step_s=self.environment.time_step_s,
+            decision_steps=self.decision_steps,
+            min_speed_mps=aircraft.min_speed_mps,
+            max_speed_mps=aircraft.max_speed_mps,
+            min_altitude_m=aircraft.min_altitude_m,
+            max_altitude_m=aircraft.max_altitude_m,
+        )
+        red_position = np.array(
+            [state.red[threat.red_index].position_m for threat in threats],
+            dtype=np.float64,
+        )
+        red_velocity = np.array(
+            [state.red[threat.red_index].velocity_mps for threat in threats],
+            dtype=np.float64,
+        )
+        severity = np.array(
+            [threat.severity for threat in threats],
+            dtype=np.float64,
+        )
+        return score_aircraft_candidates(
+            original_velocity_mps=blue.velocity_mps,
+            predicted_position_m=predicted_position,
+            predicted_velocity_mps=predicted_velocity,
+            red_position_m=red_position,
+            red_velocity_mps=red_velocity,
+            threat_severity=severity,
+            action_effort=self._action_effort,
+            previous_index=previous_index,
+            decision_interval_s=self.config.decision_interval_s,
+            lookahead_s=self.config.lookahead_s,
+            critical_range_m=self.config.critical_range_m,
+            detection_range_m=self.config.detection_range_m,
+            max_load_factor_g=aircraft.max_load_factor_g,
+            effort_penalty=self.config.effort_penalty,
+            switch_penalty=self.config.switch_penalty,
+            min_altitude_m=aircraft.min_altitude_m,
+            max_altitude_m=aircraft.max_altitude_m,
+            altitude_margin_m=self.config.altitude_margin_m,
+            altitude_prediction_s=self.config.altitude_prediction_s,
+            min_speed_mps=aircraft.min_speed_mps,
+            max_speed_mps=aircraft.max_speed_mps,
+            speed_margin_mps=self.config.speed_margin_mps,
+        )
+
+    def _guarded_argmax(self, scores: np.ndarray) -> tuple[int, bool, bool]:
+        values = np.asarray(scores, dtype=np.float64)
+        finite = bool(np.all(np.isfinite(values)))
+        if not finite:
+            return 0, False, True
+        best_index = int(np.argmax(values))
+        if values.size < 2:
+            return best_index, False, False
+        second_score = float(np.max(np.delete(values, best_index)))
+        best_score = float(values[best_index])
+        margin = best_score - second_score
+        self._runtime_stats.min_top2_margin = min(
+            self._runtime_stats.min_top2_margin,
+            margin,
+        )
+        tolerance = max(
+            1.0e-12,
+            1.0e-10 * max(abs(best_score), abs(second_score), 1.0),
+        )
+        return best_index, margin <= 2.0 * tolerance, False
+
+    def _record_reference_fallback(
+        self,
+        *,
+        near_tie: bool,
+        nonfinite: bool,
+    ) -> None:
+        self._runtime_stats.reference_fallback_count += 1
+        if near_tie:
+            self._runtime_stats.near_tie_fallback_count += 1
+        if nonfinite:
+            self._runtime_stats.nonfinite_fallback_count += 1
 
     def _assess_threats(
         self,

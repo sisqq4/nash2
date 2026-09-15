@@ -8,8 +8,10 @@ import numpy as np
 
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.environment import RedBlueEngagementEnv
+from ..env.guidance import GUIDANCE_CONTRACT
 from ..env.types import EnvironmentConfig, RedAction
 from .acmi import AcmiRecorder
+from .config_io import default_blue_environment_config
 from .flight_envelope import FlightEnvelopeConstraintLayer
 from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfig,
                                encode_normalized_v4, mechanism_observation_dim)
@@ -54,7 +56,7 @@ class BlueEscapeEnvConfig:
     observation_schema: str = "legacy_v1"
     decision_interval_s: float = 0.1
     threat_detection_range_m: float = 60000.0
-    initial_altitude_range_m: tuple[float, float] = (9000.0, 11000.0)
+    initial_altitude_range_m: tuple[float, float] = (8000.0, 12000.0)
     record_acmi: bool = True
     acmi_episode_interval: int = 1
     acmi_directory: str = "outputs/blue_rl/acmi"
@@ -125,14 +127,17 @@ class BlueEscapeEnv:
     """Separated Gym-like blue training env backed by the unchanged v1 simulation.
 
     Red missiles are always assigned to the sole blue aircraft with exactly zero
-    residual bias. Consequently the existing physics layer supplies pure PN and
-    no red actor, critic, high-level assignment policy, or low-level policy runs.
+    residual bias. Consequently the shared physics layer supplies strict 3-D
+    pure proportional navigation (PPN), and no red actor, critic, high-level
+    assignment policy, or low-level policy runs.
     """
 
-    def __init__(self, environment_config: EnvironmentConfig = EnvironmentConfig(),
+    def __init__(self, environment_config: EnvironmentConfig | None = None,
                  config: BlueEscapeEnvConfig = BlueEscapeEnvConfig()) -> None:
+        if environment_config is None:
+            environment_config = default_blue_environment_config()
         # Blue-RL scenarios have a deliberately narrower launch-altitude
-        # contract than the general engagement environment.
+        # contract than an explicitly supplied general engagement environment.
         environment_config = replace(
             environment_config,
             scenario=replace(
@@ -149,6 +154,7 @@ class BlueEscapeEnv:
         # multi-scenario run pads missing missile slots to max_missiles so one
         # policy can consume every selected scenario.
         slots = config.max_missiles if config.pad_observation_to_max_missiles else config.missile_count
+        self._policy_slot_count = slots
         self.observation_dim = blue_observation_dim(config.observation_schema, slots)
         self.action_dim = len(BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G)
         self.recorder = AcmiRecorder(); self.episode = 0
@@ -161,6 +167,7 @@ class BlueEscapeEnv:
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self.mechanism_estimator = BlueMechanismStateEstimator(config.mechanism_reward)
         self._mechanism_reward_state: dict[str, object] = {}
+        self._policy_red_slots: tuple[int, ...] = ()
         self._telemetry_red_alive: list[bool] = []
         self._red_termination_events: list[dict[str, object]] = []
 
@@ -194,10 +201,11 @@ class BlueEscapeEnv:
         self._previous_executed_action_index = 0
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self.mechanism_estimator.reset()
-        self._mechanism_reward_state = self.mechanism_estimator.observe(
-            self._mechanism_snapshot(), self._structural_action_mask()
-        )
+        self._policy_red_slots = ()
+        self._mechanism_reward_state = self._neutral_mechanism_state()
         self._activate_if_threat_observed()
+        if self._learning_active:
+            self._mechanism_reward_state = self._refresh_mechanism_state()
         self._previous_potential = (
             self._joint_potential(self._mechanism_reward_state)
             if self._learning_active else self._zero_joint_potential()
@@ -205,7 +213,9 @@ class BlueEscapeEnv:
         info = {
             "time_s": self.inner.state.time_s,
             "pure_pn": True,
+            "guidance_contract": GUIDANCE_CONTRACT,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
+            "policy_red_indices": list(self._policy_red_slots),
             "initialization": self._initialization_snapshot(),
             "flight_quality_state": self._flight_quality_snapshot(),
             "reward_mechanism_state": dict(self._mechanism_reward_state),
@@ -216,18 +226,68 @@ class BlueEscapeEnv:
             info["mechanism_state"] = self._mechanism_snapshot()
         return self._observation(), info
 
-    def _mechanism_snapshot(self) -> dict[str, object]:
+    def _visible_red_slots(self) -> tuple[int, ...]:
+        """Select v7's nearest, detected threats, preserving entity order."""
+        assert self.inner.state is not None
+        blue = self.inner.state.blue[0]
+        distances = [
+            (float(np.linalg.norm(red.position_m - blue.position_m)), index)
+            for index, red in enumerate(self.inner.state.red)
+            if red.alive
+        ]
+        nearest = sorted(
+            (distance, index)
+            for distance, index in distances
+            if distance < self.config.threat_detection_range_m
+        )
+        return tuple(sorted(index for _, index in nearest[:self._policy_slot_count]))
+
+    def _remap_policy_slots(self, slots: tuple[int, ...]) -> None:
+        """Keep estimator threat identity stable when visible slots change."""
+        for name in ("primary_slot", "primary_candidate"):
+            old_local = getattr(self.mechanism_estimator, name)
+            entity = (
+                self._policy_red_slots[old_local]
+                if old_local is not None and old_local < len(self._policy_red_slots)
+                else None
+            )
+            new_local = slots.index(entity) if entity in slots else None
+            setattr(self.mechanism_estimator, name, new_local)
+            if name == "primary_candidate" and new_local is None:
+                self.mechanism_estimator.primary_candidate_count = 0
+        self._policy_red_slots = slots
+
+    def _refresh_mechanism_state(self) -> dict[str, object]:
+        slots = self._visible_red_slots()
+        self._remap_policy_slots(slots)
+        return self.mechanism_estimator.observe(
+            self._mechanism_snapshot(), self._structural_action_mask()
+        )
+
+    def _neutral_mechanism_state(self) -> dict[str, object]:
+        """Build diagnostics without advancing the deployment-matched estimator."""
+        neutral = BlueMechanismStateEstimator(self.config.mechanism_reward)
+        return neutral.observe(
+            self._mechanism_snapshot(()), self._structural_action_mask()
+        )
+
+    def _mechanism_snapshot(
+        self,
+        red_slots: tuple[int, ...] | None = None,
+    ) -> dict[str, object]:
         """Expose physical state to the optional evaluation-only action shaper."""
         assert self.inner.state is not None
         blue = self.inner.state.blue[0]
+        slots = self._policy_red_slots if red_slots is None else red_slots
+        red_states = [self.inner.state.red[index] for index in slots]
         return {"blue_position_m": blue.position_m.tolist(),
                 "blue_velocity_mps": blue.velocity_mps.tolist(),
                 "time_s": float(self.inner.state.time_s),
-                "red_positions_m": [red.position_m.tolist() for red in self.inner.state.red],
-                "red_velocities_mps": [red.velocity_mps.tolist() for red in self.inner.state.red],
-                "red_alive": [bool(red.alive) for red in self.inner.state.red],
-                "red_energy": [float(red.energy) for red in self.inner.state.red],
-                "red_guidance_modes": [red.guidance_mode for red in self.inner.state.red],
+                "red_positions_m": [red.position_m.tolist() for red in red_states],
+                "red_velocities_mps": [red.velocity_mps.tolist() for red in red_states],
+                "red_alive": [bool(red.alive) for red in red_states],
+                "red_energy": [float(red.energy) for red in red_states],
+                "red_guidance_modes": [red.guidance_mode for red in red_states],
                 "min_altitude_m": self.environment_config.aircraft.min_altitude_m,
                 "max_altitude_m": self.environment_config.aircraft.max_altitude_m,
                 "min_speed_mps": self.environment_config.aircraft.min_speed_mps,
@@ -241,9 +301,11 @@ class BlueEscapeEnv:
                 )}
 
     def _flight_quality_snapshot(self) -> dict[str, object]:
-        snapshot = self._mechanism_snapshot()
+        assert self.inner.state is not None
+        all_red_slots = tuple(range(len(self.inner.state.red)))
+        snapshot = self._mechanism_snapshot(all_red_slots)
+        snapshot["policy_red_indices"] = list(self._policy_red_slots)
         if self.config.record_red_telemetry:
-            assert self.inner.state is not None
             snapshot.update({
                 "step_count": int(self.inner.state.step_count),
                 # Physics preserves list slots, including inactive entities.
@@ -375,8 +437,10 @@ class BlueEscapeEnv:
         assert result is not None and self.inner.state is not None
         self._previous_executed_action_index = executed_action
         blue_alive = self.inner.state.blue[0].alive
-        self._mechanism_reward_state = self.mechanism_estimator.observe(
-            self._mechanism_snapshot(), self._structural_action_mask()
+        self._mechanism_reward_state = (
+            self._refresh_mechanism_state()
+            if self._learning_active
+            else self._neutral_mechanism_state()
         )
         measured_potential = self._joint_potential(self._mechanism_reward_state)
         potential_before = self._previous_potential.get("total", 0.0)
@@ -431,7 +495,9 @@ class BlueEscapeEnv:
         terminated, truncated = bool(result.terminated), bool(result.truncated)
         info = dict(result.info); info.update({
             "pure_pn": True,
+            "guidance_contract": GUIDANCE_CONTRACT,
             "missile_slot_mask": [index < self._missile_count for index in range(self.config.max_missiles)],
+            "policy_red_indices": list(self._policy_red_slots),
             "blue_survived": blue_alive,
             "reward_components": {
                 "tactical_shaping": float(legacy_shaping_reward),
@@ -452,13 +518,17 @@ class BlueEscapeEnv:
                 "potential_after": float(potential_after),
                 "measured_potential_after": float(measured_potential["total"]),
                 "legacy_potential_multiplier": float(measured_potential["legacy_multiplier"]),
-                "total_threat": float(self._mechanism_reward_state["total_threat"]),
-                "threat_rate_per_s": float(self._mechanism_reward_state["threat_rate_per_s"]),
-                "encirclement": float(self._mechanism_reward_state["C_enc"]),
+                "total_threat": float(self._mechanism_reward_state.get("total_threat", 0.0)),
+                "threat_rate_per_s": float(
+                    self._mechanism_reward_state.get("threat_rate_per_s", 0.0)
+                ),
+                "encirclement": float(self._mechanism_reward_state.get("C_enc", 0.0)),
                 "phase_index": float({"P0": 0, "P1": 1, "P2": 2}[
-                    str(self._mechanism_reward_state["phase"])
+                    str(self._mechanism_reward_state.get("phase", "P0"))
                 ]),
-                "emergency_gate": float(self._mechanism_reward_state["emergency_gate"]),
+                "emergency_gate": float(
+                    self._mechanism_reward_state.get("emergency_gate", 0.0)
+                ),
                 "evasion_activation": float(penalties["evasion_activation"]),
                 "timing_error": float(penalties["timing_error"]),
                 "direction_error": float(penalties["direction_error"]),
@@ -654,7 +724,9 @@ class BlueEscapeEnv:
             else:
                 slots = self.config.max_missiles if self.config.pad_observation_to_max_missiles else self._missile_count
                 values.extend(encode_normalized_v4(
-                    self._mechanism_snapshot(), self._mechanism_reward_state, slots
+                    self._mechanism_snapshot(),
+                    self._mechanism_reward_state if self._learning_active else {},
+                    slots,
                 ))
             if self.config.observation_schema in {"normalized_v3", "normalized_v4"}:
                 values.extend(blue_action_context(

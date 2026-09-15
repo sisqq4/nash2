@@ -5,7 +5,7 @@ import math
 import numpy as np
 
 from .guidance import ProportionalNavigationGuidance
-from .math_utils import EPS, G0, UP_AXIS, air_density, clip_norm, norm, speed_of_sound, unit, velocity_local_frame
+from .math_utils import EPS, G0, UP_AXIS, clip_norm, norm, standard_atmosphere, unit, velocity_local_frame
 from .seeker import seeker_boresight_angle_deg, seeker_fov_limit_deg
 from .types import EngagementState, EnvironmentConfig, JointAction, ThreeDoFState, los_kinematics
 
@@ -27,30 +27,41 @@ class ThreeDoFPhysicsLayer:
             raise ValueError("guidance_bias must contain only finite values")
         if np.any((guidance_bias < -1.0) | (guidance_bias > 1.0)):
             raise ValueError("guidance_bias values must be in [-1, 1]")
-        next_state = state.copy()
-        old_blue = [vehicle.copy() for vehicle in state.blue]
-        old_red = [vehicle.copy() for vehicle in state.red]
-        for index, blue in enumerate(old_blue):
-            if blue.alive:
-                next_state.blue[index] = self._step_aircraft(blue, action.blue.load_command_body_g[index])
-        for index, missile in enumerate(old_red):
+        next_blue = [
+            self._step_aircraft(blue, action.blue.load_command_body_g[index])
+            if blue.alive
+            else blue.copy()
+            for index, blue in enumerate(state.blue)
+        ]
+        next_red: list[ThreeDoFState] = []
+        for index, missile in enumerate(state.red):
             if not missile.alive:
-                next_state.red[index].guidance_bias = np.zeros(2, dtype=np.float64)
-                next_state.red[index].pn_load_body_g = np.zeros(3, dtype=np.float64)
-                next_state.red[index].bias_load_body_g = np.zeros(3, dtype=np.float64)
-                next_state.red[index].gravity_load_body_g = np.zeros(3, dtype=np.float64)
-                next_state.red[index].final_load_body_g = np.zeros(3, dtype=np.float64)
+                dead = missile.copy()
+                dead.guidance_bias.fill(0.0)
+                dead.pn_load_body_g.fill(0.0)
+                dead.bias_load_body_g.fill(0.0)
+                dead.gravity_load_body_g.fill(0.0)
+                dead.final_load_body_g.fill(0.0)
+                next_red.append(dead)
                 continue
             target_index = int(target_indices[index])
-            target = old_blue[target_index] if 0 <= target_index < len(old_blue) else None
-            next_state.red[index] = self._step_missile(
-                missile,
-                target,
-                guidance_bias[index],
-                target_index=target_index,
+            target = state.blue[target_index] if 0 <= target_index < len(state.blue) else None
+            next_red.append(
+                self._step_missile(
+                    missile,
+                    target,
+                    guidance_bias[index],
+                    target_index=target_index,
+                )
             )
-        next_state.time_s = round(state.time_s + self.config.time_step_s, 12)
-        next_state.step_count = state.step_count + 1
+        next_state = EngagementState(
+            red=next_red,
+            blue=next_blue,
+            time_s=round(state.time_s + self.config.time_step_s, 12),
+            step_count=state.step_count + 1,
+            style=state.style,
+            parameters=dict(state.parameters),
+        )
         self._update_ranges(next_state, target_indices)
         return next_state
 
@@ -61,7 +72,8 @@ class ThreeDoFPhysicsLayer:
         acceleration = axial_load_g * G0 * frame[:, 0]
         acceleration += normal_load_g * G0 * normal_direction
         acceleration += np.array([0.0, -G0, 0.0], dtype=np.float64)
-        next_state = self._integrate(state, acceleration, mass_flow_rate_kg_s=0.0)
+        next_state = state.copy()
+        self._integrate_in_place(next_state, acceleration, mass_flow_rate_kg_s=0.0)
         next_state.bank_angle_rad = float(bank_rad)
         speed = float(np.clip(norm(next_state.velocity_mps), self.config.aircraft.min_speed_mps, self.config.aircraft.max_speed_mps))
         next_state.velocity_mps = unit(next_state.velocity_mps, frame[:, 0]) * speed
@@ -89,6 +101,7 @@ class ThreeDoFPhysicsLayer:
             raise ValueError("normalized_bias must contain only finite values")
         if np.any((guidance_bias < -1.0) | (guidance_bias > 1.0)):
             raise ValueError("normalized_bias values must be in [-1, 1]")
+        state = state.copy()
         if target_index is not None and target_index != state.current_target_index:
             self._reset_target_tracking(state)
         frame = velocity_local_frame(state.velocity_mps)
@@ -113,7 +126,6 @@ class ThreeDoFPhysicsLayer:
             gravity_load_body_g = self._gravity_compensation_load_body_g(frame)
             if guidance_target is not None:
                 pn_acceleration = self.guidance.command(state, guidance_target)
-                pn_acceleration -= np.dot(pn_acceleration, frame[:, 0]) * frame[:, 0]
                 pn_load_body_g[1:] = (frame[:, 1:].T @ pn_acceleration) / G0
                 bias_norm = norm(guidance_bias)
                 bias_direction = guidance_bias / max(1.0, bias_norm)
@@ -135,27 +147,26 @@ class ThreeDoFPhysicsLayer:
             thrust_acceleration = max(0.0, required_speed_accel + norm(drag) - axial_gravity)
             acceleration += frame[:, 0] * thrust_acceleration
         mass_flow = self.config.missile.mass_flow_rate_kg_s if boosting else 0.0
-        next_state = self._integrate(state, acceleration, mass_flow)
-        next_state.seeker_locked = locked
-        next_state.fov_out_time_s = state.fov_out_time_s
-        next_state.guidance_bias = guidance_bias.copy()
-        next_state.pn_load_body_g = pn_load_body_g
-        next_state.bias_load_body_g = bias_load_body_g
-        next_state.gravity_load_body_g = gravity_load_body_g
-        next_state.final_load_body_g = final_load_body_g
-        speed = norm(next_state.velocity_mps)
-        if boosting and next_state.age_s >= boost_duration_s:
-            next_state.age_s = boost_duration_s
-            next_state.velocity_mps = unit(next_state.velocity_mps, frame[:, 0]) * self.config.missile.max_speed_mps
-            next_state.fuel_mass_kg = 0.0
-            next_state.mass_kg = self.config.missile.dry_mass_kg
+        self._integrate_in_place(state, acceleration, mass_flow)
+        state.seeker_locked = locked
+        state.guidance_bias = guidance_bias.copy()
+        state.pn_load_body_g = pn_load_body_g
+        state.bias_load_body_g = bias_load_body_g
+        state.gravity_load_body_g = gravity_load_body_g
+        state.final_load_body_g = final_load_body_g
+        speed = norm(state.velocity_mps)
+        if boosting and state.age_s >= boost_duration_s:
+            state.age_s = boost_duration_s
+            state.velocity_mps = unit(state.velocity_mps, frame[:, 0]) * self.config.missile.max_speed_mps
+            state.fuel_mass_kg = 0.0
+            state.mass_kg = self.config.missile.dry_mass_kg
             speed = self.config.missile.max_speed_mps
-        next_state.energy = float(np.clip(speed / self.config.missile.max_speed_mps, 0.0, 1.0))
-        if next_state.position_m[UP_AXIS] <= 0.0 or next_state.age_s >= self.config.missile.max_guidance_time_s:
-            next_state.alive = False
-        if next_state.age_s >= self.config.missile.boost_duration_s and speed < self.config.missile.min_speed_mps:
-            next_state.alive = False
-        return next_state
+        state.energy = float(np.clip(speed / self.config.missile.max_speed_mps, 0.0, 1.0))
+        if state.position_m[UP_AXIS] <= 0.0 or state.age_s >= self.config.missile.max_guidance_time_s:
+            state.alive = False
+        if state.age_s >= self.config.missile.boost_duration_s and speed < self.config.missile.min_speed_mps:
+            state.alive = False
+        return state
 
     @staticmethod
     def _reset_target_tracking(state: ThreeDoFState) -> None:
@@ -254,15 +265,25 @@ class ThreeDoFPhysicsLayer:
         )
 
     def _integrate(self, state: ThreeDoFState, acceleration: np.ndarray, mass_flow_rate_kg_s: float) -> ThreeDoFState:
-        dt = self.config.time_step_s
         next_state = state.copy()
-        next_state.position_m = state.position_m + state.velocity_mps * dt + 0.5 * acceleration * dt * dt
-        next_state.velocity_mps = state.velocity_mps + acceleration * dt
-        fuel_used = min(state.fuel_mass_kg, max(0.0, mass_flow_rate_kg_s) * dt)
-        next_state.fuel_mass_kg = state.fuel_mass_kg - fuel_used
-        next_state.mass_kg = state.mass_kg - fuel_used
-        next_state.age_s = round(state.age_s + dt, 12)
+        self._integrate_in_place(next_state, acceleration, mass_flow_rate_kg_s)
         return next_state
+
+    def _integrate_in_place(
+        self,
+        state: ThreeDoFState,
+        acceleration: np.ndarray,
+        mass_flow_rate_kg_s: float,
+    ) -> None:
+        dt = self.config.time_step_s
+        position = state.position_m + state.velocity_mps * dt + 0.5 * acceleration * dt * dt
+        velocity = state.velocity_mps + acceleration * dt
+        fuel_used = min(state.fuel_mass_kg, max(0.0, mass_flow_rate_kg_s) * dt)
+        state.position_m = position
+        state.velocity_mps = velocity
+        state.fuel_mass_kg -= fuel_used
+        state.mass_kg -= fuel_used
+        state.age_s = round(state.age_s + dt, 12)
 
     def _missile_drag_acceleration(self, state: ThreeDoFState, final_load_body_g: np.ndarray) -> np.ndarray:
         load = np.asarray(final_load_body_g, dtype=np.float64)
@@ -272,10 +293,10 @@ class ThreeDoFPhysicsLayer:
         if speed <= EPS:
             return np.zeros(3, dtype=np.float64)
         altitude_m = float(state.position_m[UP_AXIS])
-        density = air_density(altitude_m)
+        _, _, density, local_sound_speed = standard_atmosphere(altitude_m)
         dynamic_pressure_pa = 0.5 * density * speed * speed
         reference_area_m2 = self.config.missile.reference_area_m2
-        mach = speed / max(speed_of_sound(altitude_m), EPS)
+        mach = speed / max(local_sound_speed, EPS)
         coefficient = self._zero_lift_drag_coefficient(mach)
         if dynamic_pressure_pa > EPS:
             lift_coefficient = (

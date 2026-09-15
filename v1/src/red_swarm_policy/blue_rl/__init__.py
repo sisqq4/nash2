@@ -2,7 +2,7 @@
 
 from .environment import (BLUE_ACTION_CONTEXT_DIM, BlueEscapeEnv, BlueEscapeEnvConfig,
                           blue_action_context, blue_observation_dim)
-from .controller import BlueRLController
+from .controller import BlueRLController, BlueRLDecision
 from .policy import DiscreteBluePolicy, PolicyRegistry
 from .rainbow import RainbowDQNAgent, RainbowDQNConfig
 from .env_pool import BlueProcessEnvironmentPool, BlueStepResult
@@ -23,6 +23,7 @@ __all__ = [
     "blue_action_context",
     "blue_observation_dim",
     "BlueRLController",
+    "BlueRLDecision",
     "DiscreteBluePolicy",
     "PolicyRegistry",
     "RainbowDQNAgent",

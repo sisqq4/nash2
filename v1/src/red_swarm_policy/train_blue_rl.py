@@ -24,6 +24,7 @@ from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironment
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
 from .blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
 from .cli_utils import parse_missile_scenarios
+from .env import GUIDANCE_CONTRACT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -203,6 +204,7 @@ def main() -> int:
             "env_worker_threads": args.env_worker_threads, "env_worker_timeout_s": args.env_worker_timeout_s,
             "inference_batch_size_max": pool_size, "training_batch_size": args.batch_size,
             "training_mode": "rainbow_off_policy", "episodes": args.episodes,
+            "guidance_contract": GUIDANCE_CONTRACT,
             "seed": args.seed, "decision_interval_s": args.decision_interval,
             "updates_per_transition": args.updates_per_transition, "completed_environment_transitions": 0,
             "completed_optimizer_updates": 0, "completed_target_updates": 0,
@@ -506,6 +508,7 @@ def main() -> int:
             baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
         final_summary = {
             "event": "training_complete", "episodes": args.episodes,
+            "guidance_contract": GUIDANCE_CONTRACT,
             "survival_rate": _mean([float(row["blue_survived"]) for row in summaries]),
             "reward_mean": _mean([float(row["reward"]) for row in summaries]),
             "elapsed_s": elapsed, "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),

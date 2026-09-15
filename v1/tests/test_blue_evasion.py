@@ -173,6 +173,7 @@ def test_blue_evasion_cli_defaults_match_required_timing_and_detection() -> None
     assert args.decision_interval_s == 0.1
     assert args.detection_range_m == 60000.0
     assert args.device == "cuda:0"
+    assert args.blue_rule_execution_backend == "vectorized_guarded"
 
     with pytest.raises(ValueError, match="integer multiple"):
         BlueEvasionRuleMachine(
