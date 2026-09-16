@@ -10,7 +10,7 @@
 `BlueEvasionController(BlueEvasionRuleMachine)`，红方使用容量约束的规则分配与
 零残差严格三维纯比例导引（PPN，系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
 回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。该命令仍可独立运行，
-六组奖励消融批处理会复用它执行第一组测试；原有蓝方训练和 Rainbow 评估入口保持不变。
+六组奖励消融批处理会复用它执行最后一组测试；原有蓝方训练和 Rainbow 评估入口保持不变。
 
 以下命令在 1～4 枚来弹场景各运行 100 回合，并输出逐回合 CSV 和汇总 JSON；汇总配置会显式
 记录 `baseline=true`、双方学习开关均为 `false`，以及双方 checkpoint 均为空：
@@ -158,14 +158,14 @@ checkpoint 仍按保存的输入契约加载。
 
 `run_blue_rl_reward_ablations` 的默认 `core` 套件依次运行以下六个条件：
 
-1. `00_rule_baseline`：蓝方使用 `BlueEvasionRuleMachine`，不创建学习器、回放缓存或 checkpoint，只执行规则机测试。
-2. `01_rl_baseline`：Rainbow-DQN 只使用原有远离、切向、俯冲势函数和终局奖励，不加入四项逃逸机理。
-3. `05_rl_all_mechanisms`：四项机理全部启用，先完成完整模型对照。
-4. `02_rl_threat`：在 RL 基础奖励上加入威胁结果势函数。
-5. `03_rl_threat_timing`：继续加入规避时机惩罚。
-6. `04_rl_threat_timing_direction`：继续加入规避方向惩罚。
+1. `01_rl_baseline`：Rainbow-DQN 只使用原有远离、切向、俯冲势函数和终局奖励，不加入四项逃逸机理。
+2. `05_rl_all_mechanisms`：四项机理全部启用，先完成完整模型对照。
+3. `02_rl_threat`：在 RL 基础奖励上加入威胁结果势函数。
+4. `03_rl_threat_timing`：继续加入规避时机惩罚。
+5. `04_rl_threat_timing_direction`：继续加入规避方向惩罚。
+6. `00_rule_baseline`：蓝方使用 `BlueEvasionRuleMachine`，不创建学习器、回放缓存或 checkpoint，最后执行规则机测试。
 
-目录编号表达实验定义，实际执行优先级固定为 `00 → 01 → 05 → 02 → 03 → 04`；manifest 的
+目录编号表达实验定义，实际执行优先级固定为 `01 → 05 → 02 → 03 → 04 → 00`；manifest 的
 `execution_order` 会保存这一顺序。
 
 五个 RL 条件使用相同训练参数与训练 seed，各自训练完成后由现有 `evaluate_blue_rl` 测试；规则机条件调用现有

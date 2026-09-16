@@ -28,7 +28,6 @@ class RewardAblationCase:
 
 
 CORE_CASES = (
-    RewardAblationCase("00_rule_baseline", (), blue_policy="rule"),
     RewardAblationCase("01_rl_baseline", ()),
     RewardAblationCase("05_rl_all_mechanisms", MECHANISM_REWARD_NAMES),
     RewardAblationCase("02_rl_threat", ("threat",)),
@@ -36,6 +35,7 @@ CORE_CASES = (
     RewardAblationCase(
         "04_rl_threat_timing_direction", ("threat", "timing", "direction")
     ),
+    RewardAblationCase("00_rule_baseline", (), blue_policy="rule"),
 )
 
 

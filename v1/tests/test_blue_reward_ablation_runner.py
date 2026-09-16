@@ -18,14 +18,14 @@ from red_swarm_policy.run_blue_rl_reward_ablations import (
 
 def test_reward_ablation_suites_cover_incremental_core_and_full_factorial() -> None:
     assert tuple((case.blue_policy, case.mechanisms) for case in CORE_CASES) == (
-        ("rule", ()),
         ("rl", ()),
         ("rl", ("threat", "timing", "direction", "overload")),
         ("rl", ("threat",)),
         ("rl", ("threat", "timing")),
         ("rl", ("threat", "timing", "direction")),
+        ("rule", ()),
     )
-    assert tuple(case.mechanisms for case in CORE_CASES[1:]) == (
+    assert tuple(case.mechanisms for case in CORE_CASES if case.blue_policy == "rl") == (
         (),
         ("threat", "timing", "direction", "overload"),
         ("threat",),
@@ -41,7 +41,7 @@ def test_reward_ablation_commands_use_the_same_selection_for_train_and_test(
     tmp_path: Path,
 ) -> None:
     args = build_parser().parse_args([])
-    for case in CORE_CASES[1:]:
+    for case in (item for item in CORE_CASES if item.blue_policy == "rl"):
         case_root = tmp_path / case.name
         train = training_command(args, case, case_root / "train")
         checkpoint = case_root / "train" / "blue_rainbow.pt"
@@ -70,7 +70,7 @@ def test_reward_ablation_commands_use_the_same_selection_for_train_and_test(
 
 def test_reward_ablation_no_plots_disables_all_existing_plot_hooks(tmp_path: Path) -> None:
     args = build_parser().parse_args(["--no-plots"])
-    case = CORE_CASES[1]
+    case = CORE_CASES[0]
     train = training_command(args, case, tmp_path / "train")
     evaluation = evaluation_command(
         args, case, tmp_path / "train" / "blue_rainbow.pt", tmp_path / "evaluation"
@@ -94,26 +94,26 @@ def test_reward_ablation_dry_run_writes_a_reviewable_manifest(tmp_path: Path) ->
     )
     assert manifest["run_count"] == 6
     assert manifest["execution_order"] == [
-        "00_rule_baseline",
         "01_rl_baseline",
         "05_rl_all_mechanisms",
         "02_rl_threat",
         "03_rl_threat_timing",
         "04_rl_threat_timing_direction",
+        "00_rule_baseline",
     ]
     assert manifest["base_reward_enabled_in_every_case"] is True
-    assert manifest["runs"][0]["case"]["blue_policy"] == "rule"
-    assert manifest["runs"][0]["train"]["status"] == "not_applicable"
-    assert manifest["runs"][0]["evaluation"]["status"] == "dry_run"
-    assert manifest["runs"][1]["case"]["mechanisms"] == []
-    assert manifest["runs"][2]["case"]["mechanisms"] == [
+    assert manifest["runs"][5]["case"]["blue_policy"] == "rule"
+    assert manifest["runs"][5]["train"]["status"] == "not_applicable"
+    assert manifest["runs"][5]["evaluation"]["status"] == "dry_run"
+    assert manifest["runs"][0]["case"]["mechanisms"] == []
+    assert manifest["runs"][1]["case"]["mechanisms"] == [
         "threat", "timing", "direction", "overload"
     ]
     assert all(
         run["evaluation"]["status"] == "dry_run" for run in manifest["runs"]
     )
     assert all(
-        run["train"]["status"] == "dry_run" for run in manifest["runs"][1:]
+        run["train"]["status"] == "dry_run" for run in manifest["runs"][:-1]
     )
 
 
