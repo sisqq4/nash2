@@ -39,6 +39,7 @@ from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
 from red_swarm_policy.evaluate_blue_rl import _aggregate_results
 from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
 from red_swarm_policy.evaluate_blue_rl import _one_meter_probability_histogram
+from red_swarm_policy.evaluate_blue_rl import _build_paired_episode_plan
 from red_swarm_policy.evaluate_blue_rl import build_parser as build_evaluation_parser
 
 
@@ -364,6 +365,7 @@ def test_parse_missile_scenarios(value: str, expected: tuple[int, ...]) -> None:
 
 def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> None:
     args = build_evaluation_parser().parse_args(["checkpoint.pt"])
+    assert args.episodes == 100
     assert args.log_interval == 10
     assert args.jsonl_path is None
     assert not any((args.mechanism_threat, args.mechanism_timing,
@@ -375,6 +377,30 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     expected = '{"event": "evaluation_progress", "completed_episodes": 10}'
     assert capsys.readouterr().out.strip() == expected
     assert path.read_text(encoding="utf-8") == expected + "\n"
+
+
+def test_evaluation_plan_runs_every_scenario_with_round_paired_seeds() -> None:
+    plan = _build_paired_episode_plan(
+        seed=2000, episodes_per_scenario=3, missile_scenarios=(1, 2, 3),
+    )
+
+    assert [trial["episode"] for trial in plan] == list(range(1, 10))
+    assert [trial["missile_count"] for trial in plan] == [1, 1, 1, 2, 2, 2, 3, 3, 3]
+    assert [trial["scenario_episode"] for trial in plan] == [1, 2, 3] * 3
+    assert [trial["seed"] for trial in plan] == [2001, 2002, 2003] * 3
+    assert build_evaluation_parser().parse_args([
+        "checkpoint.pt", "--episodes-per-scenario", "7",
+    ]).episodes == 7
+    assert [
+        (trial["missile_count"], trial["scenario_episode"], trial["seed"])
+        for trial in _build_paired_episode_plan(
+            seed=9, episodes_per_scenario=1, missile_scenarios=(3, 1),
+        )
+    ] == [(3, 1, 10), (1, 1, 10)]
+    with pytest.raises(ValueError, match="episodes per scenario"):
+        _build_paired_episode_plan(
+            seed=9, episodes_per_scenario=0, missile_scenarios=(1,),
+        )
 
 
 def test_training_parser_accepts_replay_capacity_override() -> None:
@@ -754,6 +780,28 @@ def test_blue_reset_records_initial_geometry_and_orientation() -> None:
         assert entity["altitude_m"] == pytest.approx(entity["position_m"][1])
         assert -180.0 <= entity["heading_deg"] <= 180.0
         assert -90.0 <= entity["flight_path_angle_deg"] <= 90.0
+
+
+def test_same_seed_nests_initial_geometry_across_missile_counts() -> None:
+    env = BlueEscapeEnv(
+        EnvironmentConfig(),
+        BlueEscapeEnvConfig(
+            missile_count=1, max_missiles=3, pad_observation_to_max_missiles=True,
+            record_acmi=False,
+        ),
+    )
+
+    _, one_info = env.reset(seed=123, missile_count=1)
+    _, two_info = env.reset(seed=123, missile_count=2)
+    _, three_info = env.reset(seed=123, missile_count=3)
+
+    initializations = [
+        one_info["initialization"], two_info["initialization"], three_info["initialization"],
+    ]
+    assert initializations[0]["blue_aircraft"] == initializations[1]["blue_aircraft"]
+    assert initializations[0]["blue_aircraft"] == initializations[2]["blue_aircraft"]
+    assert initializations[0]["red_missiles"] == initializations[1]["red_missiles"][:1]
+    assert initializations[1]["red_missiles"] == initializations[2]["red_missiles"][:2]
 
 
 def test_controller_is_drop_in_discrete_policy() -> None:

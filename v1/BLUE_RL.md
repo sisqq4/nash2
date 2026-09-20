@@ -10,7 +10,7 @@
 `BlueEvasionController(BlueEvasionRuleMachine)`，红方使用容量约束的规则分配与
 零残差严格三维纯比例导引（PPN，系数默认 3.5）。该入口不加载双方任何 checkpoint，不创建优化器或
 回放缓存，也不进行参数更新，专门作为衡量智能博弈策略增益的无学习对照组。该命令仍可独立运行，
-六组奖励消融批处理会复用它执行最后一组测试；原有蓝方训练和 Rainbow 评估入口保持不变。
+六组奖励消融批处理会复用它执行最后一组测试；原有蓝方训练入口保持不变。
 
 以下命令在 1～4 枚来弹场景各运行 100 回合，并输出逐回合 CSV 和汇总 JSON；汇总配置会显式
 记录 `baseline=true`、双方学习开关均为 `false`，以及双方 checkpoint 均为空：
@@ -37,9 +37,12 @@ CSV 在全部回合完成后写入。
 `reference` 可用于纯参考运行，`shadow` 会同时计算两种实现并输出一致性统计。
 
 
-独立执行规则机时，`--episodes-per-scenario` 保留按来弹数分组的旧模式。需要与 Rainbow 逐回合配对时，
-改用 `--episodes TOTAL`：两者会使用相同的 `Random(seed)` 来弹抽样以及 `seed + episode` 初始化序列。
+规则机与 Rainbow 测试统一使用按来弹数分组的配对方案。`--episodes-per-scenario N`（兼容别名
+`--episodes N`）表示每个所选弹数各运行 N 轮；每个弹数内第 i 轮均使用 `seed_start + i`，i 从 1 开始。
 基线结果分别写入 `blue_rule_baseline_summary.json` 和 `blue_rule_baseline_trials.csv`。
+
+迁移提示：测试入口中旧写法 `--episodes N` 原先表示总回合数，现在与新参数一样表示“每个所选弹数 N 轮”。
+多弹数旧脚本应据此调整 N，推荐直接改用 `--episodes-per-scenario`，避免误读总运行量。
 
 ## 旧 checkpoint 的仅测试机理塑形与消融
 
@@ -70,10 +73,12 @@ CSV 在全部回合完成后写入。
 PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
   outputs/blue_rl/curriculum_normalized_v3/blue_rainbow.pt \
   --suite core --seeds 10042,20042,30042 \
-  --missiles 1,2,3,4 --episodes 400 --device cuda:0 \
+  --missiles 1,2,3,4 --episodes-per-scenario 100 --device cuda:0 \
   --parallel-envs 16 --acmi-interval 0 \
   --output outputs/blue_rl/ablations/core
 ```
+
+上述每个消融条件在四种弹数下各测试 100 轮，即每个 seed 共 400 个测试回合。
 
 先加 `--dry-run` 可只生成并打印全部命令；默认遇到首个失败即停止，加入
 `--continue-on-error` 后会继续其余组合，并在 manifest 中记录每次运行的返回码。
@@ -183,10 +188,9 @@ checkpoint、`training_metrics.json`、`training.jsonl`、逐回合结果、ACMI
 `evaluation_analysis/` 图片。manifest 会记录每个阶段的必需文件和本轮生成的 PNG；缺失、或复用目录中只有旧文件时，
 该阶段会标记失败。除非显式传入 `--no-plots`，批处理不会关闭任何现有绘图钩子。
 
-`--eval-episodes` 默认同时作为每个 RL 条件和规则机条件的总测试回合数；规则机在该模式下使用与
-`evaluate_blue_rl` 相同的 `Random(eval_seed)` 弹数抽样和 `eval_seed + episode` 初始化 seed，因此六组测试样本
-逐回合配对。若希望规则机按每种来弹数量等量分组测试，可通过 `--rule-episodes-per-scenario` 明确指定，此时
-仅规则机切回原有的分组模式。
+`--eval-episodes-per-scenario`（兼容别名 `--eval-episodes`）表示每个所选弹数的测试轮数。每个 RL 条件和规则机条件都按弹数等量测试，且同一弹数内
+第 i 轮统一使用 `eval_seed + i`，因此不同弹数及六组策略之间均可按轮次配对。若规则机需要不同样本量，
+可用 `--rule-episodes-per-scenario` 单独覆盖；其种子仍采用相同的按轮次配对规则。
 
 PowerShell 示例：
 
@@ -196,7 +200,7 @@ python -m red_swarm_policy.run_blue_rl_reward_ablations `
   --suite core `
   --missiles 1,2,3 `
   --train-episodes 1000 `
-  --eval-episodes 1000 `
+  --eval-episodes-per-scenario 1000 `
   --train-seed 2000 `
   --eval-seed 10042 `
   --device cuda:0 `
@@ -251,12 +255,12 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
   --output outputs/blue_rl/curriculum_normalized_v4
 ```
 
-固定独立 seed 对最终 checkpoint 做 1v1～1v4 联合评估：
+固定独立 seed 对最终 checkpoint 做 1v1～1v4 联合评估（每种弹数 1000 轮，共 4000 轮）：
 
 ```bash
 PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
   outputs/blue_rl/curriculum_normalized_v4/blue_rainbow.pt \
-  --missiles 1,2,3,4 --episodes 4000 --seed 10042 --device cuda:0 \
+  --missiles 1,2,3,4 --episodes-per-scenario 1000 --seed 10042 --device cuda:0 \
   --parallel-envs 16 --env-worker-threads 1 \
   --log-interval 100 --acmi-interval 0 \
   --output outputs/blue_rl/eval_normalized_v4
@@ -300,9 +304,10 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
 可用 `--curriculum-eval-episodes 500` 增强阶段评估，最终候选仍建议用独立评估入口每场景测试 1000 回合；
 仅做快速调试时可设为 0 禁用内嵌评估。
 
-`--missiles` 接受逗号分隔的任意子集（例如 `1,3,4`）。每个 episode 从该集合中均匀随机抽取一个场景；
-训练日志记录每个窗口和全程的实际抽样数量，评估结果另外按场景报告生存率。随机序列仅由 `--seed`
-决定，不受并行 worker 完成先后影响。测试联合检查点时，所选集合的最大来弹数必须与训练时一致；例如
+`--missiles` 接受逗号分隔的任意子集（例如 `1,3,4`）。训练时每个 episode 仍从该集合中均匀随机抽取一个
+场景，训练逻辑没有改变。独立测试时，`--episodes-per-scenario N`（兼容 `--episodes N`）让每个所选弹数
+各运行 N 轮；各弹数的第 i 轮都使用 `--seed + i`（i 从 1 开始），不受并行 worker 完成先后影响。
+测试联合检查点时，所选集合的最大来弹数必须与训练时一致；例如
 用 `1,2,3,4` 训练的检查点可以测试 `2,4`，但不能只传 `1`（后者是 9 维单场景观测）。
 
 常规仿真中，`BlueEvasionController`（规则机）默认使用 v7 的 guarded 向量化等价实现；将载入的 Rainbow agent 包装为
@@ -317,6 +322,9 @@ PYTHONPATH=src python -m red_swarm_policy.train_blue_rl \
 命令行参数可通过 `--help` 查看。常用参数为 `--missiles`（1–4 的逗号分隔子集）、`--episodes`、`--seed`、
 `--device`、`--decision-interval`、`--replay-size`、`--checkpoint-interval`、`--log-interval`、`--acmi-interval` 和 `--output`。物理与场景参数基于
 v7 对齐的蓝方专用默认配置；如需覆盖，向 `--env-config` 传入只包含改动项的 JSON。例如：
+
+其中训练命令的 `--episodes` 仍表示训练总回合数；测试命令的 `--episodes` 是
+`--episodes-per-scenario` 的兼容别名，表示每个所选弹数的测试轮数。
 
 ```json
 {
@@ -354,7 +362,8 @@ PYTHONPATH=src python -m red_swarm_policy.evaluate_blue_rl \
 ```
 
 `--parallel-envs N` 启动 N 个持久 CPU 进程并行推进独立场景，主进程将这些场景的观测合并后只执行一次
-GPU 前向推理。每个环境维护独立的 n-step 轨迹，结束的环境会立即用新的全局 episode 编号和 seed 重置，
+GPU 前向推理。每个环境维护独立的 n-step 轨迹，结束后会立即按预先生成的测试计划用新的全局 episode
+编号、弹数内轮次和配对 seed 重置，
 不会等待最长回合。`--updates-per-transition` 控制每收集一条 transition 安排多少次梯度更新；并行训练建议先从
 `0.25`–`0.5` 开始，并通过 `--batch-size 128` 或 `256` 增加 GPU 工作量。训练和评估的默认值仍为
 `--parallel-envs 1`，用于保持原有资源占用习惯；性能运行建议关闭 ACMI。

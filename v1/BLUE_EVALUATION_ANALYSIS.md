@@ -39,7 +39,8 @@ flight_quality 文件的已有字段继续保留，模型测试的状态记录�
 运行开始时，`flight_quality/evaluation_metadata.json` 保存一次完整环境配置、适配器配置、测试选项、
 坐标及采样约定、Python/NumPy/PyTorch 版本、模型文件路径及 SHA-256，以及源码文件与源码整体 SHA-256。
 源码摘要标识实际运行时文件内容，包含尚未提交的源码改动。每回合 `metadata` 保存运行编号 `run_id`、
-元数据文件名 `manifest`、实际随机种子（`--seed + episode`）、实体数量、初始化信息和回合终止原因；
+元数据文件名 `manifest`、弹数内轮次 `scenario_episode`、实际随机种子
+（`--seed + scenario_episode`，轮次从 1 开始）、实体数量、初始化信息和回合终止原因；
 初始状态向量可从该回合 `trace` 的第 0 条读取。元数据文件与逐回合文件应一起保留。
 
 旧结果不会自动补出缺失字段；旧版记录仍可被既有绘图和分析逻辑读取。

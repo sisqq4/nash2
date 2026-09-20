@@ -184,11 +184,19 @@ def test_model_evaluation_writes_all_episode_traces_and_reproducibility_manifest
     consolidated = json.loads((output / "flight_quality" / "flight_quality.json").read_text())
     summary = json.loads((output / "evaluation.json").read_text())
     assert sorted(episodes, key=lambda row: row["episode"]) == consolidated["episodes"]
-    assert sorted(row["episode"] for row in episodes) == [1, 2, 3]
+    assert sorted(row["episode"] for row in episodes) == list(range(1, 7))
+    ordered_metadata = [row["metadata"] for row in sorted(episodes, key=lambda row: row["episode"])]
+    assert [
+        (metadata["missile_count"], metadata["scenario_episode"], metadata["seed"])
+        for metadata in ordered_metadata
+    ] == [
+        (1, 1, 19), (1, 2, 20), (1, 3, 21),
+        (2, 1, 19), (2, 2, 20), (2, 3, 21),
+    ]
     for episode in episodes:
         metadata, trace = episode["metadata"], episode["trace"]
         assert metadata["run_id"] == manifest["run_id"] == summary["run_id"]
-        assert metadata["seed"] == 18 + episode["episode"]
+        assert metadata["seed"] == 18 + metadata["scenario_episode"]
         assert metadata["manifest"] == "evaluation_metadata.json"
         assert trace["red_ids"] == list(range(metadata["missile_count"]))
         assert trace["sample_interval_s"] == pytest.approx([0, .1, .015])
@@ -197,4 +205,9 @@ def test_model_evaluation_writes_all_episode_traces_and_reproducibility_manifest
             assert len(trace[key]) == len(trace["time_s"]) == 3
             assert all(len(frame) == metadata["missile_count"] for frame in trace[key])
     assert summary["learner_state_unchanged"] is True
+    assert summary["episodes"] == 6
+    assert summary["total_episodes"] == 6
+    assert summary["episodes_per_scenario"] == 3
+    assert summary["seed_schedule"] == "base_seed_plus_one_based_scenario_episode_v1"
+    assert all(group["episodes"] == 3 for group in summary["by_scenario"].values())
     assert not (output / "acmi").exists()

@@ -18,7 +18,6 @@ def test_blue_rule_baseline_defaults_match_blue_test_scenarios() -> None:
     args = build_parser().parse_args([])
     assert args.missiles == "1,2,3,4"
     assert args.episodes_per_scenario == 100
-    assert args.episodes is None
     assert args.decision_interval == 0.1
     assert args.reward_mechanisms is None
     assert args.blue_rule_execution_backend == "vectorized_guarded"
@@ -33,19 +32,19 @@ def test_blue_rule_baseline_can_report_base_reward_only() -> None:
         "--reward-mechanisms", "none", "--episodes", "25"
     ])
     assert args.reward_mechanisms == ()
-    assert args.episodes == 25
+    assert args.episodes_per_scenario == 25
 
 
-def test_blue_rule_random_plan_matches_rainbow_evaluation_schedule() -> None:
+def test_blue_rule_plan_matches_rainbow_paired_evaluation_schedule() -> None:
     plan, sampling, seed_schedule = _build_episode_plan(
-        seed_start=2000, episodes_per_scenario=100,
-        missile_counts=(1, 2, 3), episodes=8,
+        seed_start=2000, episodes_per_scenario=3, missile_counts=(1, 2, 3),
     )
-    assert [episode for episode, _, _ in plan] == list(range(1, 9))
-    assert [seed for _, seed, _ in plan] == list(range(2001, 2009))
-    assert [missiles for _, _, missiles in plan] == [2, 1, 2, 2, 3, 1, 3, 3]
-    assert sampling == "uniform_random_per_episode"
-    assert "matches evaluate_blue_rl" in seed_schedule
+    assert [episode for episode, _, _, _ in plan] == list(range(1, 10))
+    assert [scenario_episode for _, scenario_episode, _, _ in plan] == [1, 2, 3] * 3
+    assert [seed for _, _, seed, _ in plan] == [2001, 2002, 2003] * 3
+    assert [missiles for _, _, _, missiles in plan] == [1, 1, 1, 2, 2, 2, 3, 3, 3]
+    assert sampling == "balanced_paired_by_scenario"
+    assert seed_schedule == "base_seed_plus_one_based_scenario_episode_v1"
 
 
 def test_blue_rule_baseline_uses_shared_missile_validation() -> None:

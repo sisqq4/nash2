@@ -23,10 +23,12 @@ def test_ablation_suites_cover_core_and_all_factorial_combinations() -> None:
 
 def test_ablation_command_only_enables_requested_mechanisms(tmp_path: Path) -> None:
     args = build_parser().parse_args(["checkpoint.pt"])
+    assert args.episodes == 100
     command = evaluation_command(args, CORE_CASES[1], 7, tmp_path / "run")
     assert "--mechanism-threat" in command
     assert "--mechanism-timing" not in command
     assert command[command.index("--seed") + 1] == "7"
+    assert command[command.index("--episodes-per-scenario") + 1] == str(args.episodes)
     assert command[command.index("--output") + 1] == str(tmp_path / "run")
 
 
@@ -35,5 +37,7 @@ def test_ablation_dry_run_writes_manifest_without_checkpoint(tmp_path: Path) -> 
                  "--suite", "core", "--seeds", "3,5"]) == 0
     manifest = (tmp_path / "ablation_manifest.json").read_text(encoding="utf-8")
     assert '"run_count": 16' in manifest
+    assert '"episodes_per_scenario": 100' in manifest
+    assert '"episodes_per_run": 400' in manifest
     assert manifest.count('"status": "dry_run"') == 16
     assert parse_seeds("3,5,3") == (3, 5)

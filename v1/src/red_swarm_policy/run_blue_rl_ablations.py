@@ -53,7 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", choices=("core", "full-factorial"), default="core")
     parser.add_argument("--seeds", default="10042", help="Comma-separated evaluation seeds")
     parser.add_argument("--missiles", default="1,2,3,4")
-    parser.add_argument("--episodes", type=int, default=400)
+    parser.add_argument(
+        "--episodes-per-scenario", "--episodes", dest="episodes", type=int, default=100,
+        help=("Evaluation rounds per selected missile-count scenario; the legacy --episodes "
+              "spelling has the same per-scenario meaning"),
+    )
     parser.add_argument("--output", default="outputs/blue_rl/ablations")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--parallel-envs", type=int, default=4)
@@ -83,7 +87,8 @@ def evaluation_command(args: argparse.Namespace, case: AblationCase, seed: int,
                        destination: Path) -> list[str]:
     command = [
         sys.executable, "-m", "red_swarm_policy.evaluate_blue_rl", str(Path(args.checkpoint)),
-        "--missiles", args.missiles, "--episodes", str(args.episodes), "--seed", str(seed),
+        "--missiles", args.missiles, "--episodes-per-scenario", str(args.episodes),
+        "--seed", str(seed),
         "--output", str(destination), "--device", args.device,
         "--parallel-envs", str(args.parallel_envs),
         "--env-worker-threads", str(args.env_worker_threads),
@@ -114,7 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("episodes and worker counts must be positive")
     try:
         seeds = parse_seeds(args.seeds)
-        parse_missile_scenarios(args.missiles)
+        missile_scenarios = parse_missile_scenarios(args.missiles)
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not args.dry_run and not Path(args.checkpoint).is_file():
@@ -130,8 +135,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                          "command": command, "status": "planned", "returncode": None})
     manifest: dict[str, object] = {
         "checkpoint": str(Path(args.checkpoint)), "suite": args.suite,
-        "seeds": list(seeds), "missiles": list(parse_missile_scenarios(args.missiles)),
-        "episodes_per_run": args.episodes, "run_count": len(runs), "runs": runs,
+        "seeds": list(seeds), "missiles": list(missile_scenarios),
+        "episodes_per_scenario": args.episodes,
+        "episodes_per_run": args.episodes * len(missile_scenarios),
+        "run_count": len(runs), "runs": runs,
     }
     manifest_path = root / "ablation_manifest.json"; _write_manifest(manifest_path, manifest)
     for index, run in enumerate(runs, 1):

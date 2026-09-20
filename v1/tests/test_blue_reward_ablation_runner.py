@@ -41,6 +41,7 @@ def test_reward_ablation_commands_use_the_same_selection_for_train_and_test(
     tmp_path: Path,
 ) -> None:
     args = build_parser().parse_args([])
+    assert args.eval_episodes == 100
     for case in (item for item in CORE_CASES if item.blue_policy == "rl"):
         case_root = tmp_path / case.name
         train = training_command(args, case, case_root / "train")
@@ -51,6 +52,7 @@ def test_reward_ablation_commands_use_the_same_selection_for_train_and_test(
 
         assert train[train.index("--reward-mechanisms") + 1] == case.selection
         assert evaluation[evaluation.index("--reward-mechanisms") + 1] == case.selection
+        assert evaluation[evaluation.index("--episodes-per-scenario") + 1] == str(args.eval_episodes)
         assert str(checkpoint) in evaluation
         assert all(
             f"--mechanism-{name}" not in evaluation
@@ -64,7 +66,7 @@ def test_reward_ablation_commands_use_the_same_selection_for_train_and_test(
     rule = rule_evaluation_command(args, tmp_path / "rule")
     assert "red_swarm_policy.evaluate_blue_rule_baseline" in rule
     assert rule[rule.index("--reward-mechanisms") + 1] == "none"
-    assert rule[rule.index("--episodes") + 1] == str(args.eval_episodes)
+    assert rule[rule.index("--episodes-per-scenario") + 1] == str(args.eval_episodes)
     assert rule[rule.index("--seed-start") + 1] == str(args.eval_seed)
 
 
@@ -105,6 +107,9 @@ def test_reward_ablation_dry_run_writes_a_reviewable_manifest(tmp_path: Path) ->
     assert manifest["runs"][5]["case"]["blue_policy"] == "rule"
     assert manifest["runs"][5]["train"]["status"] == "not_applicable"
     assert manifest["runs"][5]["evaluation"]["status"] == "dry_run"
+    assert manifest["eval_episodes_per_scenario"] == 3
+    assert all(run["evaluation"]["episodes_per_scenario"] == 3 for run in manifest["runs"])
+    assert all(run["evaluation"]["total_episodes"] == 12 for run in manifest["runs"])
     assert manifest["runs"][0]["case"]["mechanisms"] == []
     assert manifest["runs"][1]["case"]["mechanisms"] == [
         "threat", "timing", "direction", "overload"

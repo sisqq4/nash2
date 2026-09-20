@@ -5,7 +5,6 @@ from collections import Counter
 from dataclasses import asdict
 import json
 import math
-import random
 import time
 from pathlib import Path
 from typing import Any
@@ -28,10 +27,20 @@ from .cli_utils import parse_missile_scenarios
 from .env import GUIDANCE_CONTRACT
 
 
+EVALUATION_SCENARIO_SAMPLING = "balanced_paired_by_scenario"
+EVALUATION_SEED_SCHEDULE = "base_seed_plus_one_based_scenario_episode_v1"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a blue Rainbow checkpoint with batched inference")
-    parser.add_argument("checkpoint"); parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--missiles", default="1", help="Comma-separated scenarios to sample, e.g. 1,2,3,4")
+    parser.add_argument("checkpoint")
+    parser.add_argument(
+        "--episodes-per-scenario", "--episodes", dest="episodes", type=int, default=100,
+        help=("Number of evaluation rounds for each selected missile count. The same round "
+              "uses seed + round_index in every missile-count scenario. The legacy "
+              "--episodes spelling now has this per-scenario meaning too."),
+    )
+    parser.add_argument("--missiles", default="1", help="Comma-separated scenarios to evaluate, e.g. 1,2,3,4")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="outputs/blue_rl/test"); parser.add_argument("--device", default="cpu")
     parser.add_argument("--env-config", default=None); parser.add_argument("--decision-interval", type=float, default=0.1)
@@ -121,6 +130,23 @@ def _one_meter_probability_histogram(values: list[float]) -> dict[str, object]:
     }
 
 
+def _build_paired_episode_plan(*, seed: int, episodes_per_scenario: int,
+                               missile_scenarios: tuple[int, ...]) -> list[dict[str, int]]:
+    """Build a balanced plan whose same-index rounds share a seed across scenarios."""
+    if episodes_per_scenario < 1:
+        raise ValueError("episodes per scenario must be positive")
+    return [
+        {
+            "episode": scenario_index * episodes_per_scenario + scenario_episode,
+            "scenario_episode": scenario_episode,
+            "seed": seed + scenario_episode,
+            "missile_count": missile_count,
+        }
+        for scenario_index, missile_count in enumerate(missile_scenarios)
+        for scenario_episode in range(1, episodes_per_scenario + 1)
+    ]
+
+
 def _aggregate_results(rows: list[dict[str, object]]) -> dict[str, object]:
     survived = sum(bool(row["blue_survived"]) for row in rows)
     action_counts: Counter[int] = Counter()
@@ -155,6 +181,12 @@ def main() -> int:
     if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
     if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
         raise SystemExit("baseline survival rate must be in [0, 1]")
+    episode_plan = _build_paired_episode_plan(
+        seed=args.seed, episodes_per_scenario=args.episodes,
+        missile_scenarios=missile_scenarios,
+    )
+    episodes_by_id = {trial["episode"]: trial for trial in episode_plan}
+    total_episodes = len(episode_plan)
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "evaluation.jsonl"
     flight_quality_jsonl_path = output / "flight_quality" / "flight_quality_episodes.jsonl"
@@ -224,10 +256,15 @@ def main() -> int:
         recording_metadata_path, checkpoint=Path(args.checkpoint),
         environment_config=asdict(environment_config), adapter_config=asdict(config),
         evaluation_options={**vars(args), "guidance_contract": GUIDANCE_CONTRACT,
+                            "episodes": total_episodes,
+                            "episodes_per_scenario": args.episodes,
+                            "total_episodes": total_episodes,
+                            "scenario_sampling": EVALUATION_SCENARIO_SAMPLING,
+                            "seed_schedule": EVALUATION_SEED_SCHEDULE,
                             "flight_envelope_config": asdict(envelope_config),
                             "numpy_version": np.__version__, "torch_version": str(torch.__version__)},
     )
-    pool_size = min(args.parallel_envs, args.episodes); observations = {}; episode_by_worker = {}; rewards = {}
+    pool_size = min(args.parallel_envs, total_episodes); observations = {}; episode_by_worker = {}; rewards = {}
     learning_active_by_worker: dict[int, bool] = {}
     mechanism_states: dict[int, dict[str, object]] = {}
     shapers = {worker: EvaluationActionShaper(shaping_config) for worker in range(pool_size)}
@@ -240,11 +277,12 @@ def main() -> int:
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
     completed = 0; next_log = args.log_interval; vector_iterations = 0
     started = time.monotonic(); window_started = started
-    scenario_rng = random.Random(args.seed)
-    episode_scenarios = {episode: scenario_rng.choice(missile_scenarios)
-                         for episode in range(1, args.episodes + 1)}
     _emit({"event": "evaluation_config", "checkpoint": args.checkpoint, "device": str(agent.device),
-           "episodes": args.episodes, "red_counts": list(missile_scenarios), "blue_count": 1,
+           "episodes": total_episodes, "total_episodes": total_episodes,
+           "episodes_per_scenario": args.episodes,
+           "red_counts": list(missile_scenarios), "blue_count": 1,
+           "scenario_sampling": EVALUATION_SCENARIO_SAMPLING,
+           "seed_schedule": EVALUATION_SEED_SCHEDULE,
            "parallel_cpu_envs": pool_size, "env_worker_threads": args.env_worker_threads,
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
@@ -266,7 +304,8 @@ def main() -> int:
                                     timeout_s=args.env_worker_timeout_s) as pool:
         assignments = {}
         for worker in range(pool_size):
-            assignments[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
+            trial = episodes_by_id[next_episode]
+            assignments[worker] = (trial["seed"], trial["episode"], trial["missile_count"])
             episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
             action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
             mechanism_interventions[worker] = 0; shapers[worker].reset()
@@ -360,8 +399,9 @@ def main() -> int:
                         reward_diagnostic_sums[worker][str(name)] += float(value)
                 if result.terminated or result.truncated:
                     episode = episode_by_worker[worker]
-                    row = {"episode": episode, "seed": args.seed + episode,
-                           "missile_count": episode_scenarios[episode],
+                    trial = episodes_by_id[episode]
+                    row = {"episode": episode, "scenario_episode": trial["scenario_episode"],
+                           "seed": trial["seed"], "missile_count": trial["missile_count"],
                            "reward": rewards[worker], **result.info,
                            "initialization": initializations[worker],
                            "blue_orientation": initializations[worker]["blue_orientation"],
@@ -397,8 +437,9 @@ def main() -> int:
                         episode=episode, survived=bool(result.info["blue_survived"]),
                         metadata={"run_id": recording_metadata["run_id"],
                                   "manifest": recording_metadata_path.name,
-                                  "seed": args.seed + episode,
-                                  "missile_count": episode_scenarios[episode],
+                                  "scenario_episode": trial["scenario_episode"],
+                                  "seed": trial["seed"],
+                                  "missile_count": trial["missile_count"],
                                   "initialization": initializations[worker],
                                   "initial_state_trace_index": 0,
                                   "termination_reason": result.info["termination_reason"]},
@@ -406,8 +447,10 @@ def main() -> int:
                     row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
                     quality_episodes.append(quality_result)
                     append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
-                    if next_episode <= args.episodes:
-                        resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
+                    if next_episode <= total_episodes:
+                        next_trial = episodes_by_id[next_episode]
+                        resets[worker] = (next_trial["seed"], next_trial["episode"],
+                                          next_trial["missile_count"])
                         episode_by_worker[worker] = next_episode; rewards[worker] = 0.0; decisions[worker] = 0
                         action_counts[worker] = Counter(); reward_component_sums[worker] = Counter()
                         mechanism_interventions[worker] = 0; mechanism_diagnostics.pop(worker, None)
@@ -431,12 +474,12 @@ def main() -> int:
                     mechanism_states[worker] = reset_info["mechanism_state"]
                     constraints[worker].reset(); shapers[worker].reset()
                     quality[worker].add(reset_info["flight_quality_state"])
-            if completed >= next_log or (completed == args.episodes and window_rows):
+            if completed >= next_log or (completed == total_episodes and window_rows):
                 now = time.monotonic(); window_rewards = [float(row["reward"]) for row in window_rows]
                 misses = [float(row["miss_distance_m"]) for row in window_rows]
                 report = {
                     "event": "evaluation_progress", "completed_episodes": completed,
-                    "total_episodes": args.episodes, "progress_fraction": completed / args.episodes,
+                    "total_episodes": total_episodes, "progress_fraction": completed / total_episodes,
                     "episode_ids": sorted(int(row["episode"]) for row in window_rows),
                     "sampled_red_counts": dict(Counter(int(row["missile_count"]) for row in window_rows)),
                     "active_parallel_envs": len(observations), "inference_batch_size": len(active_workers),
@@ -477,7 +520,11 @@ def main() -> int:
     flight_quality_summary = write_flight_quality_report(
         sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
         baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
-    summary = {"episodes": args.episodes, "missile_scenarios": list(missile_scenarios),
+    summary = {"episodes": total_episodes, "total_episodes": total_episodes,
+               "episodes_per_scenario": args.episodes,
+               "missile_scenarios": list(missile_scenarios),
+               "scenario_sampling": EVALUATION_SCENARIO_SAMPLING,
+               "seed_schedule": EVALUATION_SEED_SCHEDULE,
                "guidance_contract": GUIDANCE_CONTRACT,
                "survival_rate": statistics["survival_rate"], "statistics": statistics,
                "by_blue_orientation": by_blue_orientation,
@@ -497,10 +544,12 @@ def main() -> int:
                "flight_quality": flight_quality_summary,
                "run_id": recording_metadata["run_id"],
                "recording_metadata_path": str(recording_metadata_path),
-               "episodes_per_hour": args.episodes * 3600.0 / max(elapsed, 1e-9),
+               "episodes_per_hour": total_episodes * 3600.0 / max(elapsed, 1e-9),
                "results": rows}
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    _emit({"event": "evaluation_complete", "episodes": args.episodes,
+    _emit({"event": "evaluation_complete", "episodes": total_episodes,
+           "total_episodes": total_episodes,
+           "episodes_per_scenario": args.episodes,
            "survival_rate": summary["survival_rate"], "by_scenario": by_scenario,
            "by_blue_orientation": by_blue_orientation,
            "statistics": statistics, "evaluation_only": True, "learner_state_unchanged": True,

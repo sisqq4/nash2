@@ -59,11 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", choices=("core", "full-factorial"), default="core")
     parser.add_argument("--missiles", default="1,2,3,4")
     parser.add_argument("--train-episodes", type=int, default=1000)
-    parser.add_argument("--eval-episodes", type=int, default=400)
+    parser.add_argument(
+        "--eval-episodes-per-scenario", "--eval-episodes", dest="eval_episodes",
+        type=int, default=100,
+        help="Evaluation rounds per selected missile-count scenario",
+    )
     parser.add_argument(
         "--rule-episodes-per-scenario", type=int, default=None,
-        help=("Optional equal rule-baseline episodes for each missile count. If omitted, use "
-              "--eval-episodes with the same randomized episode schedule as Rainbow evaluation."),
+        help=("Optional rule-baseline rounds per missile count. If omitted, use "
+              "--eval-episodes; both policies use the same paired seed schedule."),
     )
     parser.add_argument("--train-seed", type=int, default=42)
     parser.add_argument("--eval-seed", type=int, default=10042)
@@ -132,7 +136,7 @@ def evaluation_command(args: argparse.Namespace, case: RewardAblationCase,
         sys.executable, "-m", "red_swarm_policy.evaluate_blue_rl", str(checkpoint),
         "--reward-mechanisms", case.selection,
         "--missiles", args.missiles,
-        "--episodes", str(args.eval_episodes),
+        "--episodes-per-scenario", str(args.eval_episodes),
         "--seed", str(args.eval_seed),
         "--output", str(destination),
         "--device", args.device,
@@ -163,12 +167,11 @@ def rule_evaluation_command(args: argparse.Namespace, destination: Path) -> list
         "--log-interval", str(args.log_interval),
         "--acmi-interval", str(args.acmi_interval),
     ]
-    if args.rule_episodes_per_scenario is None:
-        command.extend(("--episodes", str(args.eval_episodes)))
-    else:
-        command.extend((
-            "--episodes-per-scenario", str(args.rule_episodes_per_scenario)
-        ))
+    command.extend((
+        "--episodes-per-scenario",
+        str(args.eval_episodes if args.rule_episodes_per_scenario is None
+            else args.rule_episodes_per_scenario),
+    ))
     if args.env_config:
         command.extend(("--env-config", str(Path(args.env_config).resolve())))
     if args.no_plots:
@@ -284,6 +287,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         case_root = output_root / case.name
         eval_output = case_root / "evaluation"
         if case.blue_policy == "rule":
+            rule_episodes_per_scenario = (
+                args.eval_episodes if args.rule_episodes_per_scenario is None
+                else args.rule_episodes_per_scenario
+            )
             train: dict[str, object] = {
                 "output": None, "command": None, "status": "not_applicable",
                 "returncode": None,
@@ -293,11 +300,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "output": str(eval_output), "checkpoint": None,
                 "command": rule_evaluation_command(args, eval_output),
                 "status": "planned", "returncode": None,
-                "episodes_per_scenario": args.rule_episodes_per_scenario,
-                "total_episodes": (
-                    args.eval_episodes if args.rule_episodes_per_scenario is None
-                    else args.rule_episodes_per_scenario * len(missile_scenarios)
-                ),
+                "episodes_per_scenario": rule_episodes_per_scenario,
+                "total_episodes": rule_episodes_per_scenario * len(missile_scenarios),
             }
         else:
             train_output = case_root / "train"
@@ -311,7 +315,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "output": str(eval_output), "checkpoint": str(checkpoint),
                 "command": evaluation_command(args, case, checkpoint, eval_output),
                 "status": "planned", "returncode": None,
-                "total_episodes": args.eval_episodes,
+                "episodes_per_scenario": args.eval_episodes,
+                "total_episodes": args.eval_episodes * len(missile_scenarios),
             }
         runs.append({
             "case": asdict(case),
@@ -324,6 +329,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "mechanism_order": list(MECHANISM_REWARD_NAMES),
         "base_reward_enabled_in_every_case": True,
         "train_seed": args.train_seed, "eval_seed": args.eval_seed,
+        "eval_episodes_per_scenario": args.eval_episodes,
         "missiles": list(missile_scenarios),
         "rule_episodes_per_scenario": args.rule_episodes_per_scenario,
         "plots_enabled": not args.no_plots,
