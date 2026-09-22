@@ -29,7 +29,7 @@ class ScenarioGenerator:
         if n_red <= 0 or n_blue <= 0:
             raise ValueError("red_count and blue_count must be positive")
         blue = self._build_blue_targets(rng, n_blue)
-        red = self._build_red_nodes(rng, n_red)
+        red = self._build_red_nodes(rng, n_red, blue)
         return EngagementState(
             red=red,
             blue=blue,
@@ -49,6 +49,7 @@ class ScenarioGenerator:
                 "red_sector_center_azimuth_deg": self.config.red_sector_center_azimuth_deg,
                 "red_sector_width_deg": self.config.red_sector_width_deg,
                 "red_heading_bias_max_deg": self.config.red_heading_bias_max_deg,
+                "red_spawn_mode": self.config.red_spawn_mode,
                 "position_perturb_m": self.config.position_perturb_m,
                 "velocity_perturb_mps": self.config.velocity_perturb_mps,
             },
@@ -98,11 +99,16 @@ class ScenarioGenerator:
         self,
         rng: np.random.Generator,
         n_red: int,
+        blue: list[ThreeDoFState],
     ) -> list[ThreeDoFState]:
         red: list[ThreeDoFState] = []
         center_north_m, center_east_m = self.config.blue_cluster_center_ne_m
         center_altitude_m = 0.5 * sum(self.config.blue_altitude_range_m)
         blue_center = np.array([center_north_m, center_altitude_m, center_east_m], dtype=np.float64)
+        if self.config.red_spawn_mode == "blue_center_annulus":
+            # The blue-RL engagement has one aircraft; use its sampled position.
+            blue_center = np.mean([aircraft.position_m for aircraft in blue], axis=0)
+            center_north_m, center_east_m = blue_center[[NORTH_AXIS, EAST_AXIS]]
         minimum_radius_m, maximum_radius_m = self.config.red_cluster_radius_range_m
         sector_center_rad = math.radians(self.config.red_sector_center_azimuth_deg)
         sector_half_width_rad = 0.5 * math.radians(self.config.red_sector_width_deg)
@@ -111,7 +117,10 @@ class ScenarioGenerator:
             altitude = rng.uniform(*self.config.red_altitude_range_m)
             speed = rng.uniform(*self.config.red_launch_mach_range) * self.config.speed_of_sound_mps
             radius = math.sqrt(rng.uniform(minimum_radius_m**2, maximum_radius_m**2))
-            azimuth = sector_center_rad + rng.uniform(-sector_half_width_rad, sector_half_width_rad)
+            if self.config.red_spawn_mode == "blue_center_annulus":
+                azimuth = rng.uniform(-math.pi, math.pi)
+            else:
+                azimuth = sector_center_rad + rng.uniform(-sector_half_width_rad, sector_half_width_rad)
             position = np.array(
                 [
                     center_north_m + radius * math.cos(azimuth),
@@ -122,10 +131,13 @@ class ScenarioGenerator:
             )
             if self.config.position_perturb_m > 0.0:
                 position += rng.normal(0.0, self.config.position_perturb_m, 3)
-                position = self._clip_red_position(position)
+                position = self._clip_red_position(position, blue_center)
             center_direction = unit(blue_center - position, np.array([1.0, 0.0, 0.0]))
-            heading_bias_rad = rng.uniform(-heading_bias_max_rad, heading_bias_max_rad)
-            direction = self._rotate_about_up(center_direction, heading_bias_rad)
+            if self.config.red_spawn_mode == "blue_center_annulus":
+                direction = self._sample_direction_in_cone(rng, center_direction, heading_bias_max_rad)
+            else:
+                heading_bias_rad = rng.uniform(-heading_bias_max_rad, heading_bias_max_rad)
+                direction = self._rotate_about_up(center_direction, heading_bias_rad)
             velocity = speed * direction
             if self.config.velocity_perturb_mps > 0.0:
                 velocity += rng.normal(0.0, self.config.velocity_perturb_mps, 3)
@@ -162,21 +174,36 @@ class ScenarioGenerator:
         position_m[UP_AXIS] = float(np.clip(position_m[UP_AXIS], *self.config.blue_altitude_range_m))
         return position_m
 
-    def _clip_red_position(self, position_m: np.ndarray) -> np.ndarray:
-        center_north_m, center_east_m = self.config.blue_cluster_center_ne_m
+    def _clip_red_position(self, position_m: np.ndarray, blue_center: np.ndarray) -> np.ndarray:
+        center_north_m, center_east_m = blue_center[[NORTH_AXIS, EAST_AXIS]]
         relative_north_m = position_m[NORTH_AXIS] - center_north_m
         relative_east_m = position_m[EAST_AXIS] - center_east_m
         radius = float(np.clip(math.hypot(relative_north_m, relative_east_m), *self.config.red_cluster_radius_range_m))
         azimuth_deg = math.degrees(math.atan2(relative_east_m, relative_north_m))
-        offset_deg = self._wrapped_angle_deg(azimuth_deg - self.config.red_sector_center_azimuth_deg)
-        half_width_deg = 0.5 * self.config.red_sector_width_deg
-        bounded_azimuth_rad = math.radians(
-            self.config.red_sector_center_azimuth_deg + float(np.clip(offset_deg, -half_width_deg, half_width_deg))
-        )
+        if self.config.red_spawn_mode == "blue_center_annulus":
+            bounded_azimuth_rad = math.radians(azimuth_deg)
+        else:
+            offset_deg = self._wrapped_angle_deg(azimuth_deg - self.config.red_sector_center_azimuth_deg)
+            half_width_deg = 0.5 * self.config.red_sector_width_deg
+            bounded_azimuth_rad = math.radians(
+                self.config.red_sector_center_azimuth_deg + float(np.clip(offset_deg, -half_width_deg, half_width_deg))
+            )
         position_m[NORTH_AXIS] = center_north_m + radius * math.cos(bounded_azimuth_rad)
         position_m[EAST_AXIS] = center_east_m + radius * math.sin(bounded_azimuth_rad)
         position_m[UP_AXIS] = float(np.clip(position_m[UP_AXIS], *self.config.red_altitude_range_m))
         return position_m
+
+    @staticmethod
+    def _sample_direction_in_cone(rng: np.random.Generator, axis: np.ndarray,
+                                  half_angle_rad: float) -> np.ndarray:
+        """Sample a velocity direction uniformly over the cone's solid angle."""
+        cosine = rng.uniform(math.cos(half_angle_rad), 1.0)
+        sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+        azimuth = rng.uniform(-math.pi, math.pi)
+        helper = np.array([0.0, 1.0, 0.0]) if abs(axis[UP_AXIS]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        first = unit(np.cross(axis, helper))
+        second = np.cross(axis, first)
+        return unit(cosine * axis + sine * (math.cos(azimuth) * first + math.sin(azimuth) * second))
 
     @staticmethod
     def _rotate_about_up(vector: np.ndarray, angle_rad: float) -> np.ndarray:
@@ -193,7 +220,10 @@ class ScenarioGenerator:
         if angle <= maximum_angle_rad:
             return candidate_unit
         tangent = candidate_unit - np.dot(candidate_unit, reference_unit) * reference_unit
-        tangent = unit(tangent, np.array([0.0, 0.0, 1.0]))
+        if np.linalg.norm(tangent) < 1.0e-9:
+            helper = np.array([0.0, 1.0, 0.0]) if abs(reference_unit[UP_AXIS]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            tangent = np.cross(reference_unit, helper)
+        tangent = unit(tangent)
         return math.cos(maximum_angle_rad) * reference_unit + math.sin(maximum_angle_rad) * tangent
 
     @staticmethod

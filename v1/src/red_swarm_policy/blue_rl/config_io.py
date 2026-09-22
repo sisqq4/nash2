@@ -27,6 +27,7 @@ def default_blue_environment_config() -> EnvironmentConfig:
         scenario=replace(
             config.scenario,
             blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M,
+            red_spawn_mode="blue_center_annulus",
         ),
     )
 
@@ -70,7 +71,8 @@ def configure_blue_mission_duration(
         config,
         max_steps=int(round(duration_s / config.time_step_s)),
         missile=replace(config.missile, max_guidance_time_s=duration_s),
-        scenario=replace(config.scenario, blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M),
+        scenario=replace(config.scenario, blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M,
+                         red_spawn_mode="blue_center_annulus"),
     )
     configured.validate()
     return configured

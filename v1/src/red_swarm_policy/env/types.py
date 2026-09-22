@@ -221,6 +221,7 @@ class ScenarioConfig:
     red_heading_bias_max_deg: float = 15.0
     position_perturb_m: float = 0.0
     velocity_perturb_mps: float = 0.0
+    red_spawn_mode: Literal["sector", "blue_center_annulus"] = "sector"
 
     def validate(self) -> None:
         def validate_range(name: str, values: tuple[float, float], *, positive: bool) -> None:
@@ -254,6 +255,8 @@ class ScenarioConfig:
             raise ValueError("red_sector_width_deg must be in (0, 360]")
         if not math.isfinite(self.red_heading_bias_max_deg) or not 0.0 <= self.red_heading_bias_max_deg <= 180.0:
             raise ValueError("red_heading_bias_max_deg must be in [0, 180]")
+        if self.red_spawn_mode not in ("sector", "blue_center_annulus"):
+            raise ValueError("red_spawn_mode must be 'sector' or 'blue_center_annulus'")
         if not _all_finite(self.position_perturb_m, self.velocity_perturb_mps):
             raise ValueError("scenario perturbations must be finite")
         if self.position_perturb_m < 0.0 or self.velocity_perturb_mps < 0.0:

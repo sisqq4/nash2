@@ -124,7 +124,7 @@ class BlueEscapeEnvConfig:
 
 
 class BlueEscapeEnv:
-    """Separated Gym-like blue training env backed by the unchanged v1 simulation.
+    """Separated Gym-like blue training env backed by the shared v1 simulation.
 
     Red missiles are always assigned to the sole blue aircraft with exactly zero
     residual bias. Consequently the shared physics layer supplies strict 3-D
@@ -143,6 +143,7 @@ class BlueEscapeEnv:
             scenario=replace(
                 environment_config.scenario,
                 blue_altitude_range_m=tuple(config.initial_altitude_range_m),
+                red_spawn_mode="blue_center_annulus",
             ),
         )
         environment_config.validate()
