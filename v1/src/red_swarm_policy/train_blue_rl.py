@@ -69,6 +69,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--acmi-interval", type=int, default=1,
                         help="Save one training ACMI every N episodes; use 0 to disable ACMI output")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument(
+        "--checkpoint-eval-episodes", type=int, default=100,
+        help=("Fixed holdout episodes evaluated at every checkpoint boundary without "
+              "learner updates or per-episode artifacts (default: 100)"),
+    )
     parser.add_argument("--curriculum", action="store_true",
                         help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v4 network)")
     parser.add_argument("--curriculum-transition-episodes", type=int, default=500,
@@ -99,6 +104,193 @@ def _device_metrics(device: torch.device) -> dict[str, float]:
         "cuda_memory_allocated_mb": torch.cuda.memory_allocated(device) / 2**20,
         "cuda_memory_reserved_mb": torch.cuda.memory_reserved(device) / 2**20,
         "cuda_max_memory_allocated_mb": torch.cuda.max_memory_allocated(device) / 2**20,
+    }
+
+
+def _build_checkpoint_validation_plan(
+    *, seed: int, episodes: int, missile_scenarios: tuple[int, ...]
+) -> list[dict[str, int]]:
+    """Build one balanced, fixed holdout plan shared by every checkpoint."""
+    if episodes < 1:
+        raise ValueError("checkpoint validation episodes must be positive")
+    if not missile_scenarios:
+        raise ValueError("checkpoint validation requires at least one missile scenario")
+    counts = [int(missile_scenarios[index % len(missile_scenarios)])
+              for index in range(episodes)]
+    random.Random(seed).shuffle(counts)
+    return [
+        {"episode": index + 1, "seed": seed + index + 1, "missile_count": count}
+        for index, count in enumerate(counts)
+    ]
+
+
+def _checkpoint_validation_score(result: dict[str, Any]) -> tuple[int, int, int]:
+    """Rank survival first, then decisive evasions, then fewer timeout victories."""
+    return (
+        int(result["survived_count"]),
+        int(result["successful_evasion_count"]),
+        -int(result["timeout_victory_count"]),
+    )
+
+
+def _select_retained_checkpoints(
+    candidates: list[dict[str, Any]], limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Return the best ``limit`` candidates plus exact ties at the cutoff."""
+    if limit < 1:
+        raise ValueError("checkpoint retention limit must be positive")
+    ordered = sorted(candidates, key=_checkpoint_validation_score, reverse=True)
+    if len(ordered) <= limit:
+        return ordered
+    cutoff = _checkpoint_validation_score(ordered[limit - 1])
+    return [item for item in ordered if _checkpoint_validation_score(item) >= cutoff]
+
+
+def _checkpoint_validation_learner_state(agent: RainbowDQNAgent) -> tuple[object, ...]:
+    return (
+        agent.total_steps,
+        agent.optimizer_updates,
+        agent.target_updates,
+        agent.replay.size,
+        tuple(parameter._version for parameter in agent.online.parameters()),
+        tuple(parameter._version for parameter in agent.target.parameters()),
+    )
+
+
+def _evaluate_checkpoint_without_updates(
+    agent: RainbowDQNAgent,
+    pool: BlueProcessEnvironmentPool,
+    plan: list[dict[str, int]],
+    envelope_config: FlightEnvelopeConfig,
+) -> dict[str, Any]:
+    """Run a compact deterministic holdout and return aggregates only."""
+    if not plan:
+        raise ValueError("checkpoint validation plan must not be empty")
+    learner_state = _checkpoint_validation_learner_state(agent)
+    online_training = bool(agent.online.training)
+    started = time.monotonic()
+    observations: dict[int, np.ndarray] = {}
+    learning_active: dict[int, bool] = {}
+    envelope_states: dict[int, dict[str, object]] = {}
+    trial_by_worker: dict[int, int] = {}
+    constraints = {
+        worker: FlightEnvelopeConstraintLayer(envelope_config)
+        for worker in range(min(pool.size, len(plan)))
+    }
+    survived_count = successful_evasion_count = timeout_victory_count = 0
+    termination_counts: Counter[str] = Counter()
+    scenario_counts: Counter[int] = Counter()
+    scenario_survived: Counter[int] = Counter()
+    next_trial = 0
+    try:
+        assignments: dict[int, tuple[int, int, int]] = {}
+        for worker in constraints:
+            trial = plan[next_trial]
+            assignments[worker] = (
+                int(trial["seed"]), int(trial["episode"]), int(trial["missile_count"])
+            )
+            trial_by_worker[worker] = next_trial
+            constraints[worker].reset()
+            next_trial += 1
+        for worker, (observation, info) in pool.reset(assignments).items():
+            observations[worker] = observation
+            learning_active[worker] = bool(info["learning_active"])
+            envelope_states[worker] = dict(info["flight_quality_state"])
+
+        while observations:
+            workers = sorted(observations)
+            active_workers = [worker for worker in workers if learning_active[worker]]
+            actions = {worker: 0 for worker in workers}
+            policy_actions = {worker: 0 for worker in workers}
+            diagnostics: dict[int, dict[str, object]] = {}
+            if active_workers:
+                q_values = agent.expected_action_values(
+                    np.stack([observations[worker] for worker in active_workers]),
+                    evaluation=True,
+                )
+                for worker, values in zip(active_workers, q_values):
+                    action, diagnostic = constraints[worker].select(
+                        values, envelope_states[worker]
+                    )
+                    actions[worker] = int(action)
+                    policy_actions[worker] = int(diagnostic["raw_action"])
+                    diagnostics[worker] = diagnostic
+            action_masks = {
+                worker: np.asarray(
+                    diagnostics[worker]["effective_action_mask"], dtype=bool
+                ) if worker in diagnostics else np.ones(29, dtype=bool)
+                for worker in workers
+            }
+            fallback_flags = {
+                worker: bool(diagnostics.get(worker, {}).get("fallback_required", False))
+                for worker in workers
+            }
+            results = pool.step(
+                actions,
+                policy_actions=policy_actions,
+                action_masks=action_masks,
+                fallback_required=fallback_flags,
+            )
+            resets: dict[int, tuple[int, int, int]] = {}
+            for worker in workers:
+                result = results[worker]
+                observations[worker] = result.observation
+                learning_active[worker] = bool(result.info["learning_active"])
+                envelope_states[worker] = dict(result.info["flight_quality_state"])
+                if not (result.terminated or result.truncated):
+                    continue
+                trial = plan[trial_by_worker[worker]]
+                missile_count = int(trial["missile_count"])
+                survived = bool(result.info["blue_survived"])
+                reason = str(result.info.get("termination_reason", "none"))
+                scenario_counts[missile_count] += 1
+                termination_counts[reason] += 1
+                if survived:
+                    survived_count += 1
+                    scenario_survived[missile_count] += 1
+                    successful_evasion_count += int(reason == "red_failure")
+                    timeout_victory_count += int(reason == "timeout")
+                if next_trial < len(plan):
+                    following = plan[next_trial]
+                    resets[worker] = (
+                        int(following["seed"]),
+                        int(following["episode"]),
+                        int(following["missile_count"]),
+                    )
+                    trial_by_worker[worker] = next_trial
+                    constraints[worker].reset()
+                    next_trial += 1
+                else:
+                    observations.pop(worker)
+                    learning_active.pop(worker)
+                    envelope_states.pop(worker)
+                    trial_by_worker.pop(worker)
+            if resets:
+                for worker, (observation, info) in pool.reset(resets).items():
+                    observations[worker] = observation
+                    learning_active[worker] = bool(info["learning_active"])
+                    envelope_states[worker] = dict(info["flight_quality_state"])
+                    constraints[worker].reset()
+    finally:
+        agent.online.train(online_training)
+
+    if _checkpoint_validation_learner_state(agent) != learner_state:
+        raise RuntimeError("checkpoint validation modified learner state")
+    total = len(plan)
+    return {
+        "validation_episodes": total,
+        "survived_count": survived_count,
+        "survival_rate": survived_count / total,
+        "successful_evasion_count": successful_evasion_count,
+        "timeout_victory_count": timeout_victory_count,
+        "failure_count": total - survived_count,
+        "termination_counts": dict(sorted(termination_counts.items())),
+        "scenario_counts": {str(key): value for key, value in sorted(scenario_counts.items())},
+        "scenario_survival_rates": {
+            str(key): scenario_survived[key] / value
+            for key, value in sorted(scenario_counts.items())
+        },
+        "elapsed_s": time.monotonic() - started,
     }
 
 
@@ -153,8 +345,12 @@ def main() -> int:
         raise SystemExit("--plot-smoothing-window must be positive")
     try: missile_scenarios = parse_missile_scenarios(args.missiles)
     except ValueError as error: raise SystemExit(str(error)) from error
-    if args.episodes < 1 or args.checkpoint_interval < 1 or args.log_interval < 1:
-        raise SystemExit("episodes, checkpoint interval and log interval must be positive")
+    if (args.episodes < 1 or args.checkpoint_interval < 1 or args.log_interval < 1
+            or args.checkpoint_eval_episodes < 1):
+        raise SystemExit(
+            "episodes, checkpoint interval, log interval, and checkpoint evaluation episodes "
+            "must be positive"
+        )
     if args.acmi_interval < 0 or args.parallel_envs < 1 or args.env_worker_threads < 1:
         raise SystemExit("ACMI interval must be non-negative and worker counts positive")
     if (args.env_worker_timeout_s <= 0 or args.updates_per_transition < 0
@@ -196,6 +392,18 @@ def main() -> int:
         acmi_directory=str(output / "acmi"),
         mechanism_reward=mechanism_reward_config,
     )
+    checkpoint_eval_env_config = replace(
+        env_config,
+        record_acmi=False,
+        acmi_episode_interval=0,
+        record_red_telemetry=False,
+    )
+    checkpoint_eval_seed = args.seed + 20_000_000
+    checkpoint_validation_plan = _build_checkpoint_validation_plan(
+        seed=checkpoint_eval_seed,
+        episodes=args.checkpoint_eval_episodes,
+        missile_scenarios=tuple(training_scenarios),
+    )
     envelope_config = FlightEnvelopeConfig(action_prediction_s=args.decision_interval)
     rainbow_config = RainbowDQNConfig(
         blue_observation_dim(env_config.observation_schema, max(training_scenarios)), 29,
@@ -211,11 +419,27 @@ def main() -> int:
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
     # starting spawned children after CUDA initialization can indefinitely stall
     # all workers while they import PyTorch.
-    with BlueProcessEnvironmentPool(environment_config, env_config, pool_size,
-                                    native_threads=args.env_worker_threads,
-                                    timeout_s=args.env_worker_timeout_s) as pool:
+    checkpoint_eval_pool_size = min(args.parallel_envs, args.checkpoint_eval_episodes)
+    with BlueProcessEnvironmentPool(
+        environment_config, env_config, pool_size,
+        native_threads=args.env_worker_threads,
+        timeout_s=args.env_worker_timeout_s,
+    ) as pool, BlueProcessEnvironmentPool(
+        environment_config, checkpoint_eval_env_config, checkpoint_eval_pool_size,
+        native_threads=args.env_worker_threads,
+        timeout_s=args.env_worker_timeout_s,
+    ) as checkpoint_eval_pool:
         agent = RainbowDQNAgent(rainbow_config)
         event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
+        checkpoint_evaluations: list[dict[str, Any]] = []
+        retained_checkpoints: list[dict[str, Any]] = []
+        last_checkpoint_validation_state: tuple[object, ...] | None = None
+        best_checkpoint_directory = output / "best_checkpoints"
+        best_checkpoint_directory.mkdir(parents=True, exist_ok=True)
+        leaderboard_path = best_checkpoint_directory / "leaderboard.json"
+        for stale_checkpoint in best_checkpoint_directory.glob("blue_rainbow_ep*.pt"):
+            stale_checkpoint.unlink()
+        leaderboard_path.unlink(missing_ok=True)
         started = time.monotonic()
         experiment = {
             "event": "experiment_config", "device": str(agent.device), "red_counts": list(training_scenarios),
@@ -232,6 +456,25 @@ def main() -> int:
             "completed_optimizer_updates": 0, "completed_target_updates": 0,
             "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
             "environment_config": asdict(environment_config),
+            "checkpoint_validation": {
+                "checkpoint_interval": args.checkpoint_interval,
+                "episodes": args.checkpoint_eval_episodes,
+                "seed_base": checkpoint_eval_seed,
+                "fixed_plan": True,
+                "scenario_sampling": "balanced_over_training_scenarios",
+                "scenario_counts": dict(Counter(
+                    int(trial["missile_count"]) for trial in checkpoint_validation_plan
+                )),
+                "parallel_cpu_envs": checkpoint_eval_pool_size,
+                "per_episode_artifacts": False,
+                "ranking": [
+                    "survival_rate_desc",
+                    "successful_evasion_count_desc",
+                    "timeout_victory_count_asc",
+                ],
+                "retention_limit": 3,
+                "retain_exact_cutoff_ties": True,
+            },
             "metrics_path": str(metrics_path), "jsonl_path": str(jsonl_path),
             "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
             "curriculum": curriculum.describe() if curriculum is not None else None,
@@ -270,6 +513,113 @@ def main() -> int:
         window_constraint_interventions = 0
         window_clamp_low: list[float] = []; window_clamp_high: list[float] = []
         window_started = started; window_transition_start = 0; window_update_start = 0
+
+        def leaderboard_entry(candidate: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "completed_episodes": int(candidate["completed_episodes"]),
+                "episode_thresholds": list(candidate["episode_thresholds"]),
+                "final_state": bool(candidate["final_state"]),
+                "checkpoint_path": str(candidate["checkpoint_path"]),
+                "validation_episodes": int(candidate["validation_episodes"]),
+                "survived_count": int(candidate["survived_count"]),
+                "survival_rate": float(candidate["survival_rate"]),
+                "successful_evasion_count": int(candidate["successful_evasion_count"]),
+                "timeout_victory_count": int(candidate["timeout_victory_count"]),
+                "failure_count": int(candidate["failure_count"]),
+                "termination_counts": dict(candidate["termination_counts"]),
+                "scenario_counts": dict(candidate["scenario_counts"]),
+                "scenario_survival_rates": dict(candidate["scenario_survival_rates"]),
+                "environment_transitions": int(candidate["environment_transitions"]),
+                "optimizer_updates": int(candidate["optimizer_updates"]),
+                "target_updates": int(candidate["target_updates"]),
+                "ranking_score": list(_checkpoint_validation_score(candidate)),
+            }
+
+        def write_checkpoint_leaderboard() -> None:
+            ordered_entries = [leaderboard_entry(item) for item in retained_checkpoints]
+            best_score = (_checkpoint_validation_score(retained_checkpoints[0])
+                          if retained_checkpoints else None)
+            best_entries = [
+                entry for item, entry in zip(retained_checkpoints, ordered_entries)
+                if best_score is not None and _checkpoint_validation_score(item) == best_score
+            ]
+            leaderboard_path.write_text(json.dumps({
+                "ranking": [
+                    "survived_count_desc",
+                    "successful_evasion_count_desc",
+                    "timeout_victory_count_asc",
+                ],
+                "retention_limit": 3,
+                "retain_exact_cutoff_ties": True,
+                "evaluation_count": len(checkpoint_evaluations),
+                "best_completed_episodes": [
+                    int(entry["completed_episodes"]) for entry in best_entries
+                ],
+                "best_checkpoints": best_entries,
+                "retained_checkpoints": ordered_entries,
+            }, indent=2), encoding="utf-8")
+
+        def validate_checkpoint(
+            episode_thresholds: list[int], *, final_state: bool = False,
+        ) -> None:
+            nonlocal retained_checkpoints, last_checkpoint_validation_state
+            _emit({
+                "event": "checkpoint_validation_start",
+                "episode_thresholds": list(episode_thresholds),
+                "completed_episodes": completed,
+                "final_state": final_state,
+                "validation_episodes": args.checkpoint_eval_episodes,
+                "environment_transitions": agent.total_steps,
+                "optimizer_updates": agent.optimizer_updates,
+            }, event_rows, jsonl_path)
+            validation = _evaluate_checkpoint_without_updates(
+                agent, checkpoint_eval_pool, checkpoint_validation_plan, envelope_config,
+            )
+            checkpoint_path = (
+                best_checkpoint_directory / f"blue_rainbow_ep{completed:06d}.pt"
+            )
+            candidate: dict[str, Any] = {
+                "completed_episodes": completed,
+                "episode_thresholds": list(episode_thresholds),
+                "final_state": final_state,
+                "checkpoint_path": str(checkpoint_path),
+                "environment_transitions": agent.total_steps,
+                "optimizer_updates": agent.optimizer_updates,
+                "target_updates": agent.target_updates,
+                **validation,
+            }
+            selected = _select_retained_checkpoints(
+                [*retained_checkpoints, candidate], limit=3,
+            )
+            candidate_retained = any(item is candidate for item in selected)
+            removed = [
+                item for item in retained_checkpoints
+                if not any(item is kept for kept in selected)
+            ]
+            if candidate_retained:
+                agent.save(str(checkpoint_path))
+            for removed_candidate in removed:
+                Path(str(removed_candidate["checkpoint_path"])).unlink(missing_ok=True)
+            retained_checkpoints = selected
+            last_checkpoint_validation_state = _checkpoint_validation_learner_state(agent)
+
+            evaluation_record = {
+                "event": "checkpoint_validation",
+                **candidate,
+                "candidate_retained_after_evaluation": candidate_retained,
+                "checkpoint_path": str(checkpoint_path) if candidate_retained else None,
+                "removed_checkpoint_paths": [
+                    str(item["checkpoint_path"]) for item in removed
+                ],
+                "ranking_score": list(_checkpoint_validation_score(candidate)),
+                "retained_checkpoints": [
+                    leaderboard_entry(item) for item in retained_checkpoints
+                ],
+            }
+            checkpoint_evaluations.append(evaluation_record)
+            write_checkpoint_leaderboard()
+            _emit(evaluation_record, event_rows, jsonl_path)
+
         _emit({"event": "environment_workers", "backend": "process_spawn",
                "worker_count": pool_size, "workers": list(pool.worker_info)}, event_rows, jsonl_path)
         assignments = {}
@@ -420,14 +770,12 @@ def main() -> int:
                     window_grad_norms.append(agent.last_update_metrics["gradient_norm"])
                     window_clamp_low.append(agent.last_update_metrics["c51_clamp_low_fraction"])
                     window_clamp_high.append(agent.last_update_metrics["c51_clamp_high_fraction"])
+            crossed_checkpoint_thresholds: list[int] = []
             while completed >= next_checkpoint:
-                checkpoint = output / f"blue_rainbow_ep{next_checkpoint:06d}.pt"
-                agent.save(str(checkpoint))
-                _emit({"event": "checkpoint", "episode_threshold": next_checkpoint,
-                       "completed_episodes": completed, "path": str(checkpoint),
-                       "environment_transitions": agent.total_steps,
-                       "optimizer_updates": agent.optimizer_updates}, event_rows, jsonl_path)
+                crossed_checkpoint_thresholds.append(next_checkpoint)
                 next_checkpoint += args.checkpoint_interval
+            if crossed_checkpoint_thresholds:
+                validate_checkpoint(crossed_checkpoint_thresholds)
             while (curriculum is not None and args.curriculum_eval_episodes > 0
                    and completed >= next_curriculum_eval):
                 _, evaluation_stage, _ = curriculum.stage_at(min(next_curriculum_eval, args.episodes))
@@ -523,11 +871,20 @@ def main() -> int:
                     envelope_states[worker] = dict(info["flight_quality_state"])
                     constraints[worker].reset()
         summaries.sort(key=lambda row: int(row["episode"]))
+        current_validation_state = _checkpoint_validation_learner_state(agent)
+        if current_validation_state != last_checkpoint_validation_state:
+            validate_checkpoint([], final_state=True)
         final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
         elapsed = time.monotonic() - started
         flight_quality_summary = write_flight_quality_report(
             sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
             baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
+        best_score = (_checkpoint_validation_score(retained_checkpoints[0])
+                      if retained_checkpoints else None)
+        best_checkpoint_entries = [
+            leaderboard_entry(candidate) for candidate in retained_checkpoints
+            if best_score is not None and _checkpoint_validation_score(candidate) == best_score
+        ]
         final_summary = {
             "event": "training_complete", "episodes": args.episodes,
             "guidance_contract": GUIDANCE_CONTRACT,
@@ -539,6 +896,28 @@ def main() -> int:
             "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
             "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
             "flight_quality": flight_quality_summary,
+            "checkpoint_validation": {
+                "evaluation_count": len(checkpoint_evaluations),
+                "episodes_per_evaluation": args.checkpoint_eval_episodes,
+                "best_completed_episode": (
+                    int(best_checkpoint_entries[0]["completed_episodes"])
+                    if len(best_checkpoint_entries) == 1 else None
+                ),
+                "best_completed_episodes": [
+                    int(entry["completed_episodes"]) for entry in best_checkpoint_entries
+                ],
+                "best_episode_thresholds": [
+                    list(entry["episode_thresholds"]) for entry in best_checkpoint_entries
+                ],
+                "best_checkpoint_paths": [
+                    str(entry["checkpoint_path"]) for entry in best_checkpoint_entries
+                ],
+                "best_checkpoints": best_checkpoint_entries,
+                "retained_checkpoints": [
+                    leaderboard_entry(candidate) for candidate in retained_checkpoints
+                ],
+                "leaderboard_path": str(leaderboard_path),
+            },
         }
         final_summary["scenario_episode_counts"] = dict(Counter(
             int(row["missile_count"]) for row in summaries
@@ -546,6 +925,7 @@ def main() -> int:
         _emit(final_summary, event_rows, jsonl_path)
         (output / "episodes.json").write_text(json.dumps(summaries, indent=2), encoding="utf-8")
         metrics_path.write_text(json.dumps({"experiment_config": experiment, "iterations": [row for row in event_rows if row["event"] == "iteration"],
+                                            "checkpoint_evaluations": checkpoint_evaluations,
                                             "curriculum_evaluations": [row for row in event_rows if row["event"] == "curriculum_evaluation"],
                                             "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
     if not args.no_training_plots:

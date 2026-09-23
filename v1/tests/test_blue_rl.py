@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -42,6 +43,13 @@ from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
 from red_swarm_policy.evaluate_blue_rl import _one_meter_probability_histogram
 from red_swarm_policy.evaluate_blue_rl import _build_paired_episode_plan
 from red_swarm_policy.evaluate_blue_rl import build_parser as build_evaluation_parser
+from red_swarm_policy.train_blue_rl import (
+    _build_checkpoint_validation_plan,
+    _checkpoint_validation_learner_state,
+    _checkpoint_validation_score,
+    _evaluate_checkpoint_without_updates,
+    _select_retained_checkpoints,
+)
 
 
 class FixedPolicy:
@@ -568,10 +576,176 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
 
     args = build_parser().parse_args(["--replay-size", "500000"])
     assert args.replay_size == 500_000
+    assert args.checkpoint_eval_episodes == 100
     assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
     ]).reward_mechanisms == ("timing", "overload")
+
+
+def test_checkpoint_validation_plan_is_fixed_and_balanced_across_training_scenarios() -> None:
+    first = _build_checkpoint_validation_plan(
+        seed=2000, episodes=100, missile_scenarios=(1, 2, 3),
+    )
+    repeated = _build_checkpoint_validation_plan(
+        seed=2000, episodes=100, missile_scenarios=(1, 2, 3),
+    )
+
+    assert repeated == first
+    assert len(first) == 100
+    assert [trial["episode"] for trial in first] == list(range(1, 101))
+    assert len({trial["seed"] for trial in first}) == 100
+    scenario_counts = {
+        scenario: sum(trial["missile_count"] == scenario for trial in first)
+        for scenario in (1, 2, 3)
+    }
+    assert sum(scenario_counts.values()) == 100
+    assert max(scenario_counts.values()) - min(scenario_counts.values()) <= 1
+
+
+def test_checkpoint_validation_score_uses_survival_then_evasion_then_timeout() -> None:
+    same_survival_fewer_evasions = {
+        "survived_count": 80,
+        "successful_evasion_count": 60,
+        "timeout_victory_count": 19,
+    }
+    same_survival_more_evasions = {
+        "survived_count": 80,
+        "successful_evasion_count": 61,
+        "timeout_victory_count": 18,
+    }
+    same_survival_and_evasions_more_timeouts = {
+        "survived_count": 80,
+        "successful_evasion_count": 61,
+        "timeout_victory_count": 19,
+    }
+
+    assert _checkpoint_validation_score(same_survival_more_evasions) == (80, 61, -18)
+    assert (_checkpoint_validation_score(same_survival_more_evasions)
+            > _checkpoint_validation_score(same_survival_fewer_evasions))
+    assert (_checkpoint_validation_score(same_survival_more_evasions)
+            > _checkpoint_validation_score(same_survival_and_evasions_more_timeouts))
+
+
+def test_checkpoint_retention_keeps_top_three_plus_exact_cutoff_ties() -> None:
+    candidates = [
+        {"episode_threshold": 10, "survived_count": 90,
+         "successful_evasion_count": 70, "timeout_victory_count": 20},
+        {"episode_threshold": 20, "survived_count": 85,
+         "successful_evasion_count": 65, "timeout_victory_count": 20},
+        {"episode_threshold": 30, "survived_count": 80,
+         "successful_evasion_count": 60, "timeout_victory_count": 20},
+        {"episode_threshold": 40, "survived_count": 80,
+         "successful_evasion_count": 60, "timeout_victory_count": 20},
+        {"episode_threshold": 50, "survived_count": 80,
+         "successful_evasion_count": 59, "timeout_victory_count": 19},
+        {"episode_threshold": 60, "survived_count": 75,
+         "successful_evasion_count": 70, "timeout_victory_count": 5},
+    ]
+
+    retained = _select_retained_checkpoints(candidates, limit=3)
+
+    assert {row["episode_threshold"] for row in retained} == {10, 20, 30, 40}
+    cutoff_score = _checkpoint_validation_score(candidates[2])
+    assert sum(_checkpoint_validation_score(row) == cutoff_score for row in retained) == 2
+
+
+def test_checkpoint_validation_is_evaluation_only_and_restores_network_mode() -> None:
+    class FakeParameter:
+        _version = 7
+
+    class FakeNetwork:
+        def __init__(self) -> None:
+            self.training = True
+            self.parameter = FakeParameter()
+
+        def parameters(self) -> list[FakeParameter]:
+            return [self.parameter]
+
+        def train(self, mode: bool = True) -> None:
+            self.training = mode
+
+    class FakeAgent:
+        def __init__(self) -> None:
+            self.total_steps = 123
+            self.optimizer_updates = 17
+            self.target_updates = 4
+            self.replay = SimpleNamespace(size=91)
+            self.online = FakeNetwork()
+            self.target = FakeNetwork()
+            self.evaluation_flags: list[bool] = []
+            self.update_calls = 0
+
+        def expected_action_values(
+            self, observations: np.ndarray, *, evaluation: bool,
+        ) -> np.ndarray:
+            self.evaluation_flags.append(evaluation)
+            self.online.training = not evaluation
+            return np.zeros((len(observations), 29), dtype=np.float64)
+
+        def update(self) -> None:
+            self.update_calls += 1
+
+    class OneStepPool:
+        size = 2
+
+        def __init__(self) -> None:
+            self.assignments: dict[int, tuple[int, int, int]] = {}
+
+        def reset(
+            self, assignments: dict[int, tuple[int, int, int]],
+        ) -> dict[int, tuple[np.ndarray, dict[str, object]]]:
+            self.assignments.update(assignments)
+            return {
+                worker: (
+                    np.zeros(3, dtype=np.float32),
+                    {"learning_active": True, "flight_quality_state": _envelope_snapshot()},
+                )
+                for worker in assignments
+            }
+
+        def step(self, actions: dict[int, int], **_: object) -> dict[int, SimpleNamespace]:
+            outcomes = {
+                1: (True, "red_failure"),
+                2: (True, "timeout"),
+                3: (False, "success"),
+            }
+            return {
+                worker: SimpleNamespace(
+                    observation=np.zeros(3, dtype=np.float32),
+                    reward=0.0,
+                    terminated=True,
+                    truncated=False,
+                    info={
+                        "learning_active": False,
+                        "flight_quality_state": _envelope_snapshot(),
+                        "blue_survived": outcomes[self.assignments[worker][1]][0],
+                        "termination_reason": outcomes[self.assignments[worker][1]][1],
+                    },
+                )
+                for worker in actions
+            }
+
+    agent = FakeAgent()
+    state_before = _checkpoint_validation_learner_state(agent)
+    result = _evaluate_checkpoint_without_updates(
+        agent, OneStepPool(),
+        [
+            {"episode": 1, "seed": 101, "missile_count": 1},
+            {"episode": 2, "seed": 102, "missile_count": 2},
+            {"episode": 3, "seed": 103, "missile_count": 3},
+        ],
+        FlightEnvelopeConfig(),
+    )
+
+    assert result["survived_count"] == 2
+    assert result["successful_evasion_count"] == 1
+    assert result["timeout_victory_count"] == 1
+    assert result["termination_counts"] == {"red_failure": 1, "success": 1, "timeout": 1}
+    assert agent.evaluation_flags and all(agent.evaluation_flags)
+    assert agent.update_calls == 0
+    assert agent.online.training
+    assert _checkpoint_validation_learner_state(agent) == state_before
 
 
 def test_evaluation_mechanisms_are_independent_and_deterministic() -> None:
