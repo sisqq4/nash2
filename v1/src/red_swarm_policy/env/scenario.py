@@ -29,7 +29,12 @@ class ScenarioGenerator:
         if n_red <= 0 or n_blue <= 0:
             raise ValueError("red_count and blue_count must be positive")
         blue = self._build_blue_targets(rng, n_blue)
-        red = self._build_red_nodes(rng, n_red, blue)
+        sector_center_rad = (
+            rng.uniform(0.0, 2.0 * math.pi)
+            if self.config.red_spawn_mode == "blue_center_random_sector"
+            else math.radians(self.config.red_sector_center_azimuth_deg)
+        )
+        red = self._build_red_nodes(rng, n_red, blue, sector_center_rad)
         return EngagementState(
             red=red,
             blue=blue,
@@ -47,6 +52,10 @@ class ScenarioGenerator:
                 "blue_cluster_radius_m": self.config.blue_cluster_radius_m,
                 "red_cluster_radius_range_m": self.config.red_cluster_radius_range_m,
                 "red_sector_center_azimuth_deg": self.config.red_sector_center_azimuth_deg,
+                "sampled_red_sector_center_azimuth_deg": (
+                    None if self.config.red_spawn_mode == "blue_center_annulus"
+                    else math.degrees(sector_center_rad)
+                ),
                 "red_sector_width_deg": self.config.red_sector_width_deg,
                 "red_heading_bias_max_deg": self.config.red_heading_bias_max_deg,
                 "red_spawn_mode": self.config.red_spawn_mode,
@@ -100,17 +109,17 @@ class ScenarioGenerator:
         rng: np.random.Generator,
         n_red: int,
         blue: list[ThreeDoFState],
+        sector_center_rad: float,
     ) -> list[ThreeDoFState]:
         red: list[ThreeDoFState] = []
         center_north_m, center_east_m = self.config.blue_cluster_center_ne_m
         center_altitude_m = 0.5 * sum(self.config.blue_altitude_range_m)
         blue_center = np.array([center_north_m, center_altitude_m, center_east_m], dtype=np.float64)
-        if self.config.red_spawn_mode == "blue_center_annulus":
+        if self.config.red_spawn_mode != "sector":
             # The blue-RL engagement has one aircraft; use its sampled position.
             blue_center = np.mean([aircraft.position_m for aircraft in blue], axis=0)
             center_north_m, center_east_m = blue_center[[NORTH_AXIS, EAST_AXIS]]
         minimum_radius_m, maximum_radius_m = self.config.red_cluster_radius_range_m
-        sector_center_rad = math.radians(self.config.red_sector_center_azimuth_deg)
         sector_half_width_rad = 0.5 * math.radians(self.config.red_sector_width_deg)
         heading_bias_max_rad = math.radians(self.config.red_heading_bias_max_deg)
         for _ in range(n_red):
@@ -131,9 +140,9 @@ class ScenarioGenerator:
             )
             if self.config.position_perturb_m > 0.0:
                 position += rng.normal(0.0, self.config.position_perturb_m, 3)
-                position = self._clip_red_position(position, blue_center)
+                position = self._clip_red_position(position, blue_center, sector_center_rad)
             center_direction = unit(blue_center - position, np.array([1.0, 0.0, 0.0]))
-            if self.config.red_spawn_mode == "blue_center_annulus":
+            if self.config.red_spawn_mode != "sector":
                 direction = self._sample_direction_in_cone(rng, center_direction, heading_bias_max_rad)
             else:
                 heading_bias_rad = rng.uniform(-heading_bias_max_rad, heading_bias_max_rad)
@@ -174,7 +183,9 @@ class ScenarioGenerator:
         position_m[UP_AXIS] = float(np.clip(position_m[UP_AXIS], *self.config.blue_altitude_range_m))
         return position_m
 
-    def _clip_red_position(self, position_m: np.ndarray, blue_center: np.ndarray) -> np.ndarray:
+    def _clip_red_position(
+        self, position_m: np.ndarray, blue_center: np.ndarray, sector_center_rad: float
+    ) -> np.ndarray:
         center_north_m, center_east_m = blue_center[[NORTH_AXIS, EAST_AXIS]]
         relative_north_m = position_m[NORTH_AXIS] - center_north_m
         relative_east_m = position_m[EAST_AXIS] - center_east_m
@@ -183,10 +194,11 @@ class ScenarioGenerator:
         if self.config.red_spawn_mode == "blue_center_annulus":
             bounded_azimuth_rad = math.radians(azimuth_deg)
         else:
-            offset_deg = self._wrapped_angle_deg(azimuth_deg - self.config.red_sector_center_azimuth_deg)
+            sector_center_deg = math.degrees(sector_center_rad)
+            offset_deg = self._wrapped_angle_deg(azimuth_deg - sector_center_deg)
             half_width_deg = 0.5 * self.config.red_sector_width_deg
             bounded_azimuth_rad = math.radians(
-                self.config.red_sector_center_azimuth_deg + float(np.clip(offset_deg, -half_width_deg, half_width_deg))
+                sector_center_deg + float(np.clip(offset_deg, -half_width_deg, half_width_deg))
             )
         position_m[NORTH_AXIS] = center_north_m + radius * math.cos(bounded_azimuth_rad)
         position_m[EAST_AXIS] = center_east_m + radius * math.sin(bounded_azimuth_rad)

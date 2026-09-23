@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import math
 import time
@@ -44,6 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="outputs/blue_rl/test"); parser.add_argument("--device", default="cpu")
     parser.add_argument("--env-config", default=None); parser.add_argument("--decision-interval", type=float, default=0.1)
+    parser.add_argument("--red-sector-width-deg", type=float, default=None,
+                        help="Red spawn sector width in degrees (0, 360]; default: scenario configuration (60)")
     parser.add_argument(
         "--reward-mechanisms", type=parse_mechanism_rewards, default=None,
         metavar="SELECTION",
@@ -181,6 +183,8 @@ def main() -> int:
     if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
     if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
         raise SystemExit("baseline survival rate must be in [0, 1]")
+    if args.red_sector_width_deg is not None and not 0.0 < args.red_sector_width_deg <= 360.0:
+        raise SystemExit("--red-sector-width-deg must be in (0, 360]")
     episode_plan = _build_paired_episode_plan(
         seed=args.seed, episodes_per_scenario=args.episodes,
         missile_scenarios=missile_scenarios,
@@ -194,6 +198,11 @@ def main() -> int:
     flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
+    if args.red_sector_width_deg is not None:
+        environment_config = replace(environment_config, scenario=replace(
+            environment_config.scenario, red_sector_width_deg=args.red_sector_width_deg,
+        ))
+        environment_config.validate()
     shaping_config = EvaluationShapingConfig(
         threat=args.mechanism_threat, timing=args.mechanism_timing,
         direction=args.mechanism_direction, overload=args.mechanism_overload,

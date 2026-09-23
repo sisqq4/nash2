@@ -108,20 +108,28 @@ def test_blue_cli_defaults_match_v7_environment_contract() -> None:
     assert adapter.environment_config.missile.lethal_radius_m == pytest.approx(3.0)
 
 
-def test_blue_training_and_evaluation_use_annulus_spawn_mode() -> None:
-    assert load_environment_config(None).scenario.red_spawn_mode == "blue_center_annulus"
+def test_blue_training_and_evaluation_use_random_sector_spawn_mode() -> None:
+    blue_defaults = load_environment_config(None)
+    assert blue_defaults.scenario.red_spawn_mode == "blue_center_random_sector"
     adapter_config = BlueEscapeEnvConfig(record_acmi=False)
     default_adapter = BlueEscapeEnv(config=adapter_config)
     explicit_adapter = BlueEscapeEnv(EnvironmentConfig(), adapter_config)
-    assert default_adapter.environment_config.scenario.red_spawn_mode == "blue_center_annulus"
-    assert explicit_adapter.environment_config.scenario.red_spawn_mode == "blue_center_annulus"
+    assert default_adapter.environment_config.scenario.red_spawn_mode == "blue_center_random_sector"
+    assert explicit_adapter.environment_config.scenario.red_spawn_mode == "blue_center_random_sector"
+    assert default_adapter.environment_config.scenario.red_sector_width_deg == pytest.approx(60.0)
+    custom_environment = replace(
+        blue_defaults,
+        scenario=replace(blue_defaults.scenario, red_sector_width_deg=90.0),
+    )
+    custom_adapter = BlueEscapeEnv(custom_environment, adapter_config)
+    assert custom_adapter.environment_config.scenario.red_sector_width_deg == pytest.approx(90.0)
     assert EnvironmentConfig().scenario.red_spawn_mode == "sector"
 
 
 @pytest.mark.parametrize(("position_perturb_m", "velocity_perturb_mps"), [
     (0.0, 0.0), (1_500.0, 75.0),
 ])
-def test_blue_launch_annulus_preserves_blue_and_bounds_red_geometry(
+def test_blue_launch_random_sector_preserves_blue_and_bounds_red_geometry(
     position_perturb_m: float, velocity_perturb_mps: float,
 ) -> None:
     shared = EnvironmentConfig(scenario=ScenarioConfig(
@@ -130,7 +138,7 @@ def test_blue_launch_annulus_preserves_blue_and_bounds_red_geometry(
     ))
     blue_config = replace(
         shared,
-        scenario=replace(shared.scenario, red_spawn_mode="blue_center_annulus"),
+        scenario=replace(shared.scenario, red_spawn_mode="blue_center_random_sector"),
     )
     seed = 173
     shared_state = ScenarioGenerator(
@@ -147,22 +155,34 @@ def test_blue_launch_annulus_preserves_blue_and_bounds_red_geometry(
         blue_state.blue[0].velocity_mps, shared_state.blue[0].velocity_mps
     )
     blue_position = blue_state.blue[0].position_m
+    sector_center_deg = blue_state.parameters["sampled_red_sector_center_azimuth_deg"]
+    assert 0.0 <= sector_center_deg < 360.0
     for red in blue_state.red:
         displacement = red.position_m - blue_position
         radius_m = np.linalg.norm(displacement[[0, 2]])
+        azimuth_deg = np.degrees(np.arctan2(displacement[2], displacement[0]))
+        sector_offset_deg = (azimuth_deg - sector_center_deg + 180.0) % 360.0 - 180.0
         speed_mps = np.linalg.norm(red.velocity_mps)
         aim = -displacement / np.linalg.norm(displacement)
         direction = red.velocity_mps / speed_mps
         angle_deg = np.degrees(np.arccos(np.clip(np.dot(direction, aim), -1.0, 1.0)))
         assert 140_000.0 <= radius_m <= 160_000.0
+        assert abs(sector_offset_deg) <= 30.0 + 1e-10
         assert 8_000.0 <= red.position_m[1] <= 10_000.0
         assert 0.6 <= speed_mps / shared.scenario.speed_of_sound_mps <= 0.9
         assert angle_deg <= 15.0 + 1e-10
 
 
-def test_blue_launch_samples_full_area_uniform_annulus_and_keeps_shared_sector() -> None:
+@pytest.mark.parametrize("sector_width_deg", [60.0, 90.0])
+def test_blue_launch_samples_area_and_angles_uniformly_within_shared_sector(
+    sector_width_deg: float,
+) -> None:
     shared = EnvironmentConfig()
-    blue_scenario = replace(shared.scenario, red_spawn_mode="blue_center_annulus")
+    blue_scenario = replace(
+        shared.scenario,
+        red_spawn_mode="blue_center_random_sector",
+        red_sector_width_deg=sector_width_deg,
+    )
     blue_launch = ScenarioGenerator(
         blue_scenario, shared.missile, shared.aircraft
     ).generate(seed=41, style="many_to_one", red_count=4_000, blue_count=1)
@@ -173,18 +193,59 @@ def test_blue_launch_samples_full_area_uniform_annulus_and_keeps_shared_sector()
     radii_sq = np.sum(relative_ne**2, axis=1)
     area_fraction = (radii_sq - 140_000.0**2) / (160_000.0**2 - 140_000.0**2)
     assert 0.49 <= np.mean(area_fraction) <= 0.51
-    quadrant_counts = [
-        np.count_nonzero((relative_ne[:, 0] >= 0) == north_positive)
-        for north_positive in (False, True)
+    assert min(np.histogram(area_fraction, bins=np.linspace(0.0, 1.0, 5))[0]) > 900
+
+    center_deg = blue_launch.parameters["sampled_red_sector_center_azimuth_deg"]
+    azimuth_deg = np.degrees(np.arctan2(relative_ne[:, 1], relative_ne[:, 0]))
+    offset_deg = (azimuth_deg - center_deg + 180.0) % 360.0 - 180.0
+    half_width_deg = sector_width_deg / 2.0
+    assert np.max(np.abs(offset_deg)) <= half_width_deg + 1e-10
+    assert min(np.histogram(
+        offset_deg, bins=np.linspace(-half_width_deg, half_width_deg, 5)
+    )[0]) > 900
+
+
+def test_blue_launch_random_sector_center_covers_full_circle_and_repeats_by_seed() -> None:
+    shared = EnvironmentConfig()
+    config = replace(shared.scenario, red_spawn_mode="blue_center_random_sector")
+    generator = ScenarioGenerator(config, shared.missile, shared.aircraft)
+    centers_deg = np.array([
+        generator.generate(seed=seed, style="many_to_one", red_count=1, blue_count=1)
+        .parameters["sampled_red_sector_center_azimuth_deg"]
+        for seed in range(360)
+    ])
+    assert np.all((0.0 <= centers_deg) & (centers_deg < 360.0))
+    assert min(np.histogram(centers_deg, bins=np.linspace(0.0, 360.0, 5))[0]) > 65
+    assert abs(np.mean(np.exp(1j * np.radians(centers_deg)))) < 0.1
+
+    first = generator.generate(seed=173, style="many_to_one", red_count=3, blue_count=1)
+    again = generator.generate(seed=173, style="many_to_one", red_count=3, blue_count=1)
+    assert first.parameters["sampled_red_sector_center_azimuth_deg"] == again.parameters[
+        "sampled_red_sector_center_azimuth_deg"
     ]
-    assert min(quadrant_counts) > 1_800
-    for north_positive in (False, True):
-        for east_positive in (False, True):
-            count = np.count_nonzero(
-                ((relative_ne[:, 0] >= 0) == north_positive)
-                & ((relative_ne[:, 1] >= 0) == east_positive)
-            )
-            assert count > 850
+    for one, two in zip(first.blue + first.red, again.blue + again.red):
+        np.testing.assert_array_equal(one.position_m, two.position_m)
+        np.testing.assert_array_equal(one.velocity_mps, two.velocity_mps)
+
+
+def test_blue_launch_sector_width_360_covers_full_circle() -> None:
+    shared = EnvironmentConfig()
+    config = replace(
+        shared.scenario,
+        red_spawn_mode="blue_center_random_sector",
+        red_sector_width_deg=360.0,
+    )
+    launch = ScenarioGenerator(config, shared.missile, shared.aircraft).generate(
+        seed=41, style="many_to_one", red_count=4_000, blue_count=1
+    )
+    blue_ne = launch.blue[0].position_m[[0, 2]]
+    relative_ne = np.array([red.position_m[[0, 2]] - blue_ne for red in launch.red])
+    azimuth_deg = np.degrees(np.arctan2(relative_ne[:, 1], relative_ne[:, 0]))
+    assert min(np.histogram(azimuth_deg, bins=np.linspace(-180.0, 180.0, 5))[0]) > 850
+
+
+def test_general_sector_and_legacy_blue_annulus_remain_available() -> None:
+    shared = EnvironmentConfig()
 
     assert shared.scenario.red_spawn_mode == "sector"
     shared_launch = ScenarioGenerator(
@@ -195,6 +256,15 @@ def test_blue_launch_samples_full_area_uniform_annulus_and_keeps_shared_sector()
         [red.position_m[0] for red in shared_launch.red],
     ))
     assert np.all(np.abs(np.abs(azimuth_deg) - 180.0) <= 30.0)
+
+    annulus_config = replace(shared.scenario, red_spawn_mode="blue_center_annulus")
+    annulus_launch = ScenarioGenerator(
+        annulus_config, shared.missile, shared.aircraft
+    ).generate(seed=41, style="many_to_one", red_count=4_000, blue_count=1)
+    blue_ne = annulus_launch.blue[0].position_m[[0, 2]]
+    relative_ne = np.array([red.position_m[[0, 2]] - blue_ne for red in annulus_launch.red])
+    azimuth_deg = np.degrees(np.arctan2(relative_ne[:, 1], relative_ne[:, 0]))
+    assert min(np.histogram(azimuth_deg, bins=np.linspace(-180.0, 180.0, 5))[0]) > 850
 
 
 def test_rainbow_defaults_match_long_decision_horizon() -> None:

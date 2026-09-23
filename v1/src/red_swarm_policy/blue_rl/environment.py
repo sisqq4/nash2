@@ -143,7 +143,7 @@ class BlueEscapeEnv:
             scenario=replace(
                 environment_config.scenario,
                 blue_altitude_range_m=tuple(config.initial_altitude_range_m),
-                red_spawn_mode="blue_center_annulus",
+                red_spawn_mode="blue_center_random_sector",
             ),
         )
         environment_config.validate()
@@ -372,6 +372,10 @@ class BlueEscapeEnv:
         return {
             "blue_aircraft": [describe(blue)],
             "red_missiles": [describe(red) for red in self.inner.state.red],
+            "sampled_red_sector_center_azimuth_deg": self.inner.state.parameters.get(
+                "sampled_red_sector_center_azimuth_deg"
+            ),
+            "red_sector_width_deg": self.environment_config.scenario.red_sector_width_deg,
             "missile_swarm_center_position_m": missile_center.tolist(),
             "blue_relative_heading_deg": relative_heading_deg,
             "blue_orientation": orientation,

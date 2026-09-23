@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Comma-separated scenarios to sample, e.g. 1,2,3,4 (default: 1)")
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--output", default="outputs/blue_rl/train")
     parser.add_argument("--device", default="cpu"); parser.add_argument("--env-config", default=None)
+    parser.add_argument("--red-sector-width-deg", type=float, default=None,
+                        help="Red spawn sector width in degrees (0, 360]; default: scenario configuration (60)")
     parser.add_argument("--decision-interval", type=float, default=0.1)
     parser.add_argument(
         "--reward-mechanisms", type=parse_mechanism_rewards, default="all",
@@ -166,6 +168,8 @@ def main() -> int:
     if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
     if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
         raise SystemExit("baseline survival rate must be in [0, 1]")
+    if args.red_sector_width_deg is not None and not 0.0 < args.red_sector_width_deg <= 360.0:
+        raise SystemExit("--red-sector-width-deg must be in (0, 360]")
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_path) if args.metrics_path else output / "training_metrics.json"
@@ -176,6 +180,11 @@ def main() -> int:
     flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
     flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
+    if args.red_sector_width_deg is not None:
+        environment_config = replace(environment_config, scenario=replace(
+            environment_config.scenario, red_sector_width_deg=args.red_sector_width_deg,
+        ))
+        environment_config.validate()
     training_scenarios = (1, 2, 3, 4) if curriculum is not None else missile_scenarios
     mechanism_reward_config = MechanismRewardConfig().with_mechanisms(args.reward_mechanisms)
     env_config = BlueEscapeEnvConfig(

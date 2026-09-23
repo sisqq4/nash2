@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import replace
 import csv
 import json
 from pathlib import Path
@@ -69,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rule scorer backend; guarded vectorization is v7's production default",
     )
     parser.add_argument("--env-config", default=None)
+    parser.add_argument("--red-sector-width-deg", type=float, default=None,
+                        help="Red spawn sector width in degrees (0, 360]; default: scenario configuration (60)")
     parser.add_argument("--acmi-interval", type=int, default=0)
 
     parser.add_argument("--log-interval", type=int, default=1,
@@ -193,6 +196,7 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
              jsonl_path: Path | None = None,
              execution_backend: str = "vectorized_guarded",
              reward_mechanisms: tuple[str, ...] | None = None,
+             red_sector_width_deg: float | None = None,
              ) -> tuple[dict[str, object], list[dict[str, object]]]:
 
     if episodes_per_scenario < 1:
@@ -211,6 +215,11 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
     started = time.monotonic()
 
     environment_config = configure_blue_mission_duration(load_environment_config(env_config))
+    if red_sector_width_deg is not None:
+        environment_config = replace(environment_config, scenario=replace(
+            environment_config.scenario, red_sector_width_deg=red_sector_width_deg,
+        ))
+        environment_config.validate()
     mechanism_reward = MechanismRewardConfig()
     if reward_mechanisms is not None:
         mechanism_reward = mechanism_reward.with_mechanisms(reward_mechanisms)
@@ -259,6 +268,7 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
             "scenario_sampling": sampling,
             "seed_schedule": seed_schedule,
             "decision_interval_s": decision_interval_s,
+            "red_sector_width_deg": environment_config.scenario.red_sector_width_deg,
             "environment": "BlueEscapeEnv",
             "blue_rule_execution_backend": execution_backend,
             "active_reward_mechanisms": list(mechanism_reward.active_mechanisms()),
@@ -273,6 +283,8 @@ def evaluate(*, seed_start: int, episodes_per_scenario: int, missile_counts: tup
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.red_sector_width_deg is not None and not 0.0 < args.red_sector_width_deg <= 360.0:
+        raise SystemExit("--red-sector-width-deg must be in (0, 360]")
 
     args.output.mkdir(parents=True, exist_ok=True)
     progress_path = args.output / "blue_rule_baseline_progress.jsonl"
@@ -297,6 +309,7 @@ def main(argv: list[str] | None = None) -> int:
             log_interval=args.log_interval, jsonl_path=progress_path,
             execution_backend=args.blue_rule_execution_backend,
             reward_mechanisms=args.reward_mechanisms,
+            red_sector_width_deg=args.red_sector_width_deg,
         )
     except ValueError as error:
         raise SystemExit(str(error)) from error
