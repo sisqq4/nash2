@@ -32,6 +32,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Label used for delta columns (default: first input)")
     parser.add_argument("--miss-distance-bins", type=int, default=20,
                         help="Legacy option retained for compatibility; miss-distance bins are always 1 m")
+    parser.add_argument("--font", type=Path, help="中文字体文件；默认自动查找系统字体")
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--skip-invalid-inputs", action="store_true",
                         help="Skip unreadable/incompatible inputs and record them in analysis.json")
@@ -296,24 +297,27 @@ def _episode_rows(inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
 
 
 def _plots(output: Path, inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
-           bins: int, *, make_plots: bool = True) -> None:
+           bins: int, *, make_plots: bool = True,
+           font_path: str | Path | None = None) -> None:
     from .evaluation_plots import write_evaluation_plots
-    write_evaluation_plots(output, inputs, make_plots=make_plots)
+    write_evaluation_plots(output, inputs, make_plots=make_plots, font_path=font_path)
 
 
 def _write_analysis(output: Path, inputs: Sequence[tuple[str, Path, list[dict[str, Any]]]],
                     report: dict[str, Any], flat: list[dict[str, Any]], dimensions: Sequence[str],
-                    *, plots: bool = True, bins: int = 20) -> None:
+                    *, plots: bool = True, bins: int = 20,
+                    font_path: str | Path | None = None) -> None:
     if any(output.resolve() == source.resolve().parent for _, source, _ in inputs):
         raise ValueError("Use a separate analysis directory to preserve original evaluation files")
     output.mkdir(parents=True, exist_ok=True)
     (output / "analysis.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     _write_csv(output / "metrics.csv", flat)
     _write_csv(output / "episodes.csv", _episode_rows(inputs, dimensions))
-    _plots(output, inputs, bins, make_plots=plots)
+    _plots(output, inputs, bins, make_plots=plots, font_path=font_path)
 
 
-def write_evaluation_analysis_safely(source: str | Path, output: str | Path | None = None) -> dict[str, Any] | None:
+def write_evaluation_analysis_safely(source: str | Path, output: str | Path | None = None, *,
+                                     font_path: str | Path | None = None) -> dict[str, Any] | None:
     """Run only after original results have been saved; plotting failures are non-fatal."""
     try:
         item = load_input(f"evaluation={source}")
@@ -321,7 +325,8 @@ def write_evaluation_analysis_safely(source: str | Path, output: str | Path | No
         destination = Path(output) if output is not None else item[1].parent / "evaluation_analysis"
         report, flat = extract([item], DEFAULT_DIMENSIONS, item[0])
         report["skipped_inputs"] = []
-        _write_analysis(destination, [item], report, flat, DEFAULT_DIMENSIONS)
+        _write_analysis(destination, [item], report, flat, DEFAULT_DIMENSIONS,
+                        font_path=font_path)
         return report
     except Exception as error:
         print(f"[evaluation analysis] Plot generation skipped: {type(error).__name__}: {error}", file=sys.stderr)
@@ -357,7 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(str(error)) from error
     report["skipped_inputs"] = skipped_inputs
     _write_analysis(args.output, inputs, report, flat, dimensions,
-                    plots=not args.no_plots, bins=args.miss_distance_bins)
+                    plots=not args.no_plots, bins=args.miss_distance_bins,
+                    font_path=args.font)
     print(json.dumps({"output": str(args.output), "inputs": labels, "groups": len(flat)}, ensure_ascii=False))
     return 0
 

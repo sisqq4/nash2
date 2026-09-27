@@ -9,7 +9,18 @@ from pathlib import Path
 import pytest
 
 from red_swarm_policy import analyze_blue_evaluations as analysis
-from red_swarm_policy.evaluation_plots import build_plot_statistics, one_meter_histogram, write_evaluation_plots
+from red_swarm_policy.evaluation_plots import (
+    EVENT_LABELS,
+    ORIENTATION_LABELS,
+    POLICY_LABELS,
+    QUALITY_PLOTS,
+    VERDICT_LABELS,
+    _group_label,
+    _policy_label,
+    build_plot_statistics,
+    one_meter_histogram,
+    write_evaluation_plots,
+)
 
 
 def _rows() -> list[dict]:
@@ -30,6 +41,31 @@ def _rows() -> list[dict]:
 
 def _overall(report: dict, policy: str = "blue") -> dict:
     return next(row for row in report["groups"] if row["policy"] == policy and row["level"] == "overall")
+
+
+def test_visible_evaluation_plot_labels_are_chinese() -> None:
+    assert ORIENTATION_LABELS == {
+        "toward_missile_swarm": "迎向来弹群",
+        "positive_90_deg": "正90°侧向",
+        "negative_90_deg": "负90°侧向",
+        "away_from_missile_swarm": "背向来弹群",
+        "<not recorded>": "未记录",
+    }
+    assert QUALITY_PLOTS["flight_quality_score"] == "飞行质量评分（0–100）"
+    assert QUALITY_PLOTS["max_estimated_actual_load_g"] == "最大估算实际过载（g）"
+    assert VERDICT_LABELS["small_radius_spiral"] == "小半径螺旋"
+    assert VERDICT_LABELS["safety_reliance"] == "安全约束依赖"
+    assert EVENT_LABELS["self_return"] == "返回既有航迹附近"
+    assert EVENT_LABELS["altitude_boundary"] == "高度边界"
+    assert POLICY_LABELS["evaluation"] == "测试结果"
+    assert ORIENTATION_LABELS["<not recorded>"] == "未记录"
+    assert _policy_label("blue_training") == "训练结果"
+    assert _policy_label("自定义策略") == "自定义策略"
+    assert _group_label({}) == "总体"
+    assert _group_label({
+        "missile_count": 3,
+        "blue_orientation": "toward_missile_swarm",
+    }) == "3 枚来弹 / 迎向来弹群"
 
 
 def test_one_meter_bins_include_exact_boundaries_and_sparse_long_tail() -> None:

@@ -43,7 +43,8 @@ def _load_orientations(source: Path, metadata_path: Path) -> dict[int, str]:
 
 def analyze_blue_training_results(source: str | Path, output: str | Path | None = None, *,
                                   episode_metadata_path: str | Path | None = None,
-                                  dpi: int = 160) -> dict[str, Any]:
+                                  dpi: int = 160,
+                                  font_path: str | Path | None = None) -> dict[str, Any]:
     """Reuse the result figures with actual training outcomes and optional reset metadata."""
     from .evaluation_plots import write_evaluation_plots
 
@@ -66,7 +67,8 @@ def analyze_blue_training_results(source: str | Path, output: str | Path | None 
         missing += orientation is None
         rows.append({**row, "blue_orientation": orientation or UNKNOWN_ORIENTATION})
     destination = Path(output) if output is not None else path.parent / "training_analysis" / "results"
-    report = write_evaluation_plots(destination, [("blue_training", path, rows)], dpi=dpi)
+    report = write_evaluation_plots(destination, [("blue_training", path, rows)], dpi=dpi,
+                                    font_path=font_path)
     report["data_stage"] = "training"
     report["orientation_missing_episodes"] = missing
     report["episode_metadata_path"] = str(metadata_path.resolve()) if metadata_path.is_file() else None
@@ -80,7 +82,8 @@ def analyze_blue_training_results(source: str | Path, output: str | Path | None 
 
 def write_blue_training_results_safely(source: str | Path, output: str | Path | None = None, *,
                                        episode_orientations: Mapping[int, str] | None = None,
-                                       make_plots: bool = True) -> dict[str, Any] | None:
+                                       make_plots: bool = True,
+                                       font_path: str | Path | None = None) -> dict[str, Any] | None:
     """Archive additional reset metadata after original saves; isolate plotting errors."""
     try:
         path = Path(source)
@@ -93,7 +96,7 @@ def write_blue_training_results_safely(source: str | Path, output: str | Path | 
             _metadata_path(path).write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
         if not make_plots:
             return None
-        return analyze_blue_training_results(path, output)
+        return analyze_blue_training_results(path, output, font_path=font_path)
     except Exception as error:
         print(f"[blue training results] Analysis skipped: {type(error).__name__}: {error}", file=sys.stderr)
         return None
@@ -105,10 +108,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--episode-metadata", type=Path, help="Optional saved initial-orientation metadata")
     parser.add_argument("--dpi", type=int, default=160)
+    parser.add_argument("--font", type=Path, help="中文字体文件；默认自动查找系统字体")
     args = parser.parse_args(argv)
     try:
         report = analyze_blue_training_results(args.input, args.output,
-                                               episode_metadata_path=args.episode_metadata, dpi=args.dpi)
+                                               episode_metadata_path=args.episode_metadata, dpi=args.dpi,
+                                               font_path=args.font)
     except (OSError, ValueError, ImportError) as error:
         print(f"[blue training results] {error}", file=sys.stderr)
         return 1

@@ -14,7 +14,7 @@ from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfi
                                mechanism_observation_dim, parse_mechanism_rewards)
 
 from .flight_quality import (FlightQualityTracker, append_flight_quality_episode,
-                             write_flight_quality_report)
+                             replot_flight_quality_episodes, write_flight_quality_report)
 
 
 __all__ = [
@@ -46,6 +46,6 @@ __all__ = [
     "mechanism_observation_dim",
     "FlightQualityTracker",
     "append_flight_quality_episode",
-
+    "replot_flight_quality_episodes",
     "write_flight_quality_report",
 ]

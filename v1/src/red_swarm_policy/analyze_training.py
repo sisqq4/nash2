@@ -15,6 +15,56 @@ from pathlib import Path
 from textwrap import fill
 from typing import Any, Mapping, Sequence
 
+try:
+    from .plot_localization import chinese_plot_context
+except ImportError:  # Support ``python analyze_training.py``.
+    from plot_localization import chinese_plot_context
+
+
+CHART_TITLES = {
+    "reward": "奖励",
+    "loss": "损失",
+    "blue_escape_rate": "蓝方逃逸率",
+    "validation_escape_rate": "固定评估逃逸率",
+    "learning_rate": "学习率",
+    "gradient_norm": "梯度范数",
+    "optimizer_diagnostics": "优化器诊断",
+    "training_progress": "训练进度",
+    "episode_length": "回合长度",
+}
+
+METRIC_LABELS = {
+    "actor_loss": "策略网络损失",
+    "critic_loss": "价值网络损失",
+    "loss": "损失",
+    "learning_rate": "学习率",
+    "assignment_actor_learning_rate": "分配策略网络学习率",
+    "execution_actor_learning_rate": "执行策略网络学习率",
+    "assignment_critic_learning_rate": "分配价值网络学习率",
+    "execution_critic_learning_rate": "执行价值网络学习率",
+    "gradient_norm_mean": "平均梯度范数",
+    "assignment_actor_grad_norm_preclip": "分配策略网络裁剪前梯度范数",
+    "execution_actor_grad_norm_preclip": "执行策略网络裁剪前梯度范数",
+    "assignment_critic_grad_norm_preclip": "分配价值网络裁剪前梯度范数",
+    "execution_critic_grad_norm_preclip": "执行价值网络裁剪前梯度范数",
+    "policy_diagnostics.action_entropy": "策略诊断：动作熵",
+    "assignment_entropy": "分配策略熵",
+    "execution_entropy": "执行策略熵",
+    "assignment_approx_kl": "分配策略近似 KL 散度",
+    "execution_approx_kl": "执行策略近似 KL 散度",
+    "assignment_clip_fraction": "分配策略裁剪比例",
+    "execution_clip_fraction": "执行策略裁剪比例",
+    "c51_clamp_low_fraction_mean": "C51 下界截断平均比例",
+    "c51_clamp_high_fraction_mean": "C51 上界截断平均比例",
+    "rollout_diagnostics.transitions_per_s": "采样诊断：每秒环境转移数",
+    "rollout_diagnostics.episodes_per_hour": "采样诊断：每小时完成回合数",
+    "rollout_diagnostics.wall_time_s": "采样诊断：运行耗时 (s)",
+    "replay_size": "经验回放池大小",
+    "completed_environment_transitions": "已完成环境转移数",
+    "completed_optimizer_updates": "已完成参数更新次数",
+    "cuda_memory_allocated_mb": "CUDA 已分配显存 (MB)",
+}
+
 
 @dataclass
 class TrainingData:
@@ -154,8 +204,8 @@ def _curve(rows: list[dict[str, Any]], key: str, label: str, *,
     x_key = "completed_episodes" if axis == "iteration" and rows and all(
         _number(row.get("completed_episodes")) is not None for row in rows
     ) else axis
-    x_label = {"episode": "Episode ID", "completed_episodes": "Completed episodes",
-               "iteration": "Training iteration"}[x_key]
+    x_label = {"episode": "回合编号", "completed_episodes": "已完成回合数",
+               "iteration": "训练迭代次数"}[x_key]
     xs: list[float] = []
     ys: list[float | None] = []
     for index, row in enumerate(rows, 1):
@@ -183,35 +233,35 @@ def build_charts(data: TrainingData) -> dict[str, list[Curve]]:
             charts.setdefault(chart, []).append(curve)
 
     episodes, iterations = data.episodes, data.iterations
-    add("reward", episodes, "reward", "Episode reward", axis="episode")
-    for key, label in (("reward_mean", "Logged window mean reward"),
-                       ("episode_high_reward_mean", "Episode high-level return mean"),
-                       ("episode_low_return_mean", "Episode low-level return mean"),
-                       ("active_low_reward_mean", "Active low-level step reward mean")):
+    add("reward", episodes, "reward", "回合奖励", axis="episode")
+    for key, label in (("reward_mean", "记录窗口平均奖励"),
+                       ("episode_high_reward_mean", "回合高层平均回报"),
+                       ("episode_low_return_mean", "回合低层平均回报"),
+                       ("active_low_reward_mean", "有效低层单步平均奖励")):
         add("reward", iterations, key, label)
-    for key, label in (("loss_mean", "Logged optimizer loss mean"),
-                       ("assignment_actor_loss", "Assignment actor loss"),
-                       ("execution_actor_loss", "Execution actor loss"),
-                       ("assignment_critic_loss", "Assignment critic loss"),
-                       ("execution_critic_loss", "Execution critic loss")):
+    for key, label in (("loss_mean", "记录窗口平均优化器损失"),
+                       ("assignment_actor_loss", "分配策略网络损失"),
+                       ("execution_actor_loss", "执行策略网络损失"),
+                       ("assignment_critic_loss", "分配价值网络损失"),
+                       ("execution_critic_loss", "执行价值网络损失")):
         add("loss", iterations, key, label)
     if not charts["loss"]:
         for key in ("actor_loss", "critic_loss", "loss"):
-            add("loss", iterations, key, key.replace("_", " ").capitalize())
+            add("loss", iterations, key, METRIC_LABELS[key])
     if not charts["loss"]:
         key = "learner_loss_at_completion" if any(
             _number(row.get("learner_loss_at_completion")) is not None for row in episodes
         ) else "mean_loss"
-        add("loss", episodes, key, "Learner loss snapshot at episode completion", axis="episode")
+        add("loss", episodes, key, "回合结束时的学习器损失快照", axis="episode")
         if charts["loss"]:
             data.notes.append("Episode loss is a learner snapshot, not an episode-averaged loss.")
-    add("blue_escape_rate", episodes, "blue_survived", "Episode escape outcome",
+    add("blue_escape_rate", episodes, "blue_survived", "回合逃逸结果",
         axis="episode", percentage=True, boolean=True)
-    add("blue_escape_rate", iterations, "survival_rate", "Training window escape rate", percentage=True)
+    add("blue_escape_rate", iterations, "survival_rate", "训练窗口逃逸率", percentage=True)
     add("blue_escape_rate", iterations, "fixed_validation.average_damage_rate",
-        "Fixed validation blue survival (1 - mean damage rate)", percentage=True, complement=True)
+        "固定验证蓝方存活率（1 - 平均受损率）", percentage=True, complement=True)
     add("blue_escape_rate", iterations, "rollout_diagnostics.average_damage_rate",
-        "Rollout blue alive fraction (snapshot, not terminal escape)", percentage=True, complement=True)
+        "采样阶段蓝方存活比例（过程快照，非最终逃逸结果）", percentage=True, complement=True)
     if any(curve.name.endswith("average_damage_rate") for curve in charts["blue_escape_rate"]):
         data.notes.append("Blue alive fraction = 1 - average_damage_rate, never 1 - full_success_rate. "
                           "Rollout snapshots may precede episode termination; fixed validation is shown separately.")
@@ -222,89 +272,92 @@ def build_charts(data: TrainingData) -> dict[str, list[Curve]]:
                     (row.get("survival_rates") or {}).items()}} for row in data.evaluations]
     for key in scenario_keys:
         add("validation_escape_rate", evaluations, f"survival_rates.{key}",
-            f"Fixed evaluation escape rate: scenario {key}", percentage=True)
+            f"固定评估逃逸率：场景 {key}", percentage=True)
     for key in ("learning_rate", "assignment_actor_learning_rate", "execution_actor_learning_rate",
                 "assignment_critic_learning_rate", "execution_critic_learning_rate"):
-        add("learning_rate", iterations, key, key.replace("_", " ").capitalize())
+        add("learning_rate", iterations, key, METRIC_LABELS[key])
     for key in ("gradient_norm_mean", "assignment_actor_grad_norm_preclip",
                 "execution_actor_grad_norm_preclip", "assignment_critic_grad_norm_preclip",
                 "execution_critic_grad_norm_preclip"):
-        add("gradient_norm", iterations, key, key.replace("_", " ").capitalize())
+        add("gradient_norm", iterations, key, METRIC_LABELS[key])
     for key in ("policy_diagnostics.action_entropy", "assignment_entropy", "execution_entropy",
                 "assignment_approx_kl", "execution_approx_kl", "assignment_clip_fraction",
                 "execution_clip_fraction", "c51_clamp_low_fraction_mean", "c51_clamp_high_fraction_mean"):
-        add("optimizer_diagnostics", iterations, key, key.replace("_", " ").replace(".", ": "))
+        add("optimizer_diagnostics", iterations, key, METRIC_LABELS[key])
     for key in ("rollout_diagnostics.transitions_per_s", "rollout_diagnostics.episodes_per_hour",
                 "rollout_diagnostics.wall_time_s", "replay_size", "completed_environment_transitions",
                 "completed_optimizer_updates", "cuda_memory_allocated_mb"):
-        add("training_progress", iterations, key, key.replace("_", " ").replace(".", ": "))
-    add("episode_length", episodes, "decision_steps", "Episode decision steps", axis="episode")
-    add("episode_length", episodes, "simulation_time_s", "Episode simulation duration (s)", axis="episode")
-    add("episode_length", iterations, "simulation_time_mean_s", "Window simulation duration mean (s)")
+        add("training_progress", iterations, key, METRIC_LABELS[key])
+    add("episode_length", episodes, "decision_steps", "回合决策步数", axis="episode")
+    add("episode_length", episodes, "simulation_time_s", "回合仿真时长 (s)", axis="episode")
+    add("episode_length", iterations, "simulation_time_mean_s", "窗口平均仿真时长 (s)")
     for name, curves in charts.items():
         if not curves:
             data.notes.append(f"{name}: no finite logged values; chart contains a missing-data notice.")
     return charts
 
 
-def _render_chart(path: Path, name: str, curves: list[Curve], window: int, dpi: int) -> None:
+def _render_chart(path: Path, name: str, curves: list[Curve], window: int, dpi: int,
+                  font_path: str | Path | None = None) -> None:
     # Explicit Agg canvas avoids switching the application's global pyplot backend
     # or displaying/blocking on GUI windows. Import only during postprocessing.
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
     from matplotlib.ticker import PercentFormatter
 
-    columns = 2 if len(curves) > 1 else 1
-    rows = max(1, math.ceil(len(curves) / columns))
-    figure = Figure(figsize=(12 if columns == 2 else 9, 3.4 * rows + .5), layout="constrained")
-    FigureCanvasAgg(figure)
-    axes = figure.subplots(rows, columns, squeeze=False).ravel()
-    figure.suptitle(name.replace("_", " ").title(), fontsize=15, fontweight="bold")
-    try:
-        if not curves:
-            axes[0].text(.5, .5, "No finite values in the supplied training log.\n"
-                         "Missing measurements are not treated as zero.",
-                         ha="center", va="center", transform=axes[0].transAxes)
-            axes[0].set_axis_off()
-        for axis, curve in zip(axes, curves):
-            values = [math.nan if value is None else value for value in curve.y]
-            marker = "." if len(values) < 3 or any(value is None for value in curve.y) else None
-            if curve.name == "blue_survived":
-                averaged = rolling_mean(curve.y, window)
-                axis.plot(curve.x, averaged, color="#2563eb", linewidth=1.8,
-                          label=f"Trailing {window} episodes", marker=marker)
-                total = 0.0
-                count = 0
-                cumulative: list[float | None] = []
-                for value in curve.y:
-                    if value is not None:
-                        total += value
-                        count += 1
-                    cumulative.append(total / count if value is not None and count else None)
-                axis.plot(curve.x, cumulative, color="#d97706", label="Cumulative observed episodes")
-            else:
-                axis.plot(curve.x, values, color="#94a3b8", linewidth=1, label="Logged values",
-                          marker=marker)
-                if window > 1:
-                    axis.plot(curve.x, rolling_mean(curve.y, window), color="#2563eb", linewidth=1.8,
-                              label=f"Trailing {window} records (finite values)",
+    with chinese_plot_context(font_path):
+        columns = 2 if len(curves) > 1 else 1
+        rows = max(1, math.ceil(len(curves) / columns))
+        figure = Figure(figsize=(12 if columns == 2 else 9, 3.4 * rows + .5), layout="constrained")
+        FigureCanvasAgg(figure)
+        axes = figure.subplots(rows, columns, squeeze=False).ravel()
+        figure.suptitle(CHART_TITLES.get(name, name), fontsize=15, fontweight="bold")
+        try:
+            if not curves:
+                axes[0].text(.5, .5, "给定训练日志中没有可绘制的有限数值。\n"
+                             "缺失数据不会按零值处理。",
+                             ha="center", va="center", transform=axes[0].transAxes)
+                axes[0].set_axis_off()
+            for axis, curve in zip(axes, curves):
+                values = [math.nan if value is None else value for value in curve.y]
+                marker = "." if len(values) < 3 or any(value is None for value in curve.y) else None
+                if curve.name == "blue_survived":
+                    averaged = rolling_mean(curve.y, window)
+                    axis.plot(curve.x, averaged, color="#2563eb", linewidth=1.8,
+                              label=f"最近 {window} 个回合", marker=marker)
+                    total = 0.0
+                    count = 0
+                    cumulative: list[float | None] = []
+                    for value in curve.y:
+                        if value is not None:
+                            total += value
+                            count += 1
+                        cumulative.append(total / count if value is not None and count else None)
+                    axis.plot(curve.x, cumulative, color="#d97706", label="累计已记录回合")
+                else:
+                    axis.plot(curve.x, values, color="#94a3b8", linewidth=1, label="日志记录值",
                               marker=marker)
-            axis.set_title(fill(curve.label, width=48 if columns == 2 else 80), fontsize=10)
-            axis.set_xlabel(curve.x_label)
-            if curve.percentage:
-                axis.set_ylim(-.03, 1.03)
-                axis.yaxis.set_major_formatter(PercentFormatter(1.0))
-            axis.grid(True, alpha=.22)
-            axis.legend(fontsize=8, loc="best")
-        for axis in axes[max(len(curves), 1):]:
-            axis.set_axis_off()
-        figure.savefig(path, dpi=dpi)
-    finally:
-        figure.clear()
+                    if window > 1:
+                        axis.plot(curve.x, rolling_mean(curve.y, window), color="#2563eb", linewidth=1.8,
+                                  label=f"最近 {window} 条记录（仅有限值）",
+                                  marker=marker)
+                axis.set_title(fill(curve.label, width=48 if columns == 2 else 80), fontsize=10)
+                axis.set_xlabel(curve.x_label)
+                if curve.percentage:
+                    axis.set_ylim(-.03, 1.03)
+                    axis.yaxis.set_major_formatter(PercentFormatter(1.0))
+                axis.grid(True, alpha=.22)
+                axis.legend(fontsize=8, loc="best")
+            for axis in axes[max(len(curves), 1):]:
+                axis.set_axis_off()
+            figure.savefig(path, dpi=dpi)
+        finally:
+            figure.clear()
 
 
 def analyze_training(source: str | Path | Mapping[str, Any], output: str | Path | None = None,
-                     *, smoothing_window: int = 20, dpi: int = 160) -> dict[str, Any]:
+                     *, smoothing_window: int = 20, dpi: int = 160,
+                     font_path: str | Path | None = None) -> dict[str, Any]:
     """Create only derived PNG/JSON files in a dedicated analysis directory."""
     if isinstance(smoothing_window, bool) or not isinstance(smoothing_window, int) or smoothing_window < 1:
         raise ValueError("smoothing_window must be a positive integer")
@@ -331,7 +384,7 @@ def analyze_training(source: str | Path | Mapping[str, Any], output: str | Path 
     }
     for name, curves in charts.items():
         filename = f"{name}.png"
-        _render_chart(output_path / filename, name, curves, smoothing_window, dpi)
+        _render_chart(output_path / filename, name, curves, smoothing_window, dpi, font_path)
         series = []
         for curve in curves:
             finite = [value for value in curve.y if value is not None]
@@ -347,10 +400,12 @@ def analyze_training(source: str | Path | Mapping[str, Any], output: str | Path 
 
 def write_training_analysis_safely(source: str | Path | Mapping[str, Any],
                                  output: str | Path | None = None, *,
-                                 smoothing_window: int = 20, dpi: int = 160) -> dict[str, Any] | None:
+                                 smoothing_window: int = 20, dpi: int = 160,
+                                 font_path: str | Path | None = None) -> dict[str, Any] | None:
     """Best-effort postprocessing; failures never invalidate saved training results."""
     try:
-        return analyze_training(source, output, smoothing_window=smoothing_window, dpi=dpi)
+        return analyze_training(source, output, smoothing_window=smoothing_window, dpi=dpi,
+                                font_path=font_path)
     except Exception as error:
         print(f"[training analysis] Plot generation skipped: {type(error).__name__}: {error}", file=sys.stderr)
         return None
@@ -362,9 +417,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, help="Separate directory for generated analysis")
     parser.add_argument("--smoothing-window", type=int, default=20)
     parser.add_argument("--dpi", type=int, default=160)
+    parser.add_argument("--font", type=Path, help="中文字体文件；默认自动查找系统字体")
     args = parser.parse_args(argv)
     try:
-        report = analyze_training(args.input, args.output, smoothing_window=args.smoothing_window, dpi=args.dpi)
+        report = analyze_training(args.input, args.output, smoothing_window=args.smoothing_window,
+                                  dpi=args.dpi, font_path=args.font)
     except (OSError, ValueError, ImportError) as error:
         print(f"[training analysis] {error}", file=sys.stderr)
         return 1

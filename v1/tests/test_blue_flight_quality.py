@@ -12,8 +12,10 @@ from red_swarm_policy.blue_rl.flight_quality import (
     _build_episode_figure,
     _plot_episode,
     append_flight_quality_episode,
+    replot_flight_quality_episodes,
     write_flight_quality_report,
 )
+from red_swarm_policy.plot_localization import chinese_plot_context
 
 
 def test_episode_plot_shows_large_radii_separate_units_and_all_load_legends(tmp_path: Path) -> None:
@@ -32,19 +34,21 @@ def test_episode_plot_shows_large_radii_separate_units_and_all_load_legends(tmp_
     figure = _build_episode_figure(episode)
     try:
         axes = {axis.get_ylabel(): axis for axis in figure.axes}
-        radius_axis = axes["Turn radius (m)"]
+        radius_axis = axes["转弯半径（米）"]
         assert radius_axis.get_ylim()[1] > 100000.
         np.testing.assert_allclose(radius_axis.lines[0].get_ydata()[1:], list(range(10000, 100001, 10000)))
-        assert "Flight-path angle (deg)" in axes and "Heading rate (deg/s)" in axes
-        assert axes["Heading rate (deg/s)"].get_ylim()[0] <= -1.
-        assert axes["Heading rate (deg/s)"].get_ylim()[1] >= 1.
-        assert "Load (g)" in axes and "Commanded load (g)" not in axes
-        assert axes["Load (g)"].get_ylim()[0] == 0.
-        assert axes["Load (g)"].get_ylim()[1] > 2.
+        assert "航迹倾角（度）" in axes and "航向角速度（度/秒）" in axes
+        assert axes["航向角速度（度/秒）"].get_ylim()[0] <= -1.
+        assert axes["航向角速度（度/秒）"].get_ylim()[1] >= 1.
+        assert "过载（g）" in axes and "指令过载（g）" not in axes
+        assert axes["过载（g）"].get_ylim()[0] == 0.
+        assert axes["过载（g）"].get_ylim()[1] > 2.
         legends = [text.get_text() for axis in figure.axes if axis.get_legend()
                    for text in axis.get_legend().get_texts()]
-        assert {"commanded load", "estimated actual load", "Turn radius"} <= set(legends)
-        figure.canvas.draw()
+        assert {"指令过载", "估计实际过载", "转弯半径"} <= set(legends)
+        assert figure._suptitle.get_text() == "蓝机飞行质量—第 1 回合—评分 100.0"
+        with chinese_plot_context():
+            figure.canvas.draw()
     finally:
         figure.clear()
     _plot_episode(episode, tmp_path / "episode.png")
@@ -61,7 +65,7 @@ def test_missing_turn_radius_is_marked_unavailable() -> None:
     episode["trace"]["turn_radius_m"] = [None] * 11
     figure = _build_episode_figure(episode)
     try:
-        assert "Turn radius unavailable" in [text.get_text() for axis in figure.axes for text in axis.texts]
+        assert "无可用转弯半径" in [text.get_text() for axis in figure.axes for text in axis.texts]
     finally:
         figure.clear()
 
@@ -166,3 +170,38 @@ def test_completed_episodes_are_streamed_as_jsonl(
     append_flight_quality_episode({**episode, "episode": 8}, path)
     rows = [json.loads(line) for line in path.read_text().splitlines()]
     assert rows == [episode, {**episode, "episode": 8}]
+
+
+def test_offline_replot_streams_jsonl_selects_worst_and_clears_only_its_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "flight_quality_episodes.jsonl"
+    tracker = FlightQualityTracker()
+    for index in range(11):
+        tracker.add(_state(index * .1, [30.0 * index, 10_000.0, 0.0],
+                           [300.0, 0.0, 0.0]), policy_action=0, executed_action=0)
+    template = tracker.finish(episode=1, survived=True)
+    for episode_id, score in ((1, 40.0), (2, 10.0), (3, 30.0), (4, 20.0)):
+        row = json.loads(json.dumps(template))
+        row["episode"] = episode_id
+        row["metrics"]["flight_quality_score"] = score
+        append_flight_quality_episode(row, source)
+
+    output = tmp_path / "plots"
+    result = replot_flight_quality_episodes(source, output, plot_limit=2)
+
+    assert result["records_scanned"] == 4
+    assert result["selected_episodes"] == [2, 4]
+    assert result["selected_scores"] == [10.0, 20.0]
+    assert (output / "episode_000002.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert (output / "episode_000004.png").is_file()
+
+    unrelated = output / "episode_999999.png"
+    unrelated.write_bytes(b"unrelated")
+    refreshed = replot_flight_quality_episodes(
+        source, output, plot_limit=1, clear_existing=True
+    )
+    assert refreshed["selected_episodes"] == [2]
+    assert (output / "episode_000002.png").is_file()
+    assert not (output / "episode_000004.png").exists()
+    assert unrelated.read_bytes() == b"unrelated"

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import csv
+import heapq
 import json
 import math
 
 import os
+import re
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
+from ..plot_localization import chinese_plot_context
 from .episode_telemetry import RedTelemetryTracker
 
 EPS = 1.0e-9
@@ -283,7 +286,8 @@ def append_flight_quality_episode(episode: dict[str, Any], path: Path) -> None:
 
 def write_flight_quality_report(episodes: list[dict[str, Any]], output: Path,
                                 *, baseline_survival_rate: float | None = None,
-                                plot_limit: int = 10) -> dict[str, Any]:
+                                plot_limit: int = 10,
+                                font_path: str | Path | None = None) -> dict[str, Any]:
     """Write summary table, machine-readable traces, event markers, and panels."""
     if plot_limit < 0:
         raise ValueError("plot_limit must be non-negative")
@@ -305,108 +309,264 @@ def write_flight_quality_report(episodes: list[dict[str, Any]], output: Path,
         for e in episodes: writer.writerow({"episode": e["episode"], "blue_survived": e["blue_survived"], **e["metrics"]})
     if plot_limit > 0:
         ranked = sorted(episodes, key=lambda e: float(e["metrics"]["flight_quality_score"]))[:plot_limit]
-        for episode in ranked: _plot_episode(episode, output / f"episode_{int(episode['episode']):06d}.png")
+        for episode in ranked:
+            _plot_episode(episode, output / f"episode_{int(episode['episode']):06d}.png",
+                          font_path=font_path)
     return aggregate
 
 
-def _build_episode_figure(episode: dict[str, Any]) -> Any:
+_OFFLINE_REPLOT_MANIFEST = "flight_quality_replot_manifest.json"
+_EPISODE_PLOT_NAME = re.compile(r"episode_\d{6,}\.png")
+
+
+def replot_flight_quality_episodes(
+    source: str | Path,
+    output: str | Path,
+    *,
+    plot_limit: int = 10,
+    overwrite: bool = False,
+    clear_existing: bool = False,
+    font_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Stream a flight-quality JSONL file and redraw its lowest-scoring episodes.
+
+    At most ``plot_limit`` complete episode records are retained in memory.  By
+    default existing images are protected.  ``clear_existing`` removes only
+    files recorded by this function's previous manifest; it never expands a
+    wildcard over unrelated episode images.
+    """
+    if isinstance(plot_limit, bool) or not isinstance(plot_limit, int) or plot_limit < 0:
+        raise ValueError("plot_limit must be a non-negative integer")
+    if not isinstance(overwrite, bool) or not isinstance(clear_existing, bool):
+        raise TypeError("overwrite and clear_existing must be booleans")
+    source_path = Path(source).resolve()
+    output_path = Path(output).resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(source_path)
+
+    # The heap root is the largest score (and then largest episode ID) among
+    # retained candidates, so a better low-score record can replace it in O(log k).
+    retained: list[tuple[float, int, int, dict[str, Any]]] = []
+    records_scanned = 0
+    with source_path.open(encoding="utf-8-sig") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            records_scanned += 1
+            try:
+                episode = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"invalid flight-quality JSONL at {source_path}:{line_number}: {error.msg}"
+                ) from error
+            if not isinstance(episode, dict):
+                raise ValueError(
+                    f"flight-quality JSONL record must be an object: {source_path}:{line_number}"
+                )
+            episode_id = episode.get("episode")
+            metrics = episode.get("metrics")
+            score = metrics.get("flight_quality_score") if isinstance(metrics, dict) else None
+            if (isinstance(episode_id, bool) or not isinstance(episode_id, int)
+                    or episode_id < 1):
+                raise ValueError(
+                    f"invalid episode ID in flight-quality JSONL: {source_path}:{line_number}"
+                )
+            if (isinstance(score, bool) or not isinstance(score, (int, float))
+                    or not math.isfinite(float(score))):
+                raise ValueError(
+                    f"invalid flight_quality_score in flight-quality JSONL: "
+                    f"{source_path}:{line_number}"
+                )
+            if plot_limit == 0:
+                continue
+            entry = (-float(score), -episode_id, -line_number, episode)
+            if len(retained) < plot_limit:
+                heapq.heappush(retained, entry)
+            elif entry > retained[0]:
+                heapq.heapreplace(retained, entry)
+
+    selected = [entry[3] for entry in retained]
+    selected.sort(key=lambda item: (
+        float(item["metrics"]["flight_quality_score"]), int(item["episode"])
+    ))
+    selected_ids = [int(item["episode"]) for item in selected]
+    if len(selected_ids) != len(set(selected_ids)):
+        raise ValueError("selected flight-quality records contain duplicate episode IDs")
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_path / _OFFLINE_REPLOT_MANIFEST
+    previous_files: list[str] = []
+    if manifest_path.is_file():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"cannot read previous replot manifest: {manifest_path}") from error
+        files = (previous.get("managed_files", previous.get("files"))
+                 if isinstance(previous, dict) else None)
+        if not isinstance(files, list) or any(not isinstance(name, str) for name in files):
+            raise ValueError(f"invalid previous replot manifest: {manifest_path}")
+        for name in files:
+            if Path(name).name != name or _EPISODE_PLOT_NAME.fullmatch(name) is None:
+                raise ValueError(f"unsafe file name in previous replot manifest: {name!r}")
+        previous_files = files
+
+    names = [f"episode_{episode_id:06d}.png" for episode_id in selected_ids]
+    removable = set(previous_files) if clear_existing else set()
+    conflicts = [output_path / name for name in names
+                 if (output_path / name).exists() and name not in removable]
+    if conflicts and not overwrite:
+        raise FileExistsError(
+            "refusing to overwrite existing flight-quality plot(s): "
+            + ", ".join(str(path) for path in conflicts)
+        )
+
+    rendered: list[tuple[Path, Path]] = []
+    try:
+        for episode, name in zip(selected, names):
+            destination = output_path / name
+            temporary = destination.with_name(destination.name + ".tmp")
+            temporary.unlink(missing_ok=True)
+            rendered.append((temporary, destination))
+            _plot_episode(episode, temporary, image_format="png", font_path=font_path)
+        if clear_existing:
+            for name in previous_files:
+                (output_path / name).unlink(missing_ok=True)
+        for temporary, destination in rendered:
+            os.replace(temporary, destination)
+    finally:
+        for temporary, _ in rendered:
+            temporary.unlink(missing_ok=True)
+
+    result = {
+        "source": str(source_path),
+        "output": str(output_path),
+        "records_scanned": records_scanned,
+        "plot_limit": plot_limit,
+        "selected_episodes": selected_ids,
+        "selected_scores": [float(item["metrics"]["flight_quality_score"])
+                            for item in selected],
+        "files": names,
+        "managed_files": names if clear_existing else sorted(set(previous_files).union(names)),
+    }
+    temporary_manifest = manifest_path.with_name(manifest_path.name + ".tmp")
+    try:
+        temporary_manifest.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
+        )
+        os.replace(temporary_manifest, manifest_path)
+    finally:
+        temporary_manifest.unlink(missing_ok=True)
+    return result
+
+
+def _build_episode_figure(episode: dict[str, Any], *,
+                          font_path: str | Path | None = None) -> Any:
     """Render recorded values with separate units and without changing the GUI backend."""
     from matplotlib.backends.backend_agg import FigureCanvasAgg
     from matplotlib.figure import Figure
+    from matplotlib.text import Text
 
     def legend(axis: Any, other: Any) -> None:
         handles, labels = axis.get_legend_handles_labels()
         extra_handles, extra_labels = other.get_legend_handles_labels()
         axis.legend(handles + extra_handles, labels + extra_labels, fontsize=8)
 
-    trace = episode["trace"]; time = np.asarray(trace["time_s"]); pos = np.asarray(trace["position_m"])
-    fpa = np.asarray(trace["flight_path_angle_deg"])
-    rate = np.asarray([np.nan if x is None else x for x in trace["heading_rate_deg_s"]])
-    speed = np.asarray(trace["speed_mps"]); horizontal = np.asarray(trace["horizontal_speed_mps"])
-    radius = np.asarray([np.nan if x is None else x for x in trace["turn_radius_m"]])
-    fig = Figure(figsize=(16, 12), layout="constrained")
-    FigureCanvasAgg(fig)
-    axes = [fig.add_subplot(3, 2, 1, projection="3d")]
-    axes += [fig.add_subplot(3, 2, index) for index in range(2, 7)]
-    axes[0].plot(pos[:, 0], pos[:, 2], pos[:, 1], color="royalblue"); axes[0].set(xlabel="North x (m)", ylabel="East z (m)", zlabel="Altitude y (m)")
-    axes[1].plot(pos[:, 0], pos[:, 2]); axes[1].set(xlabel="North x (m)", ylabel="East z (m)", title="Horizontal trajectory")
-    red = trace["red_positions_m"]
-    red_count = max((len(frame) for frame in red), default=0)
-    for slot in range(red_count):
-        missile = np.asarray([frame[slot] if slot < len(frame) else [np.nan] * 3 for frame in red], dtype=float)
-        if "red_state_valid" in trace:
-            missile[~np.asarray(trace["red_state_valid"], dtype=bool)[:, slot]] = np.nan
-            red_id = trace["red_ids"][slot]
-            terminal = next((event for event in episode.get("red_termination_events", [])
-                             if event["red_id"] == red_id), None)
-            if terminal is not None:
-                missile = missile[time < terminal["time_s"]]
-                if terminal.get("position_valid", False):
-                    missile = np.vstack([missile, np.asarray(terminal["position_m"], dtype=float)])
-        axes[0].plot(missile[:, 0], missile[:, 2], missile[:, 1], color="firebrick", alpha=.35)
-        axes[1].plot(missile[:, 0], missile[:, 2], color="firebrick", alpha=.25)
-    axes[0].scatter(*pos[0, [0, 2, 1]], color="green", marker="o"); axes[0].scatter(*pos[-1, [0, 2, 1]], color="black", marker="x")
-    axes[1].scatter(pos[0, 0], pos[0, 2], color="green"); axes[1].scatter(pos[-1, 0], pos[-1, 2], color="black", marker="x")
-    axes[2].plot(time, pos[:, 1]); axes[2].set(ylabel="Altitude (m)")
-    for altitude, style in ((trace["min_altitude_m"], "--"), (trace["max_altitude_m"], "--")):
-        axes[2].axhline(altitude, color="black", ls=style, alpha=.6)
-    axes[3].plot(time, fpa, color="royalblue", label="Flight-path angle (deg)")
-    axes[3].set_ylabel("Flight-path angle (deg)")
-    heading_axis = axes[3].twinx()
-    heading_axis.plot(time, rate, color="darkorange", label="Heading rate (deg/s)", alpha=.7)
-    heading_axis.set_ylabel("Heading rate (deg/s)")
-    finite_rate = rate[np.isfinite(rate)]
-    heading_limit = max(1.0, float(np.abs(finite_rate).max()) * 1.05) if finite_rate.size else 1.0
-    heading_axis.set_ylim(-heading_limit, heading_limit)
-    for threshold in (-45, -30, 30, 45): axes[3].axhline(threshold, color="red" if abs(threshold) == 45 else "gold", ls="--")
-    axes[3].fill_between(time, fpa, 45, where=fpa >= 45, color="red", alpha=.18)
-    axes[3].fill_between(time, fpa, -45, where=fpa <= -45, color="red", alpha=.18)
-    legend(axes[3], heading_axis)
-    axes[4].plot(time, speed, label="Total speed"); axes[4].plot(time, horizontal, label="Horizontal speed")
-    axes[4].set(ylabel="Speed (m/s)")
-    axes[4].plot(time, np.abs(trace["vertical_speed_mps"]), label="|Vertical speed|", alpha=.7)
-    radius_axis = axes[4].twinx()
-    radius_axis.plot(time, radius, color="purple", alpha=.6, label="Turn radius")
-    radius_axis.set_ylabel("Turn radius (m)")
-    finite_radius = radius[np.isfinite(radius)]
-    if finite_radius.size:
-        radius_axis.set_ylim(0, max(1.0, float(finite_radius.max()) * 1.05))
-    else:
-        radius_axis.set_yticks([])
-        axes[4].text(.02, .02, "Turn radius unavailable", transform=axes[4].transAxes, fontsize=8)
-    legend(axes[4], radius_axis)
-    axes[5].step(time, [np.nan if x is None else x for x in trace["policy_action"]], where="post", label="policy")
-    axes[5].step(time, [np.nan if x is None else x for x in trace["executed_action"]], where="post", label="executed", alpha=.7)
-    load_axis = axes[5].twinx(); load_axis.plot(time, [np.nan if x is None else x for x in trace["commanded_load_g"]],
-                                               color="green", alpha=.45, label="commanded load")
-    load_axis.plot(time, trace["estimated_actual_load_g"], color="darkgreen", ls="--", alpha=.6,
-                   label="estimated actual load")
-    load_axis.set_ylabel("Load (g)")
-    loads = np.asarray([np.nan if value is None else value for key in
-                        ("commanded_load_g", "estimated_actual_load_g") for value in trace[key]])
-    finite_loads = loads[np.isfinite(loads)]
-    if finite_loads.size:
-        load_axis.set_ylim(0, max(1.0, float(finite_loads.max()) * 1.1))
-    for index in np.flatnonzero(trace["safety_intervened"]): axes[5].axvline(time[index], color="black", alpha=.25)
-    legend(axes[5], load_axis)
-    axes[5].set(ylabel="Action")
-    for axis in axes[2:]:
-        axis.set_xlabel("Time (s)")
-    colors = {"near_vertical": "red", "spiral": "purple", "steep_low_horizontal_speed": "magenta",
-              "reversal": "orange",
-              "self_return": "darkorange", "altitude_boundary": "brown"}
-    for event in episode["events"]:
-        for axis in axes[2:]: axis.axvspan(event["start_s"], event["end_s"], color=colors[event["type"]], alpha=.12)
-        selected = (time >= event["start_s"]) & (time <= event["end_s"])
-        axes[0].plot(pos[selected, 0], pos[selected, 2], pos[selected, 1], color=colors[event["type"]], lw=3)
-        axes[1].plot(pos[selected, 0], pos[selected, 2], color=colors[event["type"]], lw=3)
-    fig.suptitle(f"Blue flight quality — episode {episode['episode']} — score {episode['metrics']['flight_quality_score']:.1f}")
+    with chinese_plot_context(font_path) as font_name:
+        trace = episode["trace"]; time = np.asarray(trace["time_s"]); pos = np.asarray(trace["position_m"])
+        fpa = np.asarray(trace["flight_path_angle_deg"])
+        rate = np.asarray([np.nan if x is None else x for x in trace["heading_rate_deg_s"]])
+        speed = np.asarray(trace["speed_mps"]); horizontal = np.asarray(trace["horizontal_speed_mps"])
+        radius = np.asarray([np.nan if x is None else x for x in trace["turn_radius_m"]])
+        fig = Figure(figsize=(16, 12), layout="constrained")
+        FigureCanvasAgg(fig)
+        axes = [fig.add_subplot(3, 2, 1, projection="3d")]
+        axes += [fig.add_subplot(3, 2, index) for index in range(2, 7)]
+        axes[0].plot(pos[:, 0], pos[:, 2], pos[:, 1], color="royalblue"); axes[0].set(xlabel="北向 x（米）", ylabel="东向 z（米）", zlabel="高度 y（米）")
+        axes[1].plot(pos[:, 0], pos[:, 2]); axes[1].set(xlabel="北向 x（米）", ylabel="东向 z（米）", title="水平轨迹")
+        red = trace["red_positions_m"]
+        red_count = max((len(frame) for frame in red), default=0)
+        for slot in range(red_count):
+            missile = np.asarray([frame[slot] if slot < len(frame) else [np.nan] * 3 for frame in red], dtype=float)
+            if "red_state_valid" in trace:
+                missile[~np.asarray(trace["red_state_valid"], dtype=bool)[:, slot]] = np.nan
+                red_id = trace["red_ids"][slot]
+                terminal = next((event for event in episode.get("red_termination_events", [])
+                                 if event["red_id"] == red_id), None)
+                if terminal is not None:
+                    missile = missile[time < terminal["time_s"]]
+                    if terminal.get("position_valid", False):
+                        missile = np.vstack([missile, np.asarray(terminal["position_m"], dtype=float)])
+            axes[0].plot(missile[:, 0], missile[:, 2], missile[:, 1], color="firebrick", alpha=.35)
+            axes[1].plot(missile[:, 0], missile[:, 2], color="firebrick", alpha=.25)
+        axes[0].scatter(*pos[0, [0, 2, 1]], color="green", marker="o"); axes[0].scatter(*pos[-1, [0, 2, 1]], color="black", marker="x")
+        axes[1].scatter(pos[0, 0], pos[0, 2], color="green"); axes[1].scatter(pos[-1, 0], pos[-1, 2], color="black", marker="x")
+        axes[2].plot(time, pos[:, 1]); axes[2].set(ylabel="高度（米）")
+        for altitude, style in ((trace["min_altitude_m"], "--"), (trace["max_altitude_m"], "--")):
+            axes[2].axhline(altitude, color="black", ls=style, alpha=.6)
+        axes[3].plot(time, fpa, color="royalblue", label="航迹倾角（度）")
+        axes[3].set_ylabel("航迹倾角（度）")
+        heading_axis = axes[3].twinx()
+        heading_axis.plot(time, rate, color="darkorange", label="航向角速度（度/秒）", alpha=.7)
+        heading_axis.set_ylabel("航向角速度（度/秒）")
+        finite_rate = rate[np.isfinite(rate)]
+        heading_limit = max(1.0, float(np.abs(finite_rate).max()) * 1.05) if finite_rate.size else 1.0
+        heading_axis.set_ylim(-heading_limit, heading_limit)
+        for threshold in (-45, -30, 30, 45): axes[3].axhline(threshold, color="red" if abs(threshold) == 45 else "gold", ls="--")
+        axes[3].fill_between(time, fpa, 45, where=fpa >= 45, color="red", alpha=.18)
+        axes[3].fill_between(time, fpa, -45, where=fpa <= -45, color="red", alpha=.18)
+        legend(axes[3], heading_axis)
+        axes[4].plot(time, speed, label="总速度"); axes[4].plot(time, horizontal, label="水平速度")
+        axes[4].set(ylabel="速度（米/秒）")
+        axes[4].plot(time, np.abs(trace["vertical_speed_mps"]), label="垂直速度绝对值", alpha=.7)
+        radius_axis = axes[4].twinx()
+        radius_axis.plot(time, radius, color="purple", alpha=.6, label="转弯半径")
+        radius_axis.set_ylabel("转弯半径（米）")
+        finite_radius = radius[np.isfinite(radius)]
+        if finite_radius.size:
+            radius_axis.set_ylim(0, max(1.0, float(finite_radius.max()) * 1.05))
+        else:
+            radius_axis.set_yticks([])
+            axes[4].text(.02, .02, "无可用转弯半径", transform=axes[4].transAxes, fontsize=8)
+        legend(axes[4], radius_axis)
+        axes[5].step(time, [np.nan if x is None else x for x in trace["policy_action"]], where="post", label="策略动作")
+        axes[5].step(time, [np.nan if x is None else x for x in trace["executed_action"]], where="post", label="执行动作", alpha=.7)
+        load_axis = axes[5].twinx(); load_axis.plot(time, [np.nan if x is None else x for x in trace["commanded_load_g"]],
+                                                   color="green", alpha=.45, label="指令过载")
+        load_axis.plot(time, trace["estimated_actual_load_g"], color="darkgreen", ls="--", alpha=.6,
+                       label="估计实际过载")
+        load_axis.set_ylabel("过载（g）")
+        loads = np.asarray([np.nan if value is None else value for key in
+                            ("commanded_load_g", "estimated_actual_load_g") for value in trace[key]])
+        finite_loads = loads[np.isfinite(loads)]
+        if finite_loads.size:
+            load_axis.set_ylim(0, max(1.0, float(finite_loads.max()) * 1.1))
+        for index in np.flatnonzero(trace["safety_intervened"]): axes[5].axvline(time[index], color="black", alpha=.25)
+        legend(axes[5], load_axis)
+        axes[5].set(ylabel="动作编号")
+        for axis in axes[2:]:
+            axis.set_xlabel("时间（秒）")
+        colors = {"near_vertical": "red", "spiral": "purple", "steep_low_horizontal_speed": "magenta",
+                  "reversal": "orange",
+                  "self_return": "darkorange", "altitude_boundary": "brown"}
+        for event in episode["events"]:
+            for axis in axes[2:]: axis.axvspan(event["start_s"], event["end_s"], color=colors[event["type"]], alpha=.12)
+            selected_event = (time >= event["start_s"]) & (time <= event["end_s"])
+            axes[0].plot(pos[selected_event, 0], pos[selected_event, 2], pos[selected_event, 1], color=colors[event["type"]], lw=3)
+            axes[1].plot(pos[selected_event, 0], pos[selected_event, 2], color=colors[event["type"]], lw=3)
+        fig.suptitle(f"蓝机飞行质量—第 {episode['episode']} 回合—评分 {episode['metrics']['flight_quality_score']:.1f}")
+        # The figure is returned and may be drawn after the rc context exits.
+        # Store the concrete CJK family on every text object so a later draw
+        # cannot fall back to DejaVu Sans and turn Chinese into empty boxes.
+        for text in fig.findobj(match=Text):
+            text.set_fontfamily(font_name)
     return fig
 
 
-def _plot_episode(episode: dict[str, Any], path: Path) -> None:
-    fig = _build_episode_figure(episode)
-    try:
-        fig.savefig(path, dpi=140)
-    finally:
-        fig.clear()
+def _plot_episode(episode: dict[str, Any], path: Path, *, image_format: str | None = None,
+                  font_path: str | Path | None = None) -> None:
+    with chinese_plot_context(font_path):
+        fig = _build_episode_figure(episode, font_path=font_path)
+        try:
+            fig.savefig(path, dpi=140, format=image_format)
+        finally:
+            fig.clear()

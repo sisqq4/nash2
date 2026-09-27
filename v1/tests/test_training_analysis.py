@@ -202,7 +202,7 @@ def test_red_side_survival_uses_damage_fraction_and_labels_unfinished_rollouts()
     assert curves["fixed_validation.average_damage_rate"].y == pytest.approx([0.4])
     snapshot = curves["rollout_diagnostics.average_damage_rate"]
     assert snapshot.y == pytest.approx([0.75])
-    assert "snapshot" in snapshot.label.lower()
+    assert "过程快照" in snapshot.label
     assert not any("full_success_rate" in key for key in curves)
 
 
