@@ -49,6 +49,8 @@ from red_swarm_policy.train_blue_rl import (
     _checkpoint_validation_score,
     _evaluate_checkpoint_without_updates,
     _select_retained_checkpoints,
+    _training_plot_directories,
+    _write_post_training_plots,
 )
 
 
@@ -581,6 +583,46 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
     ]).reward_mechanisms == ("timing", "overload")
+
+
+def test_post_training_speed_load_plot_destinations_and_safe_call(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    training = tmp_path / "training"
+    metrics = training / "training_metrics.json"
+    default_analysis, default_speed_load = _training_plot_directories(training, None)
+    assert default_analysis == training / "training_analysis"
+    assert default_speed_load == training / "training_load_analysis"
+
+    custom = tmp_path / "custom-plots"
+    custom_analysis, custom_speed_load = _training_plot_directories(training, custom)
+    assert custom_analysis == custom
+    assert custom_speed_load == custom / "speed_load"
+
+    calls: list[tuple[str, tuple, dict]] = []
+    monkeypatch.setattr(
+        "red_swarm_policy.train_blue_rl.write_training_analysis_safely",
+        lambda *args, **kwargs: calls.append(("training", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        "red_swarm_policy.train_blue_rl.safe_analyze_blue_training_load",
+        lambda *args, **kwargs: calls.append(("speed_load", args, kwargs)),
+    )
+
+    destinations = _write_post_training_plots(
+        training_dir=training,
+        metrics_path=metrics,
+        training_plots_dir=custom,
+        smoothing_window=37,
+    )
+
+    assert destinations == (custom, custom / "speed_load")
+    assert calls == [
+        ("training", (metrics, custom), {"smoothing_window": 37}),
+        ("speed_load", (training, custom / "speed_load"), {
+            "rolling_window": 37, "block_size": 100, "dpi": 180,
+        }),
+    ]
 
 
 def test_checkpoint_validation_plan_is_fixed_and_balanced_across_training_scenarios() -> None:

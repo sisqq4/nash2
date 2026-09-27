@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from .analyze_blue_training_load import safe_analyze_blue_training_load
 from .analyze_training import write_training_analysis_safely
 from .analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
@@ -84,6 +85,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--flight-quality-plot-limit", type=int, default=10)
     parser.add_argument("--baseline-survival-rate", type=float, default=None)
     return parser
+
+
+def _training_plot_directories(
+    output: str | Path,
+    training_plots_dir: str | Path | None,
+) -> tuple[Path, Path]:
+    """Resolve generic and speed/load post-training plot destinations."""
+    training_output = Path(output)
+    if training_plots_dir is None:
+        return training_output / "training_analysis", training_output / "training_load_analysis"
+    analysis_output = Path(training_plots_dir)
+    return analysis_output, analysis_output / "speed_load"
+
+
+def _write_post_training_plots(
+    *,
+    training_dir: str | Path,
+    metrics_path: str | Path,
+    training_plots_dir: str | Path | None,
+    smoothing_window: int,
+) -> tuple[Path, Path]:
+    """Run isolated reporting only after durable training artifacts exist."""
+    analysis_output, speed_load_output = _training_plot_directories(
+        training_dir, training_plots_dir,
+    )
+    write_training_analysis_safely(
+        metrics_path, analysis_output, smoothing_window=smoothing_window,
+    )
+    safe_analyze_blue_training_load(
+        training_dir,
+        speed_load_output,
+        rolling_window=smoothing_window,
+        block_size=100,
+        dpi=180,
+    )
+    return analysis_output, speed_load_output
 
 
 def _emit(row: dict[str, Any], rows: list[dict[str, Any]], jsonl_path: Path) -> None:
@@ -928,15 +965,17 @@ def main() -> int:
                                             "checkpoint_evaluations": checkpoint_evaluations,
                                             "curriculum_evaluations": [row for row in event_rows if row["event"] == "curriculum_evaluation"],
                                             "episodes": summaries, "final_summary": final_summary}, indent=2), encoding="utf-8")
+    training_analysis_dir, _ = _training_plot_directories(output, args.training_plots_dir)
     if not args.no_training_plots:
-        write_training_analysis_safely(
-            metrics_path,
-            Path(args.training_plots_dir) if args.training_plots_dir else output / "training_analysis",
+        _write_post_training_plots(
+            training_dir=output,
+            metrics_path=metrics_path,
+            training_plots_dir=args.training_plots_dir,
             smoothing_window=args.plot_smoothing_window,
         )
     write_blue_training_results_safely(
         metrics_path,
-        (Path(args.training_plots_dir) if args.training_plots_dir else output / "training_analysis") / "results",
+        training_analysis_dir / "results",
         episode_orientations=episode_orientations,
         make_plots=not args.no_training_plots,
     )
