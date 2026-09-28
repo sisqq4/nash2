@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import random
 import time
+import uuid
 from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -32,7 +35,10 @@ from .env import GUIDANCE_CONTRACT
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the independent v1 blue Rainbow-DQN policy")
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument(
+        "--episodes", type=int, default=1000,
+        help="Total episode target, including episodes restored by --resume-from",
+    )
     parser.add_argument("--missiles", default="1",
                         help="Comma-separated scenarios to sample, e.g. 1,2,3,4 (default: 1)")
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--output", default="outputs/blue_rl/train")
@@ -74,6 +80,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint-eval-episodes", type=int, default=100,
         help=("Fixed holdout episodes evaluated at every checkpoint boundary without "
               "learner updates or per-episode artifacts (default: 100)"),
+    )
+    parser.add_argument(
+        "--resume-from", default=None, metavar="PATH",
+        help=("Resume a full blue-training snapshot (.pt), resume manifest (.json), "
+              "or the original training output directory"),
+    )
+    parser.add_argument(
+        "--resume-save-interval", type=int, default=100,
+        help=("Drain active environments and atomically save a full resumable state "
+              "after every N completed episodes; the safe boundary may be a few "
+              "episodes later when environments run in parallel (default: 100)"),
     )
     parser.add_argument("--curriculum", action="store_true",
                         help="Use the staged 1v1-to-1v4 rehearsal curriculum (normalized_v4 network)")
@@ -142,6 +159,675 @@ def _device_metrics(device: torch.device) -> dict[str, float]:
         "cuda_memory_reserved_mb": torch.cuda.memory_reserved(device) / 2**20,
         "cuda_max_memory_allocated_mb": torch.cuda.max_memory_allocated(device) / 2**20,
     }
+
+
+BLUE_RESUME_SCHEMA_VERSION = 1
+BLUE_RESUME_KIND = "blue_rainbow_full_training_state"
+
+
+def _capture_training_rng_state(device: torch.device | None = None) -> dict[str, object]:
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        if device is not None and device.type == "cuda":
+            state["torch_cuda_active"] = torch.cuda.get_rng_state(device)
+            state["torch_cuda_active_index"] = (
+                torch.cuda.current_device() if device.index is None else int(device.index)
+            )
+    return state
+
+
+def _restore_training_rng_state(state: dict[str, object], device: torch.device) -> None:
+    random.setstate(state["python"])  # type: ignore[arg-type]
+    np.random.set_state(state["numpy"])  # type: ignore[arg-type]
+    torch.set_rng_state(torch.as_tensor(state["torch"], dtype=torch.uint8).cpu())
+    cuda_states = state.get("torch_cuda")
+    if device.type != "cuda" or not torch.cuda.is_available() or not cuda_states:
+        return
+    saved = [torch.as_tensor(value, dtype=torch.uint8).cpu() for value in cuda_states]
+    if len(saved) == torch.cuda.device_count():
+        torch.cuda.set_rng_state_all(saved)
+    active_state = state.get("torch_cuda_active")
+    if active_state is not None:
+        torch.cuda.set_rng_state(
+            torch.as_tensor(active_state, dtype=torch.uint8).cpu(), device=device
+        )
+    elif len(saved) != torch.cuda.device_count():
+        saved_index = int(state.get("torch_cuda_active_index", 0))
+        torch.cuda.set_rng_state(saved[min(saved_index, len(saved) - 1)], device=device)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=True, allow_nan=False)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def _resume_entry_path(manifest_path: Path, entry: dict[str, object]) -> Path:
+    value = Path(str(entry["path"]))
+    candidate = (value if value.is_absolute() else manifest_path.parent / value).resolve()
+    resume_directory = manifest_path.parent.resolve()
+    try:
+        candidate.relative_to(resume_directory)
+    except ValueError as error:
+        raise ValueError(f"resume entry escapes its directory: {value}") from error
+    if (candidate.parent != resume_directory or not candidate.name.startswith("state_")
+            or candidate.suffix.lower() != ".pt"):
+        raise ValueError(f"invalid resume generation path: {value}")
+    return candidate
+
+
+def _validate_resume_file(path: Path, entry: dict[str, object] | None = None) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"resume snapshot does not exist: {path}")
+    if entry is not None:
+        expected_size = int(entry.get("size_bytes", -1))
+        if expected_size >= 0 and path.stat().st_size != expected_size:
+            raise ValueError(f"resume snapshot size mismatch: {path}")
+        expected_hash = entry.get("sha256")
+        if expected_hash is not None and _sha256(path) != str(expected_hash):
+            raise ValueError(f"resume snapshot SHA256 mismatch: {path}")
+
+
+def _load_resume_snapshot(source: str | Path) -> tuple[dict[str, Any], Path]:
+    requested = Path(source)
+    if requested.is_dir():
+        direct_manifest = requested / "latest.json"
+        nested_manifest = requested / "resume" / "latest.json"
+        requested = direct_manifest if direct_manifest.is_file() else nested_manifest
+    if requested.suffix.lower() != ".json":
+        _validate_resume_file(requested)
+        payload = torch.load(requested, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError("resume snapshot root must be a dictionary")
+        return payload, requested
+
+    manifest = json.loads(requested.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("resume manifest root must be a dictionary")
+    errors: list[str] = []
+    for label in ("latest", "previous"):
+        entry = manifest.get(label)
+        if not isinstance(entry, dict):
+            continue
+        try:
+            candidate = _resume_entry_path(requested, entry)
+            _validate_resume_file(candidate, entry)
+            payload = torch.load(candidate, map_location="cpu", weights_only=False)
+            if not isinstance(payload, dict):
+                raise ValueError("snapshot root must be a dictionary")
+            return payload, candidate
+        except Exception as error:
+            errors.append(f"{label}: {error}")
+    raise RuntimeError(
+        f"no valid resume generation in {requested}: " + "; ".join(errors)
+    )
+
+
+def _save_resume_generation(
+    directory: Path,
+    payload: dict[str, Any],
+    *,
+    snapshot_id: str,
+    completed_episodes: int,
+    reason: str,
+    preferred_previous_path: Path | None = None,
+) -> tuple[Path, Path]:
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest_path = directory / "latest.json"
+    final_path = directory / f"state_{snapshot_id}.pt"
+    temporary = directory / f".{final_path.name}.tmp"
+    with temporary.open("wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, final_path)
+    entry: dict[str, object] = {
+        "path": final_path.name,
+        "snapshot_id": snapshot_id,
+        "completed_episodes": int(completed_episodes),
+        "reason": reason,
+        "size_bytes": final_path.stat().st_size,
+        "sha256": _sha256(final_path),
+    }
+    previous_manifest: dict[str, object] = {}
+    if manifest_path.is_file():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                previous_manifest = loaded
+        except (OSError, ValueError):
+            previous_manifest = {}
+    old_latest = previous_manifest.get("latest")
+    old_previous = previous_manifest.get("previous")
+
+    previous_entry: dict[str, object] | None = None
+    seen_paths = {final_path.resolve()}
+    if preferred_previous_path is not None:
+        raw_candidates: list[dict[str, object]] = []
+        for manifest_entry in (old_latest, old_previous):
+            if not isinstance(manifest_entry, dict):
+                continue
+            try:
+                if (_resume_entry_path(manifest_path, manifest_entry)
+                        == preferred_previous_path.resolve()):
+                    raw_candidates.append(manifest_entry)
+                    break
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not raw_candidates:
+            try:
+                preferred = preferred_previous_path.resolve()
+                preferred.relative_to(directory.resolve())
+                _validate_resume_file(preferred)
+                raw_candidates.append({
+                    "path": preferred.name,
+                    "snapshot_id": preferred.stem.removeprefix("state_"),
+                    "completed_episodes": -1,
+                    "reason": "previous",
+                    "size_bytes": preferred.stat().st_size,
+                    "sha256": _sha256(preferred),
+                })
+            except (OSError, ValueError):
+                pass
+    else:
+        raw_candidates = [
+            entry for entry in (old_latest, old_previous) if isinstance(entry, dict)
+        ]
+    for candidate_entry in raw_candidates:
+        try:
+            candidate_path = _resume_entry_path(manifest_path, candidate_entry)
+            _validate_resume_file(candidate_path, candidate_entry)
+        except (OSError, KeyError, TypeError, ValueError):
+            continue
+        if candidate_path.resolve() in seen_paths:
+            continue
+        previous_entry = dict(candidate_entry)
+        seen_paths.add(candidate_path.resolve())
+        break
+
+    manifest: dict[str, object] = {
+        "schema_version": BLUE_RESUME_SCHEMA_VERSION,
+        "kind": BLUE_RESUME_KIND,
+        "latest": entry,
+        "previous": previous_entry,
+    }
+    _atomic_write_json(manifest_path, manifest)
+
+    keep = set(seen_paths)
+    for obsolete_entry in (old_latest, old_previous):
+        if not isinstance(obsolete_entry, dict):
+            continue
+        try:
+            obsolete = _resume_entry_path(manifest_path, obsolete_entry)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if obsolete.resolve() not in keep:
+            obsolete.unlink(missing_ok=True)
+    return final_path, manifest_path
+
+
+def _truncate_committed_log(path: Path, committed_bytes: int) -> None:
+    if committed_bytes < 0:
+        raise ValueError("committed log byte count must be non-negative")
+    if not path.exists():
+        if committed_bytes == 0:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"")
+            return
+        raise FileNotFoundError(f"resume log is missing: {path}")
+    if path.stat().st_size < committed_bytes:
+        raise ValueError(f"resume log is shorter than its committed offset: {path}")
+    with path.open("r+b") as stream:
+        stream.truncate(committed_bytes)
+
+
+def _resume_contract(
+    *,
+    args: argparse.Namespace,
+    training_scenarios: tuple[int, ...],
+    curriculum: CurriculumSchedule | None,
+    environment_config: Any,
+    env_config: BlueEscapeEnvConfig,
+    rainbow_config: RainbowDQNConfig,
+) -> dict[str, Any]:
+    """Describe every setting that changes the training trajectory."""
+    rainbow = asdict(rainbow_config)
+    rainbow.pop("device", None)
+    blue_environment = asdict(env_config)
+    acmi_directory = blue_environment.get("acmi_directory")
+    if acmi_directory:
+        blue_environment["acmi_directory"] = str(Path(str(acmi_directory)).resolve())
+    return {
+        "seed": int(args.seed),
+        "missile_scenarios": list(training_scenarios),
+        "updates_per_transition": float(args.updates_per_transition),
+        # Draining at each full-state boundary changes parallel batch
+        # composition, so this cadence is part of the learning trajectory.
+        "resume_save_interval": int(args.resume_save_interval),
+        "checkpoint_interval": int(args.checkpoint_interval),
+        "checkpoint_eval_episodes": int(args.checkpoint_eval_episodes),
+        "curriculum_eval_interval": int(args.curriculum_eval_interval),
+        "curriculum_eval_episodes": int(args.curriculum_eval_episodes),
+        "curriculum": curriculum.describe() if curriculum is not None else None,
+        "environment_config": asdict(environment_config),
+        "blue_environment_config": blue_environment,
+        "rainbow_config": rainbow,
+    }
+
+
+def _resume_int(value: object, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"resume {name} must be an integer")
+    result = int(value)
+    if result < minimum:
+        raise ValueError(f"resume {name} must be at least {minimum}")
+    return result
+
+
+def _validate_resume_artifacts(
+    output: Path,
+    retained_checkpoints: list[dict[str, Any]],
+    artifacts: object,
+) -> None:
+    if not isinstance(artifacts, dict):
+        raise ValueError("resume snapshot is missing artifacts")
+    root = output.resolve()
+    allowed_special = {"best_new_scenario.pt", "best_balanced.pt"}
+    artifact_keys: set[str] = set()
+    for relative_name, contents in artifacts.items():
+        if not isinstance(relative_name, str) or not isinstance(contents, bytes):
+            raise ValueError("resume artifacts must map relative paths to bytes")
+        relative = Path(relative_name)
+        destination = (root / relative).resolve()
+        try:
+            normalized = destination.relative_to(root).as_posix()
+        except ValueError as error:
+            raise ValueError(f"resume artifact escapes the output directory: {relative_name}") from error
+        is_checkpoint = (
+            len(relative.parts) == 2
+            and relative.parts[0] == "best_checkpoints"
+            and relative.name.startswith("blue_rainbow_ep")
+            and relative.name.removeprefix("blue_rainbow_ep").removesuffix(".pt").isdigit()
+            and relative.suffix.lower() == ".pt"
+        )
+        if not is_checkpoint and normalized not in allowed_special:
+            raise ValueError(f"unsupported resume artifact path: {relative_name}")
+        if normalized in artifact_keys:
+            raise ValueError(f"duplicate resume artifact path: {relative_name}")
+        artifact_keys.add(normalized)
+
+    retained_keys: set[str] = set()
+    for index, candidate in enumerate(retained_checkpoints):
+        required_candidate = {
+            "completed_episodes", "episode_thresholds", "final_state",
+            "checkpoint_path", "validation_episodes", "survived_count",
+            "survival_rate", "successful_evasion_count", "timeout_victory_count",
+            "failure_count", "termination_counts", "scenario_counts",
+            "scenario_survival_rates", "environment_transitions",
+            "optimizer_updates", "target_updates",
+        }
+        if not isinstance(candidate, dict) or not required_candidate.issubset(candidate):
+            raise ValueError(f"retained checkpoint {index} is malformed")
+        candidate_completed = _resume_int(
+            candidate["completed_episodes"], f"retained checkpoint {index} episode"
+        )
+        validation_episodes = _resume_int(
+            candidate["validation_episodes"],
+            f"retained checkpoint {index} validation_episodes",
+            minimum=1,
+        )
+        survived = _resume_int(
+            candidate["survived_count"], f"retained checkpoint {index} survived_count"
+        )
+        failed = _resume_int(
+            candidate["failure_count"], f"retained checkpoint {index} failure_count"
+        )
+        if survived + failed != validation_episodes:
+            raise ValueError(f"retained checkpoint {index} validation counts are inconsistent")
+        for name in (
+            "successful_evasion_count", "timeout_victory_count",
+            "environment_transitions", "optimizer_updates", "target_updates",
+        ):
+            _resume_int(candidate[name], f"retained checkpoint {index} {name}")
+        if not isinstance(candidate["final_state"], bool):
+            raise TypeError(f"retained checkpoint {index} final_state must be boolean")
+        if not isinstance(candidate["episode_thresholds"], list):
+            raise TypeError(f"retained checkpoint {index} thresholds must be a list")
+        for threshold in candidate["episode_thresholds"]:
+            _resume_int(threshold, f"retained checkpoint {index} threshold", minimum=1)
+        for name in ("termination_counts", "scenario_counts", "scenario_survival_rates"):
+            if not isinstance(candidate[name], dict):
+                raise TypeError(f"retained checkpoint {index} {name} must be a dictionary")
+        survival_rate = float(candidate["survival_rate"])
+        if not math.isfinite(survival_rate) or not 0.0 <= survival_rate <= 1.0:
+            raise ValueError(f"retained checkpoint {index} survival_rate is invalid")
+        checkpoint_path = Path(str(candidate["checkpoint_path"])).resolve()
+        try:
+            relative = checkpoint_path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                f"retained checkpoint {index} is outside the output directory"
+            ) from error
+        key = relative.as_posix()
+        valid_name = (
+            len(relative.parts) == 2
+            and relative.parts[0] == "best_checkpoints"
+            and relative.name.startswith("blue_rainbow_ep")
+            and relative.name.removeprefix("blue_rainbow_ep").removesuffix(".pt").isdigit()
+            and relative.suffix.lower() == ".pt"
+        )
+        if not valid_name:
+            raise ValueError(f"retained checkpoint {index} has an invalid path")
+        expected_name = f"blue_rainbow_ep{candidate_completed:06d}.pt"
+        if relative.name != expected_name:
+            raise ValueError(f"retained checkpoint {index} path does not match its episode")
+        retained_keys.add(key)
+    if len(retained_keys) != len(retained_checkpoints):
+        raise ValueError("retained checkpoint paths must be unique")
+    checkpoint_artifact_keys = {
+        key for key in artifact_keys if key.startswith("best_checkpoints/")
+    }
+    if retained_keys != checkpoint_artifact_keys:
+        raise ValueError("retained checkpoints and embedded checkpoint artifacts differ")
+
+
+def _validate_resume_payload(
+    payload: dict[str, Any],
+    *,
+    expected_contract: dict[str, Any],
+    output: Path,
+    target_episodes: int,
+) -> dict[str, Any]:
+    required_root = {
+        "schema_version", "kind", "snapshot_id", "reason", "output_directory",
+        "critical_config", "runtime_config", "agent_state", "rng_state",
+        "training_state", "artifacts",
+    }
+    missing_root = required_root - set(payload)
+    extra_root = set(payload) - required_root
+    if missing_root or extra_root:
+        raise ValueError(
+            f"invalid resume snapshot keys: missing={sorted(missing_root)}, "
+            f"extra={sorted(extra_root)}"
+        )
+    if payload.get("schema_version") != BLUE_RESUME_SCHEMA_VERSION:
+        raise ValueError(
+            "unsupported blue resume schema version: "
+            f"{payload.get('schema_version')!r}"
+        )
+    if payload.get("kind") != BLUE_RESUME_KIND:
+        raise ValueError(
+            "--resume-from requires a full blue-training snapshot; "
+            "a lightweight policy checkpoint cannot continue replay/optimizer state"
+        )
+    if not isinstance(payload.get("snapshot_id"), str) or not payload["snapshot_id"]:
+        raise ValueError("resume snapshot_id must be a non-empty string")
+    if payload.get("reason") not in {"periodic", "final"}:
+        raise ValueError(f"unsupported resume snapshot reason: {payload.get('reason')!r}")
+    saved_output = Path(str(payload.get("output_directory", ""))).resolve()
+    if saved_output != output.resolve():
+        raise ValueError(
+            f"resume output directory mismatch: saved={saved_output}, current={output.resolve()}"
+        )
+    saved_contract = payload.get("critical_config")
+    if not isinstance(saved_contract, dict):
+        raise ValueError("resume snapshot is missing critical_config")
+    if saved_contract != expected_contract:
+        differing = sorted(
+            key for key in set(saved_contract) | set(expected_contract)
+            if saved_contract.get(key) != expected_contract.get(key)
+        )
+        raise ValueError(
+            "resume training configuration mismatch for: " + ", ".join(differing)
+        )
+    runtime_config = payload.get("runtime_config")
+    if not isinstance(runtime_config, dict) or set(runtime_config) != {
+        "device", "parallel_envs", "env_worker_threads",
+    }:
+        raise ValueError("resume runtime_config is malformed")
+    if not isinstance(runtime_config["device"], str):
+        raise TypeError("resume runtime device must be a string")
+    _resume_int(runtime_config["parallel_envs"], "runtime parallel_envs", minimum=1)
+    _resume_int(
+        runtime_config["env_worker_threads"], "runtime env_worker_threads", minimum=1
+    )
+    training_state = payload.get("training_state")
+    if not isinstance(training_state, dict):
+        raise ValueError("resume snapshot is missing training_state")
+    required_training = {
+        "completed_episodes", "next_episode", "next_checkpoint", "next_log",
+        "next_curriculum_eval", "next_resume_save", "resume_generation",
+        "requested_resume_thresholds", "actual_completed_episodes",
+        "vector_iterations", "update_credit", "elapsed_s", "window_elapsed_s",
+        "window_transition_start", "window_update_start", "window_episodes",
+        "window_losses", "window_grad_norms", "window_values", "window_actions",
+        "window_policy_actions", "window_constraint_interventions",
+        "window_clamp_low", "window_clamp_high", "historical_best",
+        "best_balanced_score", "best_new_rate", "summaries", "quality_episodes",
+        "episode_orientations", "event_rows", "checkpoint_evaluations",
+        "retained_checkpoints", "current_state_already_validated", "log_paths",
+        "log_offsets",
+    }
+    missing_training = required_training - set(training_state)
+    extra_training = set(training_state) - required_training
+    if missing_training or extra_training:
+        raise ValueError(
+            f"invalid resume training_state keys: missing={sorted(missing_training)}, "
+            f"extra={sorted(extra_training)}"
+        )
+    completed = _resume_int(training_state["completed_episodes"], "completed_episodes")
+    if target_episodes < completed:
+        raise ValueError(
+            f"--episodes is the total target and must be at least {completed} when resuming"
+        )
+    if not isinstance(payload.get("agent_state"), dict):
+        raise ValueError("resume snapshot is missing agent_state")
+    if not isinstance(payload.get("rng_state"), dict):
+        raise ValueError("resume snapshot is missing rng_state")
+    rng_state = payload["rng_state"]
+    if not {"python", "numpy", "torch"}.issubset(rng_state):
+        raise ValueError("resume RNG state is incomplete")
+    allowed_rng_keys = {
+        "python", "numpy", "torch", "torch_cuda", "torch_cuda_active",
+        "torch_cuda_active_index",
+    }
+    if set(rng_state) - allowed_rng_keys:
+        raise ValueError("resume RNG state has unsupported keys")
+    if not isinstance(rng_state["python"], tuple) or not isinstance(rng_state["numpy"], tuple):
+        raise ValueError("resume Python/NumPy RNG states are malformed")
+    if (not isinstance(rng_state["torch"], torch.Tensor)
+            or rng_state["torch"].dtype != torch.uint8
+            or rng_state["torch"].ndim != 1):
+        raise ValueError("resume Torch RNG state is malformed")
+    try:
+        random.Random().setstate(rng_state["python"])
+        np.random.RandomState().set_state(rng_state["numpy"])
+        torch.Generator(device="cpu").set_state(rng_state["torch"].cpu())
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("resume CPU RNG state cannot be restored") from error
+    cuda_states = rng_state.get("torch_cuda")
+    if cuda_states is not None and (
+        not isinstance(cuda_states, list)
+        or any(
+            not isinstance(value, torch.Tensor)
+            or value.dtype != torch.uint8
+            or value.ndim != 1
+            for value in cuda_states
+        )
+    ):
+        raise ValueError("resume CUDA RNG states are malformed")
+    active_cuda_state = rng_state.get("torch_cuda_active")
+    active_cuda_index = rng_state.get("torch_cuda_active_index")
+    if (active_cuda_state is None) != (active_cuda_index is None):
+        raise ValueError("resume active CUDA RNG state/index must appear together")
+    if active_cuda_state is not None:
+        if not cuda_states:
+            raise ValueError("resume active CUDA RNG state requires CUDA RNG states")
+        if (not isinstance(active_cuda_state, torch.Tensor)
+                or active_cuda_state.dtype != torch.uint8
+                or active_cuda_state.ndim != 1):
+            raise ValueError("resume active CUDA RNG state is malformed")
+        _resume_int(active_cuda_index, "active CUDA device index")
+
+    next_episode = _resume_int(training_state["next_episode"], "next_episode", minimum=1)
+    if next_episode != completed + 1:
+        raise ValueError("resume next_episode must equal completed_episodes + 1")
+    for name in (
+        "next_checkpoint", "next_log", "next_curriculum_eval", "next_resume_save",
+        "resume_generation", "vector_iterations", "window_transition_start",
+        "window_update_start", "window_constraint_interventions",
+    ):
+        _resume_int(training_state[name], name, minimum=0)
+    if _resume_int(training_state["resume_generation"], "resume_generation") < 1:
+        raise ValueError("resume_generation must be positive")
+    if _resume_int(training_state["next_checkpoint"], "next_checkpoint", minimum=1) <= completed:
+        raise ValueError("resume next_checkpoint must be after completed_episodes")
+    if _resume_int(training_state["next_log"], "next_log", minimum=1) <= completed:
+        raise ValueError("resume next_log must be after completed_episodes")
+    if _resume_int(training_state["next_resume_save"], "next_resume_save", minimum=1) <= completed:
+        raise ValueError("resume next_resume_save must be after completed_episodes")
+    if _resume_int(
+        training_state["actual_completed_episodes"], "actual_completed_episodes"
+    ) != completed:
+        raise ValueError("resume actual_completed_episodes is inconsistent")
+    update_credit = float(training_state["update_credit"])
+    if not math.isfinite(update_credit) or not 0.0 <= update_credit < 1.0:
+        raise ValueError("resume update_credit must be finite and in [0, 1)")
+    for name in ("elapsed_s", "window_elapsed_s"):
+        value = float(training_state[name])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"resume {name} must be finite and non-negative")
+    thresholds = training_state["requested_resume_thresholds"]
+    if not isinstance(thresholds, list):
+        raise TypeError("resume requested_resume_thresholds must be a list")
+    parsed_thresholds = [
+        _resume_int(value, "requested_resume_threshold", minimum=1) for value in thresholds
+    ]
+    if parsed_thresholds != sorted(set(parsed_thresholds)) or any(
+        value > completed for value in parsed_thresholds
+    ):
+        raise ValueError("resume requested thresholds must be unique, sorted, and completed")
+    list_fields = (
+        "window_episodes", "window_losses", "window_grad_norms", "window_values",
+        "window_clamp_low", "window_clamp_high", "summaries", "quality_episodes",
+        "event_rows", "checkpoint_evaluations", "retained_checkpoints",
+    )
+    for name in list_fields:
+        if not isinstance(training_state[name], list):
+            raise TypeError(f"resume {name} must be a list")
+    dict_fields = (
+        "window_actions", "window_policy_actions", "historical_best", "best_new_rate",
+        "episode_orientations", "log_paths", "log_offsets",
+    )
+    for name in dict_fields:
+        if not isinstance(training_state[name], dict):
+            raise TypeError(f"resume {name} must be a dictionary")
+    if not isinstance(training_state["current_state_already_validated"], bool):
+        raise TypeError("resume current_state_already_validated must be boolean")
+    summary_ids = []
+    for row in training_state["summaries"]:
+        if not isinstance(row, dict) or "episode" not in row:
+            raise ValueError("resume summaries contain a malformed row")
+        summary_ids.append(_resume_int(row["episode"], "summary episode", minimum=1))
+    if sorted(summary_ids) != list(range(1, completed + 1)):
+        raise ValueError("resume summaries must contain every completed episode exactly once")
+    quality_ids = []
+    for row in training_state["quality_episodes"]:
+        if not isinstance(row, dict) or "episode" not in row:
+            raise ValueError("resume quality_episodes contain a malformed row")
+        quality_ids.append(_resume_int(row["episode"], "quality episode", minimum=1))
+    if sorted(quality_ids) != list(range(1, completed + 1)):
+        raise ValueError("resume flight-quality rows must match completed episodes")
+    window_ids = []
+    for row in training_state["window_episodes"]:
+        if not isinstance(row, dict) or "episode" not in row:
+            raise ValueError("resume window_episodes contain a malformed row")
+        window_ids.append(_resume_int(row["episode"], "window episode", minimum=1))
+    if len(window_ids) != len(set(window_ids)) or not set(window_ids).issubset(summary_ids):
+        raise ValueError("resume window episodes must be unique completed episodes")
+    log_offsets = training_state["log_offsets"]
+    if set(log_offsets) != {"training_jsonl_bytes", "flight_quality_jsonl_bytes"}:
+        raise ValueError("resume log_offsets has invalid keys")
+    for name, value in log_offsets.items():
+        _resume_int(value, name)
+    retained = training_state["retained_checkpoints"]
+    _validate_resume_artifacts(output, retained, payload["artifacts"])
+    return training_state
+
+
+def _collect_resume_artifacts(output: Path, paths: list[Path]) -> dict[str, bytes]:
+    root = output.resolve()
+    artifacts: dict[str, bytes] = {}
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"resume artifact is missing: {path}")
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"resume artifact is outside the output directory: {path}") from error
+        artifacts[relative.as_posix()] = path.read_bytes()
+    return artifacts
+
+
+def _restore_resume_artifacts(output: Path, artifacts: object) -> None:
+    if not isinstance(artifacts, dict):
+        raise ValueError("resume artifacts must be a dictionary")
+    root = output.resolve()
+    validated: list[tuple[Path, bytes]] = []
+    for relative_name, contents in artifacts.items():
+        if not isinstance(relative_name, str) or not isinstance(contents, bytes):
+            raise ValueError("resume artifact entries must map relative paths to bytes")
+        destination = (root / Path(relative_name)).resolve()
+        try:
+            relative = destination.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"resume artifact escapes the output directory: {relative_name}") from error
+        is_checkpoint = (
+            len(relative.parts) == 2
+            and relative.parts[0] == "best_checkpoints"
+            and relative.name.startswith("blue_rainbow_ep")
+            and relative.name.removeprefix("blue_rainbow_ep").removesuffix(".pt").isdigit()
+            and relative.suffix.lower() == ".pt"
+        )
+        if not is_checkpoint and relative.as_posix() not in {
+            "best_new_scenario.pt", "best_balanced.pt",
+        }:
+            raise ValueError(f"unsupported resume artifact path: {relative_name}")
+        validated.append((destination, contents))
+
+    # These files are derived from the saved leaderboard/curriculum state.  A
+    # rollback removes files created after the chosen safe generation.
+    best_directory = output / "best_checkpoints"
+    for path in best_directory.glob("blue_rainbow_ep*.pt"):
+        path.unlink()
+    for name in ("best_new_scenario.pt", "best_balanced.pt"):
+        (output / name).unlink(missing_ok=True)
+    for destination, contents in validated:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".resume.tmp")
+        with temporary.open("wb") as stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
 
 
 def _build_checkpoint_validation_plan(
@@ -383,10 +1069,10 @@ def main() -> int:
     try: missile_scenarios = parse_missile_scenarios(args.missiles)
     except ValueError as error: raise SystemExit(str(error)) from error
     if (args.episodes < 1 or args.checkpoint_interval < 1 or args.log_interval < 1
-            or args.checkpoint_eval_episodes < 1):
+            or args.checkpoint_eval_episodes < 1 or args.resume_save_interval < 1):
         raise SystemExit(
             "episodes, checkpoint interval, log interval, and checkpoint evaluation episodes "
-            "must be positive"
+            "and resume save interval must be positive"
         )
     if args.acmi_interval < 0 or args.parallel_envs < 1 or args.env_worker_threads < 1:
         raise SystemExit("ACMI interval must be non-negative and worker counts positive")
@@ -403,15 +1089,13 @@ def main() -> int:
         raise SystemExit("baseline survival rate must be in [0, 1]")
     if args.red_sector_width_deg is not None and not 0.0 < args.red_sector_width_deg <= 360.0:
         raise SystemExit("--red-sector-width-deg must be in (0, 360]")
-    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    random.seed(args.seed); np.random.seed(args.seed)
     output = Path(args.output); output.mkdir(parents=True, exist_ok=True)
     metrics_path = Path(args.metrics_path) if args.metrics_path else output / "training_metrics.json"
     jsonl_path = Path(args.jsonl_path) if args.jsonl_path else output / "training.jsonl"
     flight_quality_jsonl_path = output / "flight_quality" / "flight_quality_episodes.jsonl"
     metrics_path.parent.mkdir(parents=True, exist_ok=True); jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    jsonl_path.write_text("", encoding="utf-8")
     flight_quality_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-    flight_quality_jsonl_path.write_text("", encoding="utf-8")
     environment_config = configure_blue_mission_duration(load_environment_config(args.env_config))
     if args.red_sector_width_deg is not None:
         environment_config = replace(environment_config, scenario=replace(
@@ -452,7 +1136,66 @@ def main() -> int:
         flight_envelope_config=asdict(envelope_config),
         mechanism_reward_config=asdict(env_config.mechanism_reward),
     )
-    pool_size = min(args.parallel_envs, args.episodes)
+    critical_config = _resume_contract(
+        args=args,
+        training_scenarios=tuple(training_scenarios),
+        curriculum=curriculum,
+        environment_config=environment_config,
+        env_config=env_config,
+        rainbow_config=rainbow_config,
+    )
+    resume_payload: dict[str, Any] | None = None
+    resume_path: Path | None = None
+    resume_snapshot_id: str | None = None
+    resume_rng_state: dict[str, object] | None = None
+    resume_runtime_config: dict[str, Any] | None = None
+    restored_training_state: dict[str, Any] | None = None
+    resume_log_offsets: dict[str, Any] | None = None
+    if args.resume_from is not None:
+        try:
+            resume_payload, resume_path = _load_resume_snapshot(args.resume_from)
+            restored_training_state = _validate_resume_payload(
+                resume_payload,
+                expected_contract=critical_config,
+                output=output,
+                target_episodes=args.episodes,
+            )
+            resume_snapshot_id = str(resume_payload["snapshot_id"])
+            resume_runtime_config = dict(resume_payload["runtime_config"])
+            saved_log_paths = restored_training_state.get("log_paths")
+            expected_log_paths = {
+                "training_jsonl": str(jsonl_path.resolve()),
+                "flight_quality_jsonl": str(flight_quality_jsonl_path.resolve()),
+            }
+            if saved_log_paths != expected_log_paths:
+                raise ValueError(
+                    "resume log path mismatch; use the original output/jsonl paths"
+                )
+            resume_log_offsets = restored_training_state.get("log_offsets")
+            if not isinstance(resume_log_offsets, dict):
+                raise ValueError("resume snapshot is missing committed log offsets")
+            int(resume_log_offsets["training_jsonl_bytes"])
+            int(resume_log_offsets["flight_quality_jsonl_bytes"])
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise SystemExit(f"cannot resume blue training: {error}") from error
+    else:
+        jsonl_path.write_text("", encoding="utf-8")
+        flight_quality_jsonl_path.write_text("", encoding="utf-8")
+        resume_directory = output / "resume"
+        if resume_directory.is_dir():
+            for stale_snapshot in resume_directory.glob("state_*.pt"):
+                stale_snapshot.unlink()
+            for stale_temporary in resume_directory.glob(".state_*.pt.tmp"):
+                stale_temporary.unlink()
+            (resume_directory / "latest.json").unlink(missing_ok=True)
+            (resume_directory / "latest.json.tmp").unlink(missing_ok=True)
+
+    restored_completed = (
+        int(restored_training_state["completed_episodes"])
+        if restored_training_state is not None else 0
+    )
+    remaining_episodes = max(args.episodes - restored_completed, 1)
+    pool_size = min(args.parallel_envs, remaining_episodes)
     # Spawn CPU simulation workers before creating a CUDA context.  On Windows,
     # starting spawned children after CUDA initialization can indefinitely stall
     # all workers while they import PyTorch.
@@ -466,18 +1209,59 @@ def main() -> int:
         native_threads=args.env_worker_threads,
         timeout_s=args.env_worker_timeout_s,
     ) as checkpoint_eval_pool:
+        # Keep CUDA initialization in the parent until every Windows worker has
+        # spawned.  A resumed RNG state is restored after constructing/loading
+        # the agent because both operations consume Torch random numbers.
+        torch.manual_seed(args.seed)
+        if torch.device(args.device).type == "cuda":
+            torch.cuda.manual_seed_all(args.seed)
         agent = RainbowDQNAgent(rainbow_config)
-        event_rows: list[dict[str, Any]] = []; summaries: list[dict[str, Any]] = []
-        checkpoint_evaluations: list[dict[str, Any]] = []
-        retained_checkpoints: list[dict[str, Any]] = []
+        if resume_payload is not None:
+            try:
+                resume_agent_state = resume_payload.pop("agent_state")
+                agent.load_training_state_dict(resume_agent_state)
+                del resume_agent_state
+                assert resume_log_offsets is not None
+                _truncate_committed_log(
+                    jsonl_path, int(resume_log_offsets["training_jsonl_bytes"])
+                )
+                _truncate_committed_log(
+                    flight_quality_jsonl_path,
+                    int(resume_log_offsets["flight_quality_jsonl_bytes"]),
+                )
+                resume_artifacts = resume_payload.pop("artifacts")
+                _restore_resume_artifacts(output, resume_artifacts)
+                del resume_artifacts
+                resume_rng_state = resume_payload.pop("rng_state")
+                for derived_output in {
+                    metrics_path,
+                    output / "training_metrics.json",
+                    output / "episodes.json",
+                    output / "blue_rainbow.pt",
+                }:
+                    derived_output.unlink(missing_ok=True)
+            except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:
+                raise SystemExit(f"cannot restore blue training state: {error}") from error
+
+        state = restored_training_state or {}
+        event_rows: list[dict[str, Any]] = list(state.get("event_rows", []))
+        summaries: list[dict[str, Any]] = list(state.get("summaries", []))
+        checkpoint_evaluations: list[dict[str, Any]] = list(
+            state.get("checkpoint_evaluations", [])
+        )
+        retained_checkpoints: list[dict[str, Any]] = list(
+            state.get("retained_checkpoints", [])
+        )
         last_checkpoint_validation_state: tuple[object, ...] | None = None
         best_checkpoint_directory = output / "best_checkpoints"
         best_checkpoint_directory.mkdir(parents=True, exist_ok=True)
         leaderboard_path = best_checkpoint_directory / "leaderboard.json"
-        for stale_checkpoint in best_checkpoint_directory.glob("blue_rainbow_ep*.pt"):
-            stale_checkpoint.unlink()
-        leaderboard_path.unlink(missing_ok=True)
+        if restored_training_state is None:
+            for stale_checkpoint in best_checkpoint_directory.glob("blue_rainbow_ep*.pt"):
+                stale_checkpoint.unlink()
+            leaderboard_path.unlink(missing_ok=True)
         started = time.monotonic()
+        elapsed_before_resume = float(state.get("elapsed_s", 0.0))
         experiment = {
             "event": "experiment_config", "device": str(agent.device), "red_counts": list(training_scenarios),
             "blue_count": 1, "scenario_sampling": ("staged_curriculum" if curriculum is not None
@@ -516,13 +1300,6 @@ def main() -> int:
             "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
             "curriculum": curriculum.describe() if curriculum is not None else None,
         }
-        device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
-        if agent.device.type == "cuda":
-            device_row.update({"cuda_device_name": torch.cuda.get_device_name(agent.device),
-                               "cuda_device_count": torch.cuda.device_count()})
-        _emit(device_row, event_rows, jsonl_path)
-        _emit(experiment, event_rows, jsonl_path)
-
         scenario_rng = random.Random(args.seed)
         episode_scenarios = {episode: (curriculum.sample(episode, scenario_rng) if curriculum is not None
                                       else scenario_rng.choice(missile_scenarios))
@@ -530,7 +1307,7 @@ def main() -> int:
         episode_stages = {episode: curriculum.stage_at(episode)[1].name
                           for episode in range(1, args.episodes + 1)} if curriculum is not None else {}
         observations: dict[int, np.ndarray] = {}; episode_by_worker: dict[int, int] = {}
-        episode_orientations: dict[int, str] = {}
+        episode_orientations: dict[int, str] = dict(state.get("episode_orientations", {}))
         learning_active_by_worker: dict[int, bool] = {}
         reward_by_worker: dict[int, float] = {}; decisions_by_worker: dict[int, int] = {}
         reward_components_by_worker: dict[int, Counter[str]] = {}
@@ -538,18 +1315,40 @@ def main() -> int:
         envelope_states: dict[int, dict[str, object]] = {}
         constraints = {worker: FlightEnvelopeConstraintLayer(envelope_config)
                        for worker in range(pool_size)}
-        quality: dict[int, FlightQualityTracker] = {}; quality_episodes: list[dict[str, Any]] = []
-        next_episode = 1; completed = 0; update_credit = 0.0
-        next_checkpoint = args.checkpoint_interval; next_log = args.log_interval; vector_iterations = 0
-        next_curriculum_eval = args.curriculum_eval_interval
-        historical_best: dict[int, float] = {}; best_balanced_score = -math.inf
-        best_new_rate: dict[int, float] = {}
-        window_episodes: list[dict[str, Any]] = []; window_losses: list[float] = []
-        window_grad_norms: list[float] = []; window_values: list[float] = []
-        window_actions: Counter[int] = Counter(); window_policy_actions: Counter[int] = Counter()
-        window_constraint_interventions = 0
-        window_clamp_low: list[float] = []; window_clamp_high: list[float] = []
-        window_started = started; window_transition_start = 0; window_update_start = 0
+        quality: dict[int, FlightQualityTracker] = {}
+        quality_episodes: list[dict[str, Any]] = list(state.get("quality_episodes", []))
+        next_episode = int(state.get("next_episode", 1))
+        completed = int(state.get("completed_episodes", 0))
+        update_credit = float(state.get("update_credit", 0.0))
+        next_checkpoint = int(state.get("next_checkpoint", args.checkpoint_interval))
+        next_log = int(state.get("next_log", args.log_interval))
+        vector_iterations = int(state.get("vector_iterations", 0))
+        next_curriculum_eval = int(
+            state.get("next_curriculum_eval", args.curriculum_eval_interval)
+        )
+        next_resume_save = int(state.get("next_resume_save", args.resume_save_interval))
+        while next_resume_save <= completed:
+            next_resume_save += args.resume_save_interval
+        resume_generation = int(state.get("resume_generation", 0))
+        last_resume_snapshot_path = resume_path
+        historical_best: dict[int, float] = dict(state.get("historical_best", {}))
+        best_balanced_score = float(state.get("best_balanced_score", -math.inf))
+        best_new_rate: dict[int, float] = dict(state.get("best_new_rate", {}))
+        window_episodes: list[dict[str, Any]] = list(state.get("window_episodes", []))
+        window_losses: list[float] = list(state.get("window_losses", []))
+        window_grad_norms: list[float] = list(state.get("window_grad_norms", []))
+        window_values: list[float] = list(state.get("window_values", []))
+        window_actions: Counter[int] = Counter(state.get("window_actions", {}))
+        window_policy_actions: Counter[int] = Counter(state.get("window_policy_actions", {}))
+        window_constraint_interventions = int(state.get("window_constraint_interventions", 0))
+        window_clamp_low: list[float] = list(state.get("window_clamp_low", []))
+        window_clamp_high: list[float] = list(state.get("window_clamp_high", []))
+        window_elapsed_before_resume = float(state.get("window_elapsed_s", 0.0))
+        window_started = started
+        window_transition_start = int(state.get("window_transition_start", agent.total_steps))
+        window_update_start = int(state.get("window_update_start", agent.optimizer_updates))
+        draining_for_resume = False
+        drain_requested_thresholds: list[int] = []
 
         def leaderboard_entry(candidate: dict[str, Any]) -> dict[str, Any]:
             return {
@@ -580,7 +1379,7 @@ def main() -> int:
                 entry for item, entry in zip(retained_checkpoints, ordered_entries)
                 if best_score is not None and _checkpoint_validation_score(item) == best_score
             ]
-            leaderboard_path.write_text(json.dumps({
+            _atomic_write_json(leaderboard_path, {
                 "ranking": [
                     "survived_count_desc",
                     "successful_evasion_count_desc",
@@ -594,7 +1393,7 @@ def main() -> int:
                 ],
                 "best_checkpoints": best_entries,
                 "retained_checkpoints": ordered_entries,
-            }, indent=2), encoding="utf-8")
+            })
 
         def validate_checkpoint(
             episode_thresholds: list[int], *, final_state: bool = False,
@@ -614,7 +1413,7 @@ def main() -> int:
             )
             checkpoint_path = (
                 best_checkpoint_directory / f"blue_rainbow_ep{completed:06d}.pt"
-            )
+            ).resolve()
             candidate: dict[str, Any] = {
                 "completed_episodes": completed,
                 "episode_thresholds": list(episode_thresholds),
@@ -657,23 +1456,198 @@ def main() -> int:
             write_checkpoint_leaderboard()
             _emit(evaluation_record, event_rows, jsonl_path)
 
+        def retire_worker(worker: int) -> None:
+            observations.pop(worker, None)
+            episode_by_worker.pop(worker, None)
+            learning_active_by_worker.pop(worker, None)
+            reward_by_worker.pop(worker, None)
+            decisions_by_worker.pop(worker, None)
+            reward_components_by_worker.pop(worker, None)
+            reward_diagnostics_by_worker.pop(worker, None)
+            quality.pop(worker, None)
+            envelope_states.pop(worker, None)
+
+        def prepare_assignments(worker_ids: list[int]) -> dict[int, tuple[int, int, int]]:
+            nonlocal next_episode
+            assignments: dict[int, tuple[int, int, int]] = {}
+            for worker in worker_ids:
+                if next_episode > args.episodes:
+                    break
+                assignments[worker] = (
+                    args.seed + next_episode,
+                    next_episode,
+                    episode_scenarios[next_episode],
+                )
+                episode_by_worker[worker] = next_episode
+                reward_by_worker[worker] = 0.0
+                reward_components_by_worker[worker] = Counter()
+                reward_diagnostics_by_worker[worker] = Counter()
+                decisions_by_worker[worker] = 0
+                quality[worker] = FlightQualityTracker()
+                constraints[worker].reset()
+                next_episode += 1
+            return assignments
+
+        def reset_assignments(assignments: dict[int, tuple[int, int, int]]) -> None:
+            if not assignments:
+                return
+            for worker, (observation, info) in pool.reset(assignments).items():
+                record_episode_orientation(
+                    episode_orientations, episode_by_worker[worker], info
+                )
+                observations[worker] = observation
+                learning_active_by_worker[worker] = bool(info["learning_active"])
+                quality[worker].add(info["flight_quality_state"])
+                envelope_states[worker] = dict(info["flight_quality_state"])
+                constraints[worker].reset()
+
+        def save_resume_snapshot(
+            *, reason: str, requested_thresholds: list[int], actual_completed: int,
+        ) -> tuple[Path, Path]:
+            nonlocal resume_generation, last_resume_snapshot_path
+            if observations:
+                raise RuntimeError("full resume state can only be saved after draining all workers")
+            if next_episode != completed + 1:
+                raise RuntimeError(
+                    "safe resume boundary requires next_episode == completed_episodes + 1"
+                )
+            agent.assert_resume_safe()
+
+            artifact_paths = [
+                Path(str(candidate["checkpoint_path"]))
+                for candidate in retained_checkpoints
+            ]
+            artifact_paths.extend(
+                path for path in (
+                    output / "best_new_scenario.pt",
+                    output / "best_balanced.pt",
+                ) if path.is_file()
+            )
+            artifacts = _collect_resume_artifacts(output, artifact_paths)
+            now = time.monotonic()
+            resume_generation += 1
+            snapshot_id = (
+                f"g{resume_generation:06d}_ep{completed:06d}_"
+                f"t{agent.total_steps:012d}_{uuid.uuid4().hex[:12]}"
+            )
+            training_state: dict[str, Any] = {
+                "completed_episodes": completed,
+                "next_episode": next_episode,
+                "next_checkpoint": next_checkpoint,
+                "next_log": next_log,
+                "next_curriculum_eval": next_curriculum_eval,
+                "next_resume_save": next_resume_save,
+                "resume_generation": resume_generation,
+                "requested_resume_thresholds": list(requested_thresholds),
+                "actual_completed_episodes": int(actual_completed),
+                "vector_iterations": vector_iterations,
+                "update_credit": update_credit,
+                "elapsed_s": elapsed_before_resume + now - started,
+                "window_elapsed_s": window_elapsed_before_resume + now - window_started,
+                "window_transition_start": window_transition_start,
+                "window_update_start": window_update_start,
+                "window_episodes": window_episodes,
+                "window_losses": window_losses,
+                "window_grad_norms": window_grad_norms,
+                "window_values": window_values,
+                "window_actions": dict(window_actions),
+                "window_policy_actions": dict(window_policy_actions),
+                "window_constraint_interventions": window_constraint_interventions,
+                "window_clamp_low": window_clamp_low,
+                "window_clamp_high": window_clamp_high,
+                "historical_best": historical_best,
+                "best_balanced_score": best_balanced_score,
+                "best_new_rate": best_new_rate,
+                "summaries": summaries,
+                "quality_episodes": quality_episodes,
+                "episode_orientations": episode_orientations,
+                "event_rows": event_rows,
+                "checkpoint_evaluations": checkpoint_evaluations,
+                "retained_checkpoints": retained_checkpoints,
+                "current_state_already_validated": (
+                    last_checkpoint_validation_state
+                    == _checkpoint_validation_learner_state(agent)
+                ),
+                "log_paths": {
+                    "training_jsonl": str(jsonl_path.resolve()),
+                    "flight_quality_jsonl": str(flight_quality_jsonl_path.resolve()),
+                },
+                "log_offsets": {
+                    "training_jsonl_bytes": jsonl_path.stat().st_size,
+                    "flight_quality_jsonl_bytes": flight_quality_jsonl_path.stat().st_size,
+                },
+            }
+            payload: dict[str, Any] = {
+                "schema_version": BLUE_RESUME_SCHEMA_VERSION,
+                "kind": BLUE_RESUME_KIND,
+                "snapshot_id": snapshot_id,
+                "reason": reason,
+                "output_directory": str(output.resolve()),
+                "critical_config": critical_config,
+                "runtime_config": {
+                    "device": str(agent.device),
+                    "parallel_envs": int(args.parallel_envs),
+                    "env_worker_threads": int(args.env_worker_threads),
+                },
+                "agent_state": agent.training_state_dict(),
+                "rng_state": _capture_training_rng_state(agent.device),
+                "training_state": training_state,
+                "artifacts": artifacts,
+            }
+            result = _save_resume_generation(
+                output / "resume",
+                payload,
+                snapshot_id=snapshot_id,
+                completed_episodes=completed,
+                reason=reason,
+                preferred_previous_path=last_resume_snapshot_path,
+            )
+            last_resume_snapshot_path = result[0]
+            return result
+
+        if restored_training_state is not None:
+            if bool(restored_training_state.get("current_state_already_validated", False)):
+                last_checkpoint_validation_state = _checkpoint_validation_learner_state(agent)
+            write_checkpoint_leaderboard()
+            assert (resume_path is not None and resume_rng_state is not None
+                    and resume_runtime_config is not None)
+            _restore_training_rng_state(resume_rng_state, agent.device)
+            resume_rng_state = None
+            if resume_payload is not None:
+                resume_payload.clear()
+                resume_payload = None
+            _emit({
+                "event": "training_resumed",
+                "snapshot_path": str(resume_path),
+                "snapshot_id": resume_snapshot_id,
+                "restored_completed_episodes": completed,
+                "target_episodes": args.episodes,
+                "device": str(agent.device),
+                "parallel_cpu_envs": pool_size,
+                "trajectory_equivalent_runtime": (
+                    str(resume_runtime_config["device"]) == str(agent.device)
+                    and int(resume_runtime_config["parallel_envs"]) == args.parallel_envs
+                    and int(resume_runtime_config["env_worker_threads"])
+                    == args.env_worker_threads
+                ),
+                "saved_runtime_config": resume_runtime_config,
+            }, event_rows, jsonl_path)
+        else:
+            device_row: dict[str, Any] = {"event": "device", "device": str(agent.device)}
+            if agent.device.type == "cuda":
+                device_row.update({
+                    "cuda_device_name": torch.cuda.get_device_name(agent.device),
+                    "cuda_device_count": torch.cuda.device_count(),
+                })
+            _emit(device_row, event_rows, jsonl_path)
+            _emit(experiment, event_rows, jsonl_path)
+
         _emit({"event": "environment_workers", "backend": "process_spawn",
                "worker_count": pool_size, "workers": list(pool.worker_info)}, event_rows, jsonl_path)
-        assignments = {}
-        for worker in range(pool_size):
-            assignments[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
-            episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
-            reward_components_by_worker[worker] = Counter()
-            reward_diagnostics_by_worker[worker] = Counter()
-            decisions_by_worker[worker] = 0; next_episode += 1
-            quality[worker] = FlightQualityTracker()
-        for worker, (observation, info) in pool.reset(assignments).items():
-            record_episode_orientation(episode_orientations, episode_by_worker[worker], info)
-            observations[worker] = observation
-            learning_active_by_worker[worker] = bool(info["learning_active"])
-            quality[worker].add(info["flight_quality_state"])
-            envelope_states[worker] = dict(info["flight_quality_state"])
-            constraints[worker].reset()
+        if next_episode != completed + 1:
+            raise RuntimeError("resume state has inconsistent next_episode/completed_episodes")
+        initial_workers = list(range(min(pool_size, args.episodes - completed)))
+        reset_assignments(prepare_assignments(initial_workers))
         while observations:
             vector_iterations += 1; workers = sorted(observations)
             active_workers = [worker for worker in workers if learning_active_by_worker[worker]]
@@ -703,7 +1677,9 @@ def main() -> int:
             results = pool.step(
                 actions, policy_actions=policy_actions, action_masks=action_masks,
                 fallback_required=fallback_flags,
-            ); resets: dict[int, tuple[int, int]] = {}
+            )
+            resets: dict[int, tuple[int, int, int]] = {}
+            finished_workers: list[int] = []
             learning_transition_count = 0
             for worker in workers:
                 result = results[worker]; previous = observations[worker]
@@ -780,22 +1756,21 @@ def main() -> int:
                     row["flight_quality"] = {key: quality_result[key] for key in ("metrics", "verdicts", "events")}
                     quality_episodes.append(quality_result)
                     append_flight_quality_episode(quality_result, flight_quality_jsonl_path)
-                    if next_episode <= args.episodes:
-                        resets[worker] = (args.seed + next_episode, next_episode, episode_scenarios[next_episode])
-                        episode_by_worker[worker] = next_episode; reward_by_worker[worker] = 0.0
-                        reward_components_by_worker[worker] = Counter()
-                        reward_diagnostics_by_worker[worker] = Counter()
-                        decisions_by_worker[worker] = 0; next_episode += 1
-                        quality[worker] = FlightQualityTracker()
-                        constraints[worker].reset()
-                    else:
-                        observations.pop(worker); episode_by_worker.pop(worker)
-                        learning_active_by_worker.pop(worker)
-                        reward_by_worker.pop(worker); decisions_by_worker.pop(worker)
-                        reward_components_by_worker.pop(worker)
-                        reward_diagnostics_by_worker.pop(worker)
-                        quality.pop(worker)
-                        envelope_states.pop(worker)
+                    finished_workers.append(worker)
+
+            if (not draining_for_resume and completed >= next_resume_save
+                    and completed < args.episodes and next_episode <= args.episodes):
+                draining_for_resume = True
+                drain_requested_thresholds = []
+                threshold = next_resume_save
+                while threshold <= completed:
+                    drain_requested_thresholds.append(threshold)
+                    threshold += args.resume_save_interval
+            for worker in finished_workers:
+                if draining_for_resume or next_episode > args.episodes:
+                    retire_worker(worker)
+                else:
+                    resets.update(prepare_assignments([worker]))
             # Replay insertion and loss/gradient computation are both driven
             # exclusively by post-detection transitions.
             update_credit += learning_transition_count * args.updates_per_transition
@@ -865,9 +1840,9 @@ def main() -> int:
                     "simulation_time_mean_s": _mean(simulation_times),
                     "termination_counts": dict(Counter(str(row["termination_reason"]) for row in window_episodes)),
                     "rollout_diagnostics": {
-                        "wall_time_s": now - window_started,
-                        "transitions_per_s": (agent.total_steps - window_transition_start) / max(now - window_started, 1e-9),
-                        "episodes_per_hour": len(window_episodes) * 3600.0 / max(now - window_started, 1e-9),
+                        "wall_time_s": window_elapsed_before_resume + now - window_started,
+                        "transitions_per_s": (agent.total_steps - window_transition_start) / max(window_elapsed_before_resume + now - window_started, 1e-9),
+                        "episodes_per_hour": len(window_episodes) * 3600.0 / max(window_elapsed_before_resume + now - window_started, 1e-9),
                     },
                     "policy_diagnostics": {
                         "policy_action_histogram": {str(key): value for key, value in sorted(window_policy_actions.items())},
@@ -898,21 +1873,60 @@ def main() -> int:
                 window_clamp_low = []; window_clamp_high = []
                 window_actions = Counter(); window_policy_actions = Counter()
                 window_constraint_interventions = 0; window_started = now
+                window_elapsed_before_resume = 0.0
                 window_transition_start = agent.total_steps; window_update_start = agent.optimizer_updates
             if resets:
-                for worker, (observation, info) in pool.reset(resets).items():
-                    record_episode_orientation(episode_orientations, episode_by_worker[worker], info)
-                    observations[worker] = observation
-                    learning_active_by_worker[worker] = bool(info["learning_active"])
-                    quality[worker].add(info["flight_quality_state"])
-                    envelope_states[worker] = dict(info["flight_quality_state"])
-                    constraints[worker].reset()
+                reset_assignments(resets)
+            if draining_for_resume and not observations:
+                crossed_resume_thresholds: list[int] = []
+                while next_resume_save <= completed:
+                    crossed_resume_thresholds.append(next_resume_save)
+                    next_resume_save += args.resume_save_interval
+                if not crossed_resume_thresholds:
+                    crossed_resume_thresholds = list(drain_requested_thresholds)
+                snapshot_path, manifest_path = save_resume_snapshot(
+                    reason="periodic",
+                    requested_thresholds=crossed_resume_thresholds,
+                    actual_completed=completed,
+                )
+                _emit({
+                    "event": "resume_snapshot",
+                    "reason": "periodic",
+                    "requested_episode_thresholds": crossed_resume_thresholds,
+                    "completed_episodes": completed,
+                    "snapshot_path": str(snapshot_path),
+                    "manifest_path": str(manifest_path),
+                }, event_rows, jsonl_path)
+                draining_for_resume = False
+                drain_requested_thresholds = []
+                remaining = args.episodes - completed
+                if remaining > 0:
+                    reset_assignments(
+                        prepare_assignments(list(range(min(pool_size, remaining))))
+                    )
         summaries.sort(key=lambda row: int(row["episode"]))
         current_validation_state = _checkpoint_validation_learner_state(agent)
         if current_validation_state != last_checkpoint_validation_state:
             validate_checkpoint([], final_state=True)
+        final_resume_thresholds: list[int] = []
+        while next_resume_save <= completed:
+            final_resume_thresholds.append(next_resume_save)
+            next_resume_save += args.resume_save_interval
+        final_resume_path, resume_manifest_path = save_resume_snapshot(
+            reason="final",
+            requested_thresholds=final_resume_thresholds,
+            actual_completed=completed,
+        )
+        _emit({
+            "event": "resume_snapshot",
+            "reason": "final",
+            "requested_episode_thresholds": final_resume_thresholds,
+            "completed_episodes": completed,
+            "snapshot_path": str(final_resume_path),
+            "manifest_path": str(resume_manifest_path),
+        }, event_rows, jsonl_path)
         final_checkpoint = output / "blue_rainbow.pt"; agent.save(str(final_checkpoint))
-        elapsed = time.monotonic() - started
+        elapsed = elapsed_before_resume + time.monotonic() - started
         flight_quality_summary = write_flight_quality_report(
             sorted(quality_episodes, key=lambda item: int(item["episode"])), output / "flight_quality",
             baseline_survival_rate=args.baseline_survival_rate, plot_limit=args.flight_quality_plot_limit)
@@ -931,7 +1945,10 @@ def main() -> int:
             "completed_environment_transitions": agent.total_steps,
             "completed_optimizer_updates": agent.optimizer_updates,
             "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
-            "final_checkpoint": str(final_checkpoint), **_device_metrics(agent.device),
+            "final_checkpoint": str(final_checkpoint),
+            "resume_snapshot": str(final_resume_path),
+            "resume_manifest": str(resume_manifest_path),
+            **_device_metrics(agent.device),
             "flight_quality": flight_quality_summary,
             "checkpoint_validation": {
                 "evaluation_count": len(checkpoint_evaluations),

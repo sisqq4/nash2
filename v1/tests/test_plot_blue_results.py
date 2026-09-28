@@ -21,6 +21,7 @@ def test_batch_entry_accepts_separate_training_and_evaluation_directories(
     calls: list[tuple[str, Path]] = []
     quality_options: list[dict] = []
     dynamics_options: list[dict] = []
+    evaluation_dynamics_options: list[dict] = []
     font = tmp_path / "中文字体.ttf"
     font.write_bytes(b"test double")
 
@@ -39,6 +40,16 @@ def test_batch_entry_accepts_separate_training_and_evaluation_directories(
         Path(destination).mkdir(parents=True, exist_ok=True)
         (Path(destination) / "evaluation.png").write_bytes(b"png")
         return {"ok": True}
+
+    def fake_evaluation_dynamics(source, destination, **kwargs):
+        calls.append(("evaluation_dynamics", Path(source)))
+        evaluation_dynamics_options.append(kwargs)
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        return {
+            "figures": ["速度时间剖面.png", "过载时间剖面.png"],
+            "tables": ["逐回合速度过载统计.csv", "全部及分弹数速度过载汇总.csv",
+                       "速度过载时间剖面.csv"],
+        }
 
     def fake_dynamics(source, destination, **kwargs):
         calls.append(("dynamics", Path(source)))
@@ -61,20 +72,26 @@ def test_batch_entry_accepts_separate_training_and_evaluation_directories(
     monkeypatch.setattr(batch, "analyze_blue_training_results", fake_grouped)
     monkeypatch.setattr(batch, "analyze_blue_training_load", fake_dynamics)
     monkeypatch.setattr(batch, "write_evaluation_analysis_safely", fake_evaluation)
+    monkeypatch.setattr(batch, "analyze_blue_evaluation_dynamics", fake_evaluation_dynamics)
     monkeypatch.setattr(batch, "replot_flight_quality_episodes", fake_quality)
 
     manifest = batch.generate_blue_plots(
         training, evaluation, output_root=output, font_path=font,
+        evaluation_time_bin_s=2.5,
     )
 
     assert [name for name, _ in calls] == [
-        "training", "grouped", "dynamics", "evaluation", "quality", "quality",
+        "training", "grouped", "dynamics", "evaluation", "evaluation_dynamics",
+        "quality", "quality",
     ]
     assert calls[0][1] == training.resolve()
     assert calls[2][1] == training.resolve()
     assert calls[3][1] == evaluation.resolve()
     assert [options["font_path"] for options in quality_options] == [font, font]
     assert dynamics_options == [{"rolling_window": 20, "dpi": 160, "font_path": font}]
+    assert evaluation_dynamics_options == [
+        {"time_bin_s": 2.5, "dpi": 160, "font_path": font}
+    ]
     assert manifest["training_dir"] == str(training.resolve())
     saved = json.loads((output / "blue_plot_batch_manifest.json").read_text(encoding="utf-8"))
     assert saved["figures"]["training_analysis"] == ["reward.png"]
@@ -86,6 +103,16 @@ def test_batch_entry_accepts_separate_training_and_evaluation_directories(
         (output / "training_dynamics").resolve()
     )
     assert saved["figures"]["evaluation_flight_quality"] == ["episode_000001.png"]
+    assert saved["figures"]["evaluation_dynamics"] == [
+        "速度时间剖面.png", "过载时间剖面.png",
+    ]
+    assert saved["tables"]["evaluation_dynamics"] == [
+        "逐回合速度过载统计.csv", "全部及分弹数速度过载汇总.csv",
+        "速度过载时间剖面.csv",
+    ]
+    assert saved["outputs"]["evaluation_dynamics"] == str(
+        (output / "evaluation_dynamics").resolve()
+    )
     assert "episode_trace" not in saved
     assert "evaluation_episode" not in saved["figures"]
 
@@ -98,6 +125,13 @@ def test_batch_parser_exposes_input_directory_aliases() -> None:
     assert args.training_dir == Path("训练")
     assert args.evaluation_dir == Path("测试")
     assert args.output_root == Path("输出")
+    assert args.evaluation_time_bin_s == 1.0
+
+    custom = batch.build_parser().parse_args([
+        "--train-dir", "训练", "--eval-dir", "测试",
+        "--evaluation-time-bin-s", "2.5",
+    ])
+    assert custom.evaluation_time_bin_s == 2.5
 
 
 def _patch_standard_plotters(monkeypatch, calls: list[str]) -> None:
@@ -117,6 +151,15 @@ def _patch_standard_plotters(monkeypatch, calls: list[str]) -> None:
         (Path(destination) / "evaluation.png").write_bytes(b"png")
         return {"ok": True}
 
+    def fake_evaluation_dynamics(_source, destination, **_kwargs):
+        calls.append("evaluation_dynamics")
+        Path(destination).mkdir(parents=True, exist_ok=True)
+        return {
+            "figures": ["速度时间剖面.png", "过载时间剖面.png"],
+            "tables": ["逐回合速度过载统计.csv", "全部及分弹数速度过载汇总.csv",
+                       "速度过载时间剖面.csv"],
+        }
+
     def fake_dynamics(_source, destination, **_kwargs):
         calls.append("dynamics")
         Path(destination).mkdir(parents=True, exist_ok=True)
@@ -134,6 +177,7 @@ def _patch_standard_plotters(monkeypatch, calls: list[str]) -> None:
     monkeypatch.setattr(batch, "analyze_blue_training_results", fake_grouped)
     monkeypatch.setattr(batch, "analyze_blue_training_load", fake_dynamics)
     monkeypatch.setattr(batch, "write_evaluation_analysis_safely", fake_evaluation)
+    monkeypatch.setattr(batch, "analyze_blue_evaluation_dynamics", fake_evaluation_dynamics)
     monkeypatch.setattr(batch, "replot_flight_quality_episodes", fake_quality)
 
 
@@ -176,7 +220,8 @@ def test_full_batch_can_append_selected_episode_without_changing_default_pipelin
     )
 
     assert calls == [
-        "training", "grouped", "dynamics", "evaluation", "quality", "quality", "episode",
+        "training", "grouped", "dynamics", "evaluation", "evaluation_dynamics",
+        "quality", "quality", "episode",
     ]
     assert exported["source"] == (
         evaluation / "flight_quality" / "flight_quality_episodes.jsonl"
@@ -212,6 +257,10 @@ def test_evaluation_only_mode_uses_scenario_selector_and_default_output_root(
     monkeypatch.setattr(
         batch, "analyze_blue_training_load",
         lambda *_args, **_kwargs: pytest.fail("仅单回合模式不得运行训练速度过载分析"),
+    )
+    monkeypatch.setattr(
+        batch, "analyze_blue_evaluation_dynamics",
+        lambda *_args, **_kwargs: pytest.fail("仅单回合模式不得运行测试速度过载分析"),
     )
     manifest = batch.generate_evaluation_episode_plots(
         evaluation, missiles=2, scenario_episode=3, output_root=output_root, dpi=100,
@@ -249,6 +298,35 @@ def test_main_without_training_dispatches_only_single_episode(monkeypatch) -> No
     assert received["evaluation_dir"] == Path("测试")
     assert received["episode"] == 7
     assert received["episode_output"] == Path("单回合")
+
+
+def test_main_forwards_evaluation_time_bin_to_full_batch(monkeypatch) -> None:
+    received: dict[str, object] = {}
+
+    def fake_batch(training_dir, evaluation_dir, **kwargs):
+        received.update({
+            "training_dir": training_dir,
+            "evaluation_dir": evaluation_dir,
+            **kwargs,
+        })
+        return {"figures": {}, "tables": {}, "outputs": {}}
+
+    monkeypatch.setattr(batch, "generate_blue_plots", fake_batch)
+    assert batch.main([
+        "--training-dir", "训练", "--evaluation-dir", "测试",
+        "--evaluation-time-bin-s", "2.25",
+    ]) == 0
+    assert received["evaluation_time_bin_s"] == 2.25
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_parser_rejects_invalid_evaluation_time_bin(value: str) -> None:
+    with pytest.raises(SystemExit) as error:
+        batch.build_parser().parse_args([
+            "--training-dir", "训练", "--evaluation-dir", "测试",
+            "--evaluation-time-bin-s", value,
+        ])
+    assert error.value.code == 2
 
 
 @pytest.mark.parametrize("arguments, message", [

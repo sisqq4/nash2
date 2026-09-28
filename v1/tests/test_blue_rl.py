@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import random
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 
 from red_swarm_policy.blue_rl import (
     BLUE_ACTION_CONTEXT_DIM,
@@ -37,6 +41,7 @@ from red_swarm_policy.env import (
 from red_swarm_policy.env.scenario import ScenarioGenerator
 from red_swarm_policy.cli_utils import parse_missile_scenarios
 from red_swarm_policy.blue_rl.curriculum import CurriculumSchedule, balanced_score, within_forgetting_limit
+from red_swarm_policy.blue_rl.replay_buffer import PrioritizedReplayBuffer
 from red_swarm_policy.evaluate_blue_rl import _emit as emit_evaluation_event
 from red_swarm_policy.evaluate_blue_rl import _aggregate_results
 from red_swarm_policy.evaluate_blue_rl import _numeric_distribution
@@ -45,10 +50,18 @@ from red_swarm_policy.evaluate_blue_rl import _build_paired_episode_plan
 from red_swarm_policy.evaluate_blue_rl import build_parser as build_evaluation_parser
 from red_swarm_policy.train_blue_rl import (
     _build_checkpoint_validation_plan,
+    _capture_training_rng_state,
     _checkpoint_validation_learner_state,
     _checkpoint_validation_score,
+    _collect_resume_artifacts,
     _evaluate_checkpoint_without_updates,
+    _load_resume_snapshot,
+    _resume_contract,
+    _restore_resume_artifacts,
+    _restore_training_rng_state,
+    _save_resume_generation,
     _select_retained_checkpoints,
+    _truncate_committed_log,
     _training_plot_directories,
     _write_post_training_plots,
 )
@@ -538,6 +551,9 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert args.episodes == 100
     assert args.log_interval == 10
     assert args.jsonl_path is None
+    assert args.dynamics_time_bin_s == 1.0
+    assert args.dynamics_output_dir is None
+    assert args.no_dynamics_analysis is False
     assert not any((args.mechanism_threat, args.mechanism_timing,
                     args.mechanism_direction, args.mechanism_overload))
 
@@ -579,10 +595,48 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
     args = build_parser().parse_args(["--replay-size", "500000"])
     assert args.replay_size == 500_000
     assert args.checkpoint_eval_episodes == 100
+    assert args.resume_from is None
+    assert args.resume_save_interval == 100
     assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
     ]).reward_mechanisms == ("timing", "overload")
+
+
+def test_resume_contract_includes_safe_boundary_save_interval() -> None:
+    args = SimpleNamespace(
+        seed=2000,
+        updates_per_transition=0.5,
+        checkpoint_interval=10,
+        checkpoint_eval_episodes=100,
+        resume_save_interval=100,
+        curriculum_eval_interval=500,
+        curriculum_eval_episodes=0,
+    )
+    environment = EnvironmentConfig()
+    blue_environment = BlueEscapeEnvConfig(record_acmi=False)
+    rainbow = RainbowDQNConfig(3, 2, hidden_dim=8, replay_size=16)
+
+    original = _resume_contract(
+        args=args,
+        training_scenarios=(1, 2, 3),
+        curriculum=None,
+        environment_config=environment,
+        env_config=blue_environment,
+        rainbow_config=rainbow,
+    )
+    changed = _resume_contract(
+        args=SimpleNamespace(**{**vars(args), "resume_save_interval": 200}),
+        training_scenarios=(1, 2, 3),
+        curriculum=None,
+        environment_config=environment,
+        env_config=blue_environment,
+        rainbow_config=rainbow,
+    )
+
+    assert original["resume_save_interval"] == 100
+    assert changed["resume_save_interval"] == 200
+    assert changed != original
 
 
 def test_post_training_speed_load_plot_destinations_and_safe_call(
@@ -1580,3 +1634,270 @@ def test_process_blue_pool_uses_global_episode_numbers(tmp_path) -> None:
         assert all(result.terminated or result.truncated for result in results.values())
     assert not (tmp_path / "episode_000001.acmi").exists()
     assert (tmp_path / "episode_000002.acmi").is_file()
+
+
+def _assert_nested_training_state_equal(expected: object, actual: object) -> None:
+    """Compare checkpoint structures without hiding tensor or array differences."""
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+    elif isinstance(expected, np.ndarray):
+        assert isinstance(actual, np.ndarray)
+        np.testing.assert_array_equal(actual, expected)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _assert_nested_training_state_equal(expected[key], actual[key])
+    elif isinstance(expected, (list, tuple)):
+        assert isinstance(actual, type(expected))
+        assert len(actual) == len(expected)
+        for expected_item, actual_item in zip(expected, actual):
+            _assert_nested_training_state_equal(expected_item, actual_item)
+    else:
+        assert actual == expected
+
+
+@pytest.mark.parametrize("insert_count", [3, 7])
+def test_prioritized_replay_state_round_trip_preserves_prefix_and_wrapped_ring(
+    insert_count: int,
+) -> None:
+    capacity, observation_dim, action_dim = 5, 3, 4
+    replay = PrioritizedReplayBuffer(
+        capacity, observation_dim, alpha=0.7, action_dim=action_dim,
+    )
+    for index in range(insert_count):
+        observation = np.asarray([index, index + 0.25, -index], dtype=np.float32)
+        mask = np.zeros(action_dim, dtype=bool)
+        mask[index % action_dim] = True
+        penalty = np.arange(action_dim, dtype=np.float32) * (index + 1) / 10.0
+        replay.add(
+            observation,
+            index % action_dim,
+            index + 0.5,
+            observation + 1.0,
+            index % 3 == 0,
+            next_action_mask=mask,
+            next_action_penalty=penalty,
+        )
+    replay.update_priorities(
+        np.arange(replay.size), np.linspace(0.25, 2.25, replay.size, dtype=np.float32),
+    )
+
+    state = replay.state_dict()
+    restored = PrioritizedReplayBuffer(
+        capacity, observation_dim, alpha=0.7, action_dim=action_dim,
+    )
+    restored.load_state_dict(state)
+
+    assert state["storage"] == ("full" if insert_count > capacity else "prefix")
+    assert restored.size == replay.size
+    assert restored.position == replay.position == insert_count % capacity
+    assert restored.max_priority == pytest.approx(replay.max_priority)
+    _assert_nested_training_state_equal(state, restored.state_dict())
+
+    expected_self_round_trip = deepcopy(restored.state_dict())
+    restored.load_state_dict(restored.state_dict())
+    _assert_nested_training_state_equal(expected_self_round_trip, restored.state_dict())
+
+    np.random.seed(903)
+    expected_sample = replay.sample(batch_size=4, beta=0.65)
+    np.random.seed(903)
+    restored_sample = restored.sample(batch_size=4, beta=0.65)
+    _assert_nested_training_state_equal(expected_sample, restored_sample)
+
+
+def test_rainbow_full_training_state_round_trip_preserves_learning_state() -> None:
+    config = RainbowDQNConfig(
+        3, 2, hidden_dim=8, atoms=5, value_min=-2.0, value_max=2.0,
+        batch_size=2, replay_size=8, learning_starts=2, n_step=2,
+        target_update_interval=2, device="cpu",
+    )
+    torch.manual_seed(71)
+    np.random.seed(71)
+    agent = RainbowDQNAgent(config)
+    mask = np.asarray([True, False])
+    penalty = np.asarray([0.0, 0.25], dtype=np.float32)
+    for env_id, offset in ((0, 0.0), (1, 10.0)):
+        first = np.asarray([offset, 1.0, 2.0], dtype=np.float32)
+        middle = first + 1.0
+        final = first + 2.0
+        agent.observe_for_env(
+            env_id, first, env_id, 1.5 + offset, middle, False,
+            next_action_mask=mask, next_action_penalty=penalty,
+        )
+        agent.observe_for_env(
+            env_id, middle, env_id, 2.5 + offset, final, True,
+            next_action_mask=np.asarray([True, True]),
+            next_action_penalty=np.zeros(2, dtype=np.float32),
+        )
+    assert agent.update() is not None
+    assert agent.update() is not None
+    agent.last_action_metrics = {"selected_value_mean": 1.25, "action_batch_size": 2.0}
+    agent.assert_resume_safe()
+
+    saved = agent.training_state_dict()
+    restored = RainbowDQNAgent.from_training_state_dict(saved, device="cpu")
+
+    _assert_nested_training_state_equal(saved, restored.training_state_dict())
+    assert restored.n_step is restored._n_step_by_env[0]
+    assert set(restored._n_step_by_env) == {0, 1}
+    assert all(not buffer.items for buffer in restored._n_step_by_env.values())
+
+    np.random.seed(1701)
+    expected_sample = agent.replay.sample(3, beta=0.8)
+    np.random.seed(1701)
+    actual_sample = restored.replay.sample(3, beta=0.8)
+    _assert_nested_training_state_equal(expected_sample, actual_sample)
+
+
+def test_rainbow_resume_safety_rejects_pending_n_step_transitions() -> None:
+    agent = RainbowDQNAgent(RainbowDQNConfig(
+        2, 2, hidden_dim=8, atoms=5, n_step=3, learning_starts=100,
+    ))
+    observation = np.zeros(2, dtype=np.float32)
+    agent.observe_for_env(0, observation, 0, 1.0, observation, False)
+    agent.observe_for_env(4, observation, 1, 2.0, observation, False)
+
+    with pytest.raises(RuntimeError, match=r"env 0: 1.*env 4: 1"):
+        agent.assert_resume_safe()
+
+    agent.observe_for_env(0, observation, 0, 0.0, observation, True)
+    agent.observe_for_env(4, observation, 1, 0.0, observation, True)
+    agent.assert_resume_safe()
+
+
+def test_training_rng_state_round_trip_covers_python_numpy_and_torch() -> None:
+    restore_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    original = _capture_training_rng_state()
+    try:
+        random.seed(8128)
+        np.random.seed(8128)
+        torch.manual_seed(8128)
+        saved = _capture_training_rng_state()
+        expected_python = [random.random() for _ in range(4)]
+        expected_numpy = np.random.random(4)
+        expected_torch = torch.rand(4)
+
+        for _ in range(7):
+            random.random()
+            np.random.random()
+            torch.rand(1)
+        _restore_training_rng_state(saved, restore_device)
+
+        assert [random.random() for _ in range(4)] == expected_python
+        np.testing.assert_array_equal(np.random.random(4), expected_numpy)
+        torch.testing.assert_close(torch.rand(4), expected_torch, rtol=0.0, atol=0.0)
+    finally:
+        _restore_training_rng_state(original, restore_device)
+
+
+def test_resume_manifest_falls_back_to_previous_when_latest_is_corrupt(tmp_path) -> None:
+    resume_directory = tmp_path / "resume"
+    previous_path, manifest_path = _save_resume_generation(
+        resume_directory,
+        {"generation": "previous", "completed_episodes": 10},
+        snapshot_id="ep000010-step00000100",
+        completed_episodes=10,
+        reason="interval",
+    )
+    latest_path, repeated_manifest_path = _save_resume_generation(
+        resume_directory,
+        {"generation": "latest", "completed_episodes": 20},
+        snapshot_id="ep000020-step00000200",
+        completed_episodes=20,
+        reason="interval",
+    )
+    assert repeated_manifest_path == manifest_path
+    assert previous_path.is_file() and latest_path.is_file()
+    latest_path.write_bytes(latest_path.read_bytes() + b"corrupt-tail")
+
+    payload, loaded_path = _load_resume_snapshot(resume_directory)
+
+    assert payload == {"generation": "previous", "completed_episodes": 10}
+    assert loaded_path.resolve() == previous_path.resolve()
+
+    replacement_path, _ = _save_resume_generation(
+        resume_directory,
+        {"generation": "replacement", "completed_episodes": 30},
+        snapshot_id="ep000030-step00000300-unique",
+        completed_episodes=30,
+        reason="interval",
+        preferred_previous_path=loaded_path,
+    )
+    replacement_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert replacement_manifest["latest"]["path"] == replacement_path.name
+    assert replacement_manifest["previous"]["path"] == previous_path.name
+    assert replacement_manifest["latest"]["path"] != replacement_manifest["previous"]["path"]
+    replacement_path.write_bytes(replacement_path.read_bytes() + b"corrupt-again")
+    recovered_again, recovered_path = _load_resume_snapshot(resume_directory)
+    assert recovered_again == {"generation": "previous", "completed_episodes": 10}
+    assert recovered_path.resolve() == previous_path.resolve()
+
+
+def test_resume_manifest_never_reads_or_deletes_paths_outside_resume_directory(tmp_path) -> None:
+    resume_directory = tmp_path / "resume"
+    resume_directory.mkdir()
+    victim = tmp_path / "victim.pt"
+    victim.write_bytes(b"must-remain")
+    (resume_directory / "latest.json").write_text(
+        json.dumps({
+            "latest": {
+                "path": "../victim.pt",
+                "size_bytes": victim.stat().st_size,
+            },
+            "previous": None,
+        }),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="no valid resume generation"):
+        _load_resume_snapshot(resume_directory)
+    _save_resume_generation(
+        resume_directory,
+        {"generation": "safe"},
+        snapshot_id="safe-unique",
+        completed_episodes=1,
+        reason="interval",
+    )
+    assert victim.read_bytes() == b"must-remain"
+
+
+def test_resume_artifacts_roll_back_leaderboard_models_to_safe_generation(tmp_path) -> None:
+    output = tmp_path / "training"
+    retained = output / "best_checkpoints" / "blue_rainbow_ep000100.pt"
+    curriculum_best = output / "best_balanced.pt"
+    retained.parent.mkdir(parents=True)
+    retained.write_bytes(b"retained-at-safe-boundary")
+    curriculum_best.write_bytes(b"curriculum-at-safe-boundary")
+    artifacts = _collect_resume_artifacts(output, [retained, curriculum_best])
+
+    retained.write_bytes(b"modified-after-safe-boundary")
+    curriculum_best.unlink()
+    stale = output / "best_checkpoints" / "blue_rainbow_ep000200.pt"
+    stale.write_bytes(b"created-after-safe-boundary")
+    unrelated = output / "notes.txt"
+    unrelated.write_bytes(b"do-not-remove")
+
+    _restore_resume_artifacts(output, artifacts)
+
+    assert retained.read_bytes() == b"retained-at-safe-boundary"
+    assert curriculum_best.read_bytes() == b"curriculum-at-safe-boundary"
+    assert not stale.exists()
+    assert unrelated.read_bytes() == b"do-not-remove"
+
+
+def test_truncate_committed_log_removes_only_uncommitted_tail(tmp_path) -> None:
+    path = tmp_path / "training.jsonl"
+    committed = '{"event":"iteration","note":"\u5df2\u63d0\u4ea4"}\n'.encode("utf-8")
+    uncommitted = b'{"event":"partial"}\n'
+    path.write_bytes(committed + uncommitted)
+
+    _truncate_committed_log(path, len(committed))
+
+    assert path.read_bytes() == committed
+    missing = tmp_path / "flight_quality" / "episodes.jsonl"
+    _truncate_committed_log(missing, 0)
+    assert missing.is_file() and missing.read_bytes() == b""
+    with pytest.raises(ValueError, match="shorter than its committed offset"):
+        _truncate_committed_log(path, len(committed) + 1)

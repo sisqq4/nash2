@@ -1,7 +1,10 @@
 # 蓝方强化学习子系统
 
 测试结束后默认在输出目录的 `evaluation_analysis/` 中生成按弹数、朝向分组的逃脱率图、
-1 米分箱脱靶量分布和已有飞行质量统计图。原始结果保留不变；选项及独立绘图方式见
+1 米分箱脱靶量分布和已有飞行质量统计图；同时在 `evaluation_dynamics/` 中
+流式生成全部回合及每种实际来弹数的速度/过载 CSV、JSON 和时间剖面图。原始结果保留不变；
+`--dynamics-time-bin-s` 可调整时间箱，`--dynamics-output-dir` 可改输出目录，
+`--no-dynamics-analysis` 可完全关闭该后处理。`--no-result-plots` 仅关闭 PNG，仍保留速度/过载数值表。选项及独立绘图方式见
 [BLUE_EVALUATION_ANALYSIS.md](BLUE_EVALUATION_ANALYSIS.md)。
 
 ## 双方均不学习的规则基线
@@ -82,6 +85,49 @@ PYTHONPATH=src python -m red_swarm_policy.run_blue_rl_ablations \
 
 先加 `--dry-run` 可只生成并打印全部命令；默认遇到首个失败即停止，加入
 `--continue-on-error` 后会继续其余组合，并在 manifest 中记录每次运行的返回码。
+
+## 同场景规则机、四项后置规则与 Rainbow 对比
+
+`compare_blue_rule_mechanisms` 用于寻找并完整记录满足“原始规则机未逃脱、指定 Rainbow
+checkpoint 逃脱”的多弹场景。每个候选先用同一个 `seed + missile_count` 分别筛选原始规则机和
+checkpoint；命中条件后再按固定顺序重跑并记录六组结果：原始规则机、规则机分别叠加
+`threat / timing / direction / overload` 单项后置规则，以及 checkpoint 原生 Rainbow 策略。
+
+四个单项后置规则直接接收规则机原有的 29 维候选动作分数，并执行
+`EvaluationActionShaper` 选出的动作；不会用 one-hot 或伪造 Q 值替代规则机偏好，也不会把
+checkpoint 专属飞行包线混入规则机单项实验。四项开关都会保留该现有后置器共有的动作切换惩罚及
+速度、高度、载荷安全过滤，因此这里比较的是每个现有开关的完整实际效果，而不是删除共有逻辑后的
+纯评分公式。`rainbow_full` 则表示 checkpoint 原生策略加 checkpoint 保存的飞行包线。对
+`normalized_v4` checkpoint，不会再重复打开四个 evaluation-only 动作整形开关，因为对应机理已经
+内生于训练奖励和观测。
+
+脚本对六组 `reset_info.initialization` 的规范 JSON 计算 SHA-256，并在写入正式对比前强制要求指纹
+完全相同。每组保存终局 `result.json`、逐决策 `trajectory.json/trajectory.csv`、飞行品质 JSONL、
+逐决策仲裁诊断，以及默认启用的物理步级 ACMI；根目录另存搜索审计日志和 manifest。例如指定
+pt1660 checkpoint，只搜索 2、3 弹场景：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m red_swarm_policy.compare_blue_rule_mechanisms `
+  --checkpoint outputs/blue_rl/train_1v1-1v3_train_1v1-1v3_missle_around_60_ep2000/best_checkpoints/blue_rainbow_ep001660.pt `
+  --missiles 2,3 --seed-start 10089 --max-seeds 100 --matches 1 `
+  --output outputs/blue_rl/rule_mechanism_rl_comparison_ep1660
+```
+
+该 checkpoint 的 `normalized_v4` 输入为 104 维，即固定 3 个来弹槽；脚本会自动按 3 槽补齐 2 弹
+观测，并拒绝不兼容的 4 弹场景。即使只传 `--missiles 2`，也不会把输入错误缩为 89 维。
+
+已经保存的对比结果可以离线重绘，不会重新运行仿真或加载 checkpoint：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m red_swarm_policy.plot_blue_rule_mechanism_comparison `
+  outputs/blue_rl/rule_mechanism_rl_comparison_ep1660/matches/match_001_seed_10089_missiles_2
+```
+
+命令会在该场景的 `plots/` 下为六种策略分别生成一张飞行品质六联图，并生成统一坐标尺度的
+`strategy_horizontal_trajectory_overview.png` 水平轨迹总览和 `plot_manifest.json`。绘图输入是各策略
+已有的 `flight_quality_episodes.jsonl`，因此不会改变原始结果。
 
 
 `red_swarm_policy.blue_rl` 将 nash1.6 的离散蓝方逃逸强化学习结构移植到 v1：采用 29 个 v1

@@ -210,4 +210,17 @@ def test_model_evaluation_writes_all_episode_traces_and_reproducibility_manifest
     assert summary["episodes_per_scenario"] == 3
     assert summary["seed_schedule"] == "base_seed_plus_one_based_scenario_episode_v1"
     assert all(group["episodes"] == 3 for group in summary["by_scenario"].values())
+    dynamics = summary["evaluation_dynamics"]
+    assert dynamics["episode_count"] == 6
+    assert dynamics["missile_counts"] == [1, 2]
+    assert dynamics["episodes_by_missile_count"] == {"1": 3, "2": 3}
+    dynamics_output = output / "evaluation_dynamics"
+    for name in (
+        "逐回合速度过载统计.csv", "全部及分弹数速度过载汇总.csv",
+        "全部及分弹数速度过载汇总.json", "速度过载时间剖面.csv",
+        "测试速度过载分析清单.json",
+    ):
+        assert (dynamics_output / name).is_file()
+    assert not (dynamics_output / "速度时间剖面.png").exists()
+    assert not (dynamics_output / "过载时间剖面.png").exists()
     assert not (output / "acmi").exists()

@@ -45,6 +45,35 @@ flight_quality 文件的已有字段继续保留，模型测试的状态记录�
 
 旧结果不会自动补出缺失字段；旧版记录仍可被既有绘图和分析逻辑读取。
 
+## 全部测试回合及分弹数的速度/过载监测
+
+常规结果对比主要汇总逃脱率、脱靶量和既有飞行品质指标。若要监测整个测试中蓝机速度和过载随时间的变化，并分别查看 1、2、3 等来弹数，可直接流式分析测试目录的逐回合轨迹。
+
+新的 `evaluate_blue_rl` 运行在测试结束后默认执行该分析并写入
+`<测试输出目录>/evaluation_dynamics`。可用 `--dynamics-time-bin-s`、`--dynamics-output-dir`
+调整时间箱和目录，或用 `--no-dynamics-analysis` 关闭；`--no-result-plots` 仅关闭图片，不关闭数值表。
+对于既有结果，可以独立执行下列命令，无需重新测试：
+
+```powershell
+cd C:\Users\sisqq4\PycharmProjects\nash_origin\v1
+$env:PYTHONPATH='src'
+python -m red_swarm_policy.analyze_blue_evaluation_dynamics `
+  --evaluation-dir "outputs/blue_rl/eval_1v1-1v3_ep500_missle_around_60（pt1660参数下的训练结果）"
+```
+
+默认输出到 `<测试输出目录>/evaluation_dynamics`。也可以用 `--output <目录>` 改变位置、用 `--time-bin-s 1.0` 调整时间剖面箱宽、用 `--dpi` 或 `--font` 调整图片；`--no-plots` 只关闭 PNG，CSV、JSON 和清单仍会生成。该命令不加载 checkpoint、不创建环境、不重新测试，也不改写原始结果；它逐行处理 `flight_quality/flight_quality_episodes.jsonl`，适合直接分析体积很大的测试记录。
+
+数值产物包括：
+
+- `逐回合速度过载统计.csv`：逐回合速度、估算实际过载、名义指令过载、分位数、极值、阈值持续时间、安全介入和动作切换统计。
+- `全部及分弹数速度过载汇总.csv/json`：同时提供“全部来弹数”和每个实际来弹数；包含时间加权均值和 RMS、采样 P05/P50/P95、全局峰值、逐回合峰值均值/P95，以及两种过载超过 3g、6g、9g 的时长和比例。
+- `速度过载时间剖面.csv`：按相对时间箱保存全部回合及各弹数组的速度和过载均值、P05/P50/P95，以及每个时间箱实际贡献的回合数。
+- `测试速度过载分析清单.json`：记录输入文件、文件大小、回合总数、各弹数回合数、统计口径和全部产物。
+
+图形产物为 `速度时间剖面.png` 和 `过载时间剖面.png`。时间剖面先在单个回合的每个时间箱内取样本均值，再让各回合等权参与组统计；已经结束的回合不会用末值补齐后续时间。均值和 RMS 使用 `sample_interval_s` 加权，而采样分位数不做时间加权。该分析要求逐回合记录含有效的 `metadata.missile_count`；缺少该字段的旧测试结果无法可靠恢复分组，会明确报错而不是归入错误弹数组。
+
+单回合三投影图由 `red_swarm_policy.export_blue_episode_trace` 生成：蓝机轨迹为蓝色，所有红弹轨迹为红色；红弹失效后的冻结点会被去掉，有终止事件时使用其中的物理步终止位置收尾。图片默认不显示安全介入区间；只有显式加入 `--show-safety-interventions` 时，时间图才显示淡红背景，轨迹图才标出连续介入区间的起止位置。原始安全介入字段始终保留在 CSV/JSON 中。完整命令和九张图片的说明见 [BLUE_TRACE_ANALYSIS.md](BLUE_TRACE_ANALYSIS.md)。
+
 ## 基线与强化学习对比
 
 两个测试命令新增 `--no-result-plots` 用于关闭本次新增的汇总绘图，

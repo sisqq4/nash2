@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -236,7 +237,12 @@ class BlueEvasionRuleMachine:
     def runtime_statistics(self) -> dict[str, object]:
         return self._runtime_stats.output_record(self.execution_backend)
 
-    def decide(self, state: EngagementState) -> BlueEvasionDecision:
+    def decide(
+        self,
+        state: EngagementState,
+        *,
+        action_selector: Callable[[np.ndarray, int], int] | None = None,
+    ) -> BlueEvasionDecision:
         self._runtime_stats.decision_count += 1
         n_blue = len(state.blue)
         previous = self._previous_indices
@@ -272,6 +278,16 @@ class BlueEvasionRuleMachine:
                 threats,
                 int(previous[blue_index]),
             )
+            if action_selector is not None:
+                selected_index = action_selector(scores.copy(), blue_index)
+                if isinstance(selected_index, (bool, np.bool_)) or not isinstance(
+                    selected_index,
+                    (int, np.integer),
+                ):
+                    raise TypeError("action_selector must return an integer action index")
+                action_index = int(selected_index)
+                if not 0 <= action_index < scores.size:
+                    raise ValueError("action_selector returned action index out of range")
             indices[blue_index] = action_index
             selected_scores[blue_index] = scores[action_index]
             critical = (

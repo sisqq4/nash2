@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any, Sequence
 
 from .analyze_blue_evaluations import write_evaluation_analysis_safely
+from .analyze_blue_evaluation_dynamics import analyze_blue_evaluation_dynamics
 from .analyze_blue_training_load import analyze_blue_training_load
 from .analyze_blue_training_results import analyze_blue_training_results
 from .analyze_training import analyze_training
@@ -23,6 +25,13 @@ def _positive_integer(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("必须是正整数")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        raise argparse.ArgumentTypeError("必须是正有限数")
     return parsed
 
 
@@ -41,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoothing-window", type=int, default=20)
     parser.add_argument("--flight-quality-plot-limit", type=int, default=10,
                         help="训练和测试各重绘评分最低的多少个回合")
+    parser.add_argument("--evaluation-time-bin-s", type=_positive_float, default=1.0,
+                        help="测试速度/过载跨回合时间剖面的箱宽（秒，默认1.0）")
     parser.add_argument("--include-report-charts", action="store_true",
                         help="同时运行第二版报告批量图表导出（会读取完整测试轨迹）")
     parser.add_argument("--report-output", type=Path,
@@ -54,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="按场景内回合选择时的红弹数量")
     parser.add_argument("--episode-output", type=Path,
                         help="单回合详情的最终输出目录；省略时按选择器自动命名")
+    parser.add_argument(
+        "--show-safety-interventions", action="store_true",
+        help="在所选单回合的时序图和轨迹图中标出安全介入；默认不标注",
+    )
     return parser
 
 
@@ -65,6 +80,7 @@ def _destinations(training_dir: Path, evaluation_dir: Path,
             "training_results": training_dir / "training_analysis" / "results",
             "training_dynamics": training_dir / "training_load_analysis",
             "evaluation_analysis": evaluation_dir / "evaluation_analysis",
+            "evaluation_dynamics": evaluation_dir / "evaluation_dynamics",
             "training_flight_quality": training_dir / "flight_quality",
             "evaluation_flight_quality": evaluation_dir / "flight_quality",
             "report": evaluation_dir / "report_charts_zh",
@@ -75,6 +91,7 @@ def _destinations(training_dir: Path, evaluation_dir: Path,
         "training_results": output_root / "training_results",
         "training_dynamics": output_root / "training_dynamics",
         "evaluation_analysis": output_root / "evaluation_analysis",
+        "evaluation_dynamics": output_root / "evaluation_dynamics",
         "training_flight_quality": output_root / "training_flight_quality",
         "evaluation_flight_quality": output_root / "evaluation_flight_quality",
         "report": output_root / "report_charts_zh",
@@ -141,7 +158,8 @@ def _export_selected_episode(evaluation: Path, *, output_root: Path | None,
                              episode_output: str | Path | None,
                              episode: int | None, missiles: int | None,
                              scenario_episode: int | None,
-                             font_path: str | Path | None, dpi: int) -> dict[str, Any]:
+                             font_path: str | Path | None, dpi: int,
+                             show_safety_interventions: bool) -> dict[str, Any]:
     destination = _episode_destination(
         evaluation, output_root, episode_output, episode=episode, missiles=missiles,
         scenario_episode=scenario_episode,
@@ -149,6 +167,7 @@ def _export_selected_episode(evaluation: Path, *, output_root: Path | None,
     return export_episode_trace(
         _flight_quality_source(evaluation), destination, episode=episode, missiles=missiles,
         scenario_episode=scenario_episode, font_path=font_path, dpi=dpi,
+        show_safety_interventions=show_safety_interventions,
     )
 
 
@@ -162,6 +181,7 @@ def generate_evaluation_episode_plots(
     episode_output: str | Path | None = None,
     font_path: str | Path | None = None,
     dpi: int = 160,
+    show_safety_interventions: bool = False,
 ) -> dict[str, Any]:
     """Export only one selected evaluation episode through the batch entry point."""
     selected = _validate_episode_selector(
@@ -177,6 +197,7 @@ def generate_evaluation_episode_plots(
     episode_report = _export_selected_episode(
         evaluation, output_root=root, episode_output=episode_output, episode=episode,
         missiles=missiles, scenario_episode=scenario_episode, font_path=font_path, dpi=dpi,
+        show_safety_interventions=show_safety_interventions,
     )
     manifest = {
         "mode": "evaluation_episode_only",
@@ -205,6 +226,7 @@ def generate_blue_plots(
     dpi: int = 160,
     smoothing_window: int = 20,
     flight_quality_plot_limit: int = 10,
+    evaluation_time_bin_s: float = 1.0,
     include_report_charts: bool = False,
     report_output: str | Path | None = None,
     report_dpi: int = 220,
@@ -212,6 +234,7 @@ def generate_blue_plots(
     missiles: int | None = None,
     scenario_episode: int | None = None,
     episode_output: str | Path | None = None,
+    show_safety_interventions: bool = False,
 ) -> dict[str, Any]:
     """Generate every native Blue result figure from two existing run directories."""
     training = Path(training_dir).resolve()
@@ -227,6 +250,11 @@ def generate_blue_plots(
             or not isinstance(flight_quality_plot_limit, int)
             or flight_quality_plot_limit < 0):
         raise ValueError("flight_quality_plot_limit 必须是非负整数")
+    if (isinstance(evaluation_time_bin_s, bool)
+            or not isinstance(evaluation_time_bin_s, (int, float))
+            or not math.isfinite(float(evaluation_time_bin_s))
+            or evaluation_time_bin_s <= 0.0):
+        raise ValueError("evaluation_time_bin_s 必须是正有限数")
     episode_selected = _validate_episode_selector(
         episode=episode, missiles=missiles, scenario_episode=scenario_episode,
         episode_output=episode_output,
@@ -254,6 +282,10 @@ def generate_blue_plots(
     )
     if evaluation_report is None:
         raise RuntimeError("测试结果图生成失败；详细原因见此前的标准错误输出")
+    evaluation_dynamics_report = analyze_blue_evaluation_dynamics(
+        evaluation, outputs["evaluation_dynamics"],
+        time_bin_s=float(evaluation_time_bin_s), dpi=dpi, font_path=font_path,
+    )
 
     flight_reports = {
         "training": _replot_flight_quality(
@@ -272,6 +304,7 @@ def generate_blue_plots(
             evaluation, output_root=root, episode_output=episode_output, episode=episode,
             missiles=missiles, scenario_episode=scenario_episode,
             font_path=font_path, dpi=dpi,
+            show_safety_interventions=show_safety_interventions,
         )
 
     report_destination = Path(report_output).resolve() if report_output is not None else outputs["report"]
@@ -294,6 +327,7 @@ def generate_blue_plots(
         "training_results": grouped_training_report["figures"],
         "training_dynamics": training_dynamics_report["figures"],
         "evaluation_analysis": sorted(path.name for path in outputs["evaluation_analysis"].glob("*.png")),
+        "evaluation_dynamics": evaluation_dynamics_report["figures"],
         "training_flight_quality": flight_reports["training"]["files"],
         "evaluation_flight_quality": flight_reports["evaluation"]["files"],
     }
@@ -309,7 +343,10 @@ def generate_blue_plots(
         "outputs": {name: str(path.resolve()) for name, path in outputs.items()
                     if name != "manifest"},
         "figures": figures,
-        "tables": {"training_dynamics": training_dynamics_report["tables"]},
+        "tables": {
+            "training_dynamics": training_dynamics_report["tables"],
+            "evaluation_dynamics": evaluation_dynamics_report["tables"],
+        },
         "report_charts": str(report_destination) if include_report_charts else None,
     }
     if episode_report is not None:
@@ -341,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.evaluation_dir, episode=args.episode, missiles=args.missiles,
                 scenario_episode=args.scenario_episode, output_root=args.output_root,
                 episode_output=args.episode_output, font_path=args.font, dpi=args.dpi,
+                show_safety_interventions=args.show_safety_interventions,
             )
         else:
             manifest = generate_blue_plots(
@@ -351,6 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dpi=args.dpi,
                 smoothing_window=args.smoothing_window,
                 flight_quality_plot_limit=args.flight_quality_plot_limit,
+                evaluation_time_bin_s=args.evaluation_time_bin_s,
                 include_report_charts=args.include_report_charts,
                 report_output=args.report_output,
                 report_dpi=args.report_dpi,
@@ -358,6 +397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 missiles=args.missiles,
                 scenario_episode=args.scenario_episode,
                 episode_output=args.episode_output,
+                show_safety_interventions=args.show_safety_interventions,
             )
     except (OSError, ValueError, RuntimeError, ImportError) as error:
         print(f"批量绘图失败：{type(error).__name__}: {error}", file=sys.stderr)

@@ -80,6 +80,84 @@ def test_close_locked_threat_selects_a_non_cruise_library_action() -> None:
     assert decision.output_record()["blue_action_library_entries"] == [int(decision.action_indices[0]) + 1]
 
 
+@pytest.mark.parametrize(
+    "execution_backend", ("reference", "vectorized_guarded", "shadow")
+)
+def test_action_selector_controls_action_score_and_next_previous_action(
+    execution_backend: str,
+) -> None:
+    config = _rule_config()
+    rule = BlueEvasionRuleMachine(config, execution_backend=execution_backend)
+    seen_scores: list[np.ndarray] = []
+    selected_indices = iter((7, 8))
+
+    def select_action(scores: np.ndarray, blue_index: int) -> int:
+        assert scores.shape == (29,)
+        assert blue_index == 0
+        seen_scores.append(scores.copy())
+        scores.fill(-123.0)
+        return next(selected_indices)
+
+    first = rule.decide(
+        _engagement(config, 20000.0),
+        action_selector=select_action,
+    )
+    second = rule.decide(
+        _engagement(config, 20000.0),
+        action_selector=select_action,
+    )
+
+    assert first.action_indices.tolist() == [7]
+    assert first.selected_scores.tolist() == pytest.approx([seen_scores[0][7]])
+    assert second.action_indices.tolist() == [8]
+    assert second.selected_scores.tolist() == pytest.approx([seen_scores[1][8]])
+    assert seen_scores[1][7] == pytest.approx(
+        seen_scores[0][7] + rule.config.switch_penalty
+    )
+    assert seen_scores[1][0] == pytest.approx(
+        seen_scores[0][0] - rule.config.switch_penalty
+    )
+
+
+@pytest.mark.parametrize(
+    ("invalid_index", "error_type"),
+    [
+        (True, TypeError),
+        (1.0, TypeError),
+        (-1, ValueError),
+        (29, ValueError),
+    ],
+)
+def test_action_selector_rejects_invalid_indices(
+    invalid_index: object,
+    error_type: type[Exception],
+) -> None:
+    config = _rule_config()
+    rule = BlueEvasionRuleMachine(config)
+
+    with pytest.raises(error_type, match="action_selector"):
+        rule.decide(
+            _engagement(config, 20000.0),
+            action_selector=lambda _scores, _blue_index: invalid_index,  # type: ignore[return-value]
+        )
+
+
+def test_action_selector_is_not_called_without_a_threat() -> None:
+    config = _rule_config()
+    rule = BlueEvasionRuleMachine(config)
+
+    def unexpected_selector(_scores: np.ndarray, _blue_index: int) -> int:
+        raise AssertionError("selector must not run for recovery or cruise")
+
+    decision = rule.decide(
+        _engagement(config, 60000.001),
+        action_selector=unexpected_selector,
+    )
+
+    assert decision.action_indices.tolist() == [0]
+    assert decision.modes == ("cruise",)
+
+
 def test_controller_updates_once_per_20_physics_steps() -> None:
     config = _rule_config()
     state = _engagement(config, 60000.001)

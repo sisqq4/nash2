@@ -44,6 +44,15 @@ def _episode(episode: int, *, missiles: int, scenario_episode: int) -> dict:
     ]
     speed = [math.sqrt(sum(component * component for component in row)) for row in velocity]
     horizontal = [math.hypot(row[0], row[2]) for row in velocity]
+    red_positions = [
+        [
+            [-2_000.0 + 120.0 * sample + 250.0 * slot,
+             10_500.0 + 20.0 * slot,
+             -1_000.0 + 80.0 * sample - 150.0 * slot]
+            for slot in range(missiles)
+        ]
+        for sample in range(len(time))
+    ]
     return {
         "episode": episode,
         "blue_survived": True,
@@ -76,7 +85,10 @@ def _episode(episode: int, *, missiles: int, scenario_episode: int) -> dict:
             "safety_reasons": [[], ["高度保护"], [], []],
             "min_altitude_m": 8_000.0,
             "max_altitude_m": 12_000.0,
-            "red_positions_m": [[[0.0, 9_000.0, 0.0]]] * 4,
+            "red_positions_m": red_positions,
+            "red_ids": list(range(missiles)),
+            "red_position_valid": [[True] * missiles for _ in time],
+            "red_state_valid": [[True] * missiles for _ in time],
         },
     }
 
@@ -104,6 +116,8 @@ def test_export_writes_complete_chinese_tables_mapping_summary_and_separate_plot
     assert result["episode"] == 42
     assert result["samples"] == 4
     assert result["action_segments"] == 3
+    assert result["red_tracks"] == 2
+    assert result["show_safety_interventions"] is False
     expected = {
         TRACE_CSV_NAME, SEGMENT_CSV_NAME, ACTION_MAP_CSV_NAME,
         SUMMARY_JSON_NAME, SUMMARY_CSV_NAME, *PLOT_FILENAMES,
@@ -264,6 +278,10 @@ def test_safety_overlay_is_subtle_and_projection_marks_only_run_boundaries(
         "safety": np.asarray([False, True, True, False, True, False]),
     }
     trace_export._decorate_time_axis(TimeAxis(), time_data)
+    assert time_axis_calls == []
+    trace_export._decorate_time_axis(
+        TimeAxis(), time_data, show_safety_interventions=True
+    )
     np.testing.assert_allclose(
         [(start, end) for start, end, _ in time_axis_calls],
         [(0.0, 0.2), (0.3, 0.4)], rtol=0.0, atol=1.0e-12,
@@ -297,6 +315,16 @@ def test_safety_overlay_is_subtle_and_projection_marks_only_run_boundaries(
         font_path=None, dpi=100, equal=True,
     )
 
+    default_labels = [call[2].get("label") for call in scatter_calls]
+    assert "安全介入区间起点" not in default_labels
+    assert "安全介入区间终点" not in default_labels
+    scatter_calls.clear()
+    trace_export._plot_projection(
+        tmp_path / "projection-with-safety.png", {**time_data, "position": positions},
+        first=0, second=1, title="投影", xlabel="x", ylabel="y",
+        font_path=None, dpi=100, equal=True, show_safety_interventions=True,
+    )
+
     safety_starts = next(call for call in scatter_calls
                          if call[2].get("label") == "安全介入区间起点")
     safety_ends = next(call for call in scatter_calls
@@ -309,6 +337,55 @@ def test_safety_overlay_is_subtle_and_projection_marks_only_run_boundaries(
     assert labels.count("安全介入区间起点") == 1
     assert labels.count("安全介入区间终点") == 1
     assert "安全约束介入" not in labels
+
+
+def test_projection_draws_blue_and_red_tracks_and_uses_exact_terminal_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    episode = _episode(11, missiles=2, scenario_episode=5)
+    trace = episode["trace"]
+    frozen = [9_999.0, 9_999.0, 9_999.0]
+    trace["red_positions_m"][2][0] = frozen
+    trace["red_positions_m"][3][0] = frozen
+    trace["red_state_valid"][2][0] = False
+    trace["red_state_valid"][3][0] = False
+    episode["red_termination_events"] = [{
+        "red_id": 0,
+        "time_s": 7.2,
+        "position_valid": True,
+        "position_m": [-1_777.0, 10_444.0, -888.0],
+    }]
+    data = _prepare_trace(episode)
+    assert len(data["red_tracks"]) == 2
+    first_track = data["red_tracks"][0]["position"]
+    assert first_track.shape == (3, 3)
+    assert first_track[-1].tolist() == [-1_777.0, 10_444.0, -888.0]
+    assert not np.any(np.all(first_track == np.asarray(frozen), axis=1))
+
+    plot_calls: list[tuple[np.ndarray, np.ndarray, dict]] = []
+
+    class Axis:
+        def plot(self, x, y, **kwargs):
+            plot_calls.append((np.asarray(x), np.asarray(y), kwargs))
+
+        def scatter(self, *_args, **_kwargs):
+            return None
+
+        def legend(self):
+            return None
+
+    def draw_without_saving(_path, **kwargs):
+        kwargs["draw"](Axis(), object())
+
+    monkeypatch.setattr(trace_export, "_save_figure", draw_without_saving)
+    trace_export._plot_projection(
+        tmp_path / "projection.png", data, first=0, second=2,
+        title="投影", xlabel="x", ylabel="z", font_path=None, dpi=100, equal=True,
+    )
+    assert plot_calls[0][2]["color"] == "royalblue"
+    assert [call[2]["color"] for call in plot_calls[1:]] == ["firebrick", "firebrick"]
+    assert plot_calls[1][0][-1] == pytest.approx(-1_777.0)
+    assert plot_calls[1][1][-1] == pytest.approx(-888.0)
 
 
 def test_strict_selector_safety_and_sample_interval_validation(tmp_path: Path) -> None:
