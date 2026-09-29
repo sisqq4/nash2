@@ -10,6 +10,7 @@ from ..env.types import EnvironmentConfig
 T = TypeVar("T")
 BLUE_MISSION_DURATION_S = 180.0
 BLUE_INITIAL_ALTITUDE_RANGE_M = (8000.0, 12000.0)
+BLUE_AIRCRAFT_MAX_LOAD_FACTOR_G = 10.0
 BLUE_MISSILE_INDUCED_DRAG_FACTOR = 0.05
 BLUE_MISSILE_LETHAL_RADIUS_M = 3.0
 
@@ -19,6 +20,10 @@ def default_blue_environment_config() -> EnvironmentConfig:
     config = EnvironmentConfig()
     return replace(
         config,
+        aircraft=replace(
+            config.aircraft,
+            max_load_factor_g=BLUE_AIRCRAFT_MAX_LOAD_FACTOR_G,
+        ),
         missile=replace(
             config.missile,
             induced_drag_factor=BLUE_MISSILE_INDUCED_DRAG_FACTOR,

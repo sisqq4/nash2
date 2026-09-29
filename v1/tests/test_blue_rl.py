@@ -131,6 +131,13 @@ def test_blue_cli_defaults_match_v7_environment_contract() -> None:
     assert adapter.environment_config.missile.lethal_radius_m == pytest.approx(3.0)
 
 
+def test_blue_defaults_use_ten_g_aircraft_limit() -> None:
+    assert EnvironmentConfig().aircraft.max_load_factor_g == pytest.approx(9.0)
+    assert load_environment_config(None).aircraft.max_load_factor_g == pytest.approx(10.0)
+    adapter = BlueEscapeEnv(config=BlueEscapeEnvConfig(record_acmi=False))
+    assert adapter.environment_config.aircraft.max_load_factor_g == pytest.approx(10.0)
+
+
 def test_blue_training_and_evaluation_use_random_sector_spawn_mode() -> None:
     blue_defaults = load_environment_config(None)
     assert blue_defaults.scenario.red_spawn_mode == "blue_center_random_sector"
@@ -1114,6 +1121,19 @@ def test_replay_attributes_transition_to_post_constraint_action() -> None:
     assert agent.replay.actions[0] != diagnostic["raw_action"]
     np.testing.assert_array_equal(agent.replay.next_action_masks[0], next_mask)
     np.testing.assert_allclose(agent.replay.next_action_penalties[0], next_penalty)
+
+
+def test_ten_g_blue_limit_allows_nine_g_axial_action() -> None:
+    snapshot = _envelope_snapshot()
+    snapshot["max_load_factor_g"] = 10.0
+    q_values = np.zeros(29)
+    q_values[2] = 100.0
+
+    executed, diagnostic = FlightEnvelopeConstraintLayer().select(q_values, snapshot)
+
+    assert diagnostic["raw_action"] == 2
+    assert diagnostic["executed_action"] == 2
+    assert "maximum_load" not in diagnostic["raw_action_hard_violation_reasons"]
 
 
 def test_checkpoint_round_trips_shared_envelope_configuration(tmp_path) -> None:
