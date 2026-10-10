@@ -49,7 +49,7 @@ from red_swarm_policy.policy.actor import (
     _radial_tanh_inverse,
     _radial_tanh_log_prob,
 )
-from red_swarm_policy.run_cluster_scenario import (
+from red_swarm_policy.tools.run_cluster_scenario import (
     _build_environment_config as build_cluster_environment_config,
     _load_policy_actors,
     build_parser as build_cluster_parser,

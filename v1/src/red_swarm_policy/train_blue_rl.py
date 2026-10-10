@@ -16,9 +16,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from .analyze_blue_training_load import safe_analyze_blue_training_load
-from .analyze_training import write_training_analysis_safely
-from .analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
+from .analysis.analyze_blue_training_load import safe_analyze_blue_training_load
+from .analysis.analyze_training import write_training_analysis_safely
+from .analysis.analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
                       FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
                       FlightQualityTracker, MechanismRewardConfig,

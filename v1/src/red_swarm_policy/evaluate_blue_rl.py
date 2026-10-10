@@ -12,8 +12,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .analyze_blue_evaluations import write_evaluation_analysis_safely
-from .analyze_blue_evaluation_dynamics import safe_analyze_blue_evaluation_dynamics
+from .analysis.analyze_blue_evaluations import write_evaluation_analysis_safely
 from .blue_rl import (BlueEscapeEnvConfig, BlueProcessEnvironmentPool, EvaluationActionShaper,
                       EvaluationShapingConfig, FlightEnvelopeConfig,
                       FlightEnvelopeConstraintLayer, FlightQualityTracker,
@@ -81,16 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-survival-rate", type=float, default=None,
                         help="Reference survival rate used to flag a decrease larger than 5 percentage points")
     parser.add_argument("--no-result-plots", action="store_true",
-                        help=("Skip aggregate result figures and speed/load profile PNGs; "
-                              "speed/load CSV and JSON statistics are still written"))
+                        help="Skip aggregate result figures; preserve evaluation and telemetry data")
     parser.add_argument("--result-plots-dir", default=None,
                         help="Aggregate result figures directory; defaults to OUTPUT/evaluation_analysis")
-    parser.add_argument("--dynamics-time-bin-s", type=float, default=1.0,
-                        help="Time-bin width in seconds for post-evaluation speed/load profiles")
-    parser.add_argument("--dynamics-output-dir", default=None,
-                        help="Speed/load statistics directory; defaults to OUTPUT/evaluation_dynamics")
-    parser.add_argument("--no-dynamics-analysis", action="store_true",
-                        help="Skip all post-evaluation speed/load statistics")
     return parser
 
 
@@ -189,8 +181,6 @@ def main() -> int:
     if args.episodes < 1 or args.parallel_envs < 1 or args.env_worker_threads < 1 or args.log_interval < 1: raise SystemExit("episode, worker, and log interval counts must be positive")
     if args.acmi_interval < 0 or args.env_worker_timeout_s <= 0: raise SystemExit("invalid ACMI interval or worker timeout")
     if args.flight_quality_plot_limit < 0: raise SystemExit("flight-quality plot limit must be non-negative")
-    if not math.isfinite(args.dynamics_time_bin_s) or args.dynamics_time_bin_s <= 0.0:
-        raise SystemExit("--dynamics-time-bin-s must be a positive finite number")
     if args.baseline_survival_rate is not None and not 0.0 <= args.baseline_survival_rate <= 1.0:
         raise SystemExit("baseline survival rate must be in [0, 1]")
     if args.red_sector_width_deg is not None and not 0.0 < args.red_sector_width_deg <= 360.0:
@@ -565,17 +555,6 @@ def main() -> int:
                "recording_metadata_path": str(recording_metadata_path),
                "episodes_per_hour": total_episodes * 3600.0 / max(elapsed, 1e-9),
                "results": rows}
-    if args.no_dynamics_analysis:
-        summary["evaluation_dynamics"] = None
-    else:
-        dynamics_output = (Path(args.dynamics_output_dir) if args.dynamics_output_dir
-                           else output / "evaluation_dynamics")
-        summary["evaluation_dynamics"] = safe_analyze_blue_evaluation_dynamics(
-            output,
-            dynamics_output,
-            time_bin_s=args.dynamics_time_bin_s,
-            make_plots=not args.no_result_plots,
-        )
     (output / "evaluation.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _emit({"event": "evaluation_complete", "episodes": total_episodes,
            "total_episodes": total_episodes,

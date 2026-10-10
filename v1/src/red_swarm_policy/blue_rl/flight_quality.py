@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
-from ..plot_localization import chinese_plot_context
+from ..analysis.plot_localization import chinese_plot_context
 from .episode_telemetry import RedTelemetryTracker
 
 EPS = 1.0e-9

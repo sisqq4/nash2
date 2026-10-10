@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from .analyze_training import write_training_analysis_safely
+from .analysis.analyze_training import write_training_analysis_safely
 from .cli_utils import parse_float_pair, parse_float_range, parse_float_sequence
 from .core.config import PPOConfig, SwarmModelConfig
 from .env import (

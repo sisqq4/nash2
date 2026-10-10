@@ -558,9 +558,6 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert args.episodes == 100
     assert args.log_interval == 10
     assert args.jsonl_path is None
-    assert args.dynamics_time_bin_s == 1.0
-    assert args.dynamics_output_dir is None
-    assert args.no_dynamics_analysis is False
     assert not any((args.mechanism_threat, args.mechanism_timing,
                     args.mechanism_direction, args.mechanism_overload))
 

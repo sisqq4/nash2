@@ -44,7 +44,7 @@ from red_swarm_policy.train_env import (
     build_parser as build_training_parser,
     train,
 )
-from red_swarm_policy.validate_stage1_low_checkpoint import (
+from red_swarm_policy.tools.validate_stage1_low_checkpoint import (
     _build_stage1_quality_gate,
     _compare_to_pn_baseline,
 )

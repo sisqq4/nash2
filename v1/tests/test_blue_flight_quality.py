@@ -15,7 +15,7 @@ from red_swarm_policy.blue_rl.flight_quality import (
     replot_flight_quality_episodes,
     write_flight_quality_report,
 )
-from red_swarm_policy.plot_localization import chinese_plot_context
+from red_swarm_policy.analysis.plot_localization import chinese_plot_context
 
 
 def test_episode_plot_shows_large_radii_separate_units_and_all_load_legends(tmp_path: Path) -> None:

@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from .analyze_blue_evaluations import write_evaluation_analysis_safely
+from .analysis.analyze_blue_evaluations import write_evaluation_analysis_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, MechanismRewardConfig,
                       parse_mechanism_rewards)
 from .blue_rl.config_io import configure_blue_mission_duration, load_environment_config
