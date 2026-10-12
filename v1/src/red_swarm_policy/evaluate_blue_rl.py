@@ -83,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip aggregate result figures; preserve evaluation and telemetry data")
     parser.add_argument("--result-plots-dir", default=None,
                         help="Aggregate result figures directory; defaults to OUTPUT/evaluation_analysis")
+    parser.add_argument(
+        "--minimal-input-adapter", action="store_true",
+        help=("Rebuild normalized-v4 observations from test-time minimal packets "
+              "(time/reset, ownship kinematics, stable missile track_id plus "
+              "kinematics, and the previous actual maneuver)."),
+    )
     return parser
 
 
@@ -241,6 +247,8 @@ def main() -> int:
             f"checkpoint schema/dimension ({checkpoint_schema}, {agent.config.observation_dim}) "
             f"does not match --missiles; expected {schema_dimensions}"
         )
+    if args.minimal_input_adapter and observation_schema != "normalized_v4":
+        raise ValueError("--minimal-input-adapter requires a normalized_v4 checkpoint")
     mechanism_reward_config = (
         MechanismRewardConfig(**agent.config.mechanism_reward_config)
         if agent.config.mechanism_reward_config else MechanismRewardConfig(enabled=False)
@@ -295,6 +303,8 @@ def main() -> int:
            "parallel_cpu_envs": pool_size, "env_worker_threads": args.env_worker_threads,
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
+           "observation_source": ("minimal_input_adapter"
+                                  if args.minimal_input_adapter else "simulator"),
            "guidance_contract": GUIDANCE_CONTRACT,
            "acmi_interval": args.acmi_interval, "output": str(output), "evaluation_only": True,
            "flight_quality_jsonl_path": str(flight_quality_jsonl_path),
@@ -310,7 +320,8 @@ def main() -> int:
            "checkpoint_target_updates": agent.target_updates}, jsonl_path)
     with BlueProcessEnvironmentPool(environment_config, config, pool_size,
                                     native_threads=args.env_worker_threads,
-                                    timeout_s=args.env_worker_timeout_s) as pool:
+                                    timeout_s=args.env_worker_timeout_s,
+                                    minimal_input_adapter=args.minimal_input_adapter) as pool:
         assignments = {}
         for worker in range(pool_size):
             trial = episodes_by_id[next_episode]
@@ -540,6 +551,8 @@ def main() -> int:
                "by_scenario": by_scenario, "parallel_envs": pool_size,
                "inference_batch_size": pool_size,
                "evaluation_only": True, "learner_state_unchanged": True,
+                "observation_source": ("minimal_input_adapter"
+                                       if args.minimal_input_adapter else "simulator"),
                "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
                "evaluation_mechanisms": {"threat": shaping_config.threat, "timing": shaping_config.timing,
                                          "direction": shaping_config.direction, "overload": shaping_config.overload,

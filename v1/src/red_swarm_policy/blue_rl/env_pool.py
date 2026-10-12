@@ -13,8 +13,10 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import torch
 
+from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.types import EnvironmentConfig
 from .environment import BlueEscapeEnv, BlueEscapeEnvConfig
+from .minimal_input import BlueMinimalInput, BlueMinimalInputAdapter, BlueMissileTrack
 
 
 @dataclass(frozen=True)
@@ -35,12 +37,63 @@ def _receive(connection: Connection) -> Any:
 
 
 def _worker(connection: Connection, environment: EnvironmentConfig,
-            config: BlueEscapeEnvConfig, worker_index: int, native_threads: int) -> None:
+            config: BlueEscapeEnvConfig, worker_index: int, native_threads: int,
+            minimal_input_adapter: bool) -> None:
     try:
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[name] = str(native_threads)
         torch.set_num_threads(native_threads)
         env = BlueEscapeEnv(environment, config)
+        adapter = (
+            BlueMinimalInputAdapter(environment, config)
+            if minimal_input_adapter else None
+        )
+
+        def adapted_observation(
+            info: dict[str, object], *, reset: bool
+        ) -> tuple[np.ndarray, dict[str, object]]:
+            assert env.inner.state is not None and adapter is not None
+            state = env.inner.state
+            actual_command = (
+                BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
+                if reset
+                else np.asarray(info["actual_load_command_body_g"], dtype=np.float64)
+            )
+            frame = BlueMinimalInput(
+                time_s=float(state.time_s),
+                reset=reset,
+                blue_position_m=state.blue[0].position_m,
+                blue_velocity_mps=state.blue[0].velocity_mps,
+                missile_tracks=tuple(
+                    BlueMissileTrack(
+                        track_id=index,
+                        position_m=missile.position_m,
+                        velocity_mps=missile.velocity_mps,
+                    )
+                    for index, missile in enumerate(state.red)
+                    if missile.alive
+                ),
+                previous_actual_load_command_body_g=actual_command,
+            )
+            output = adapter.observe(frame)
+            adapted_info = dict(info)
+            # The model, optional test-time shaper, and hard envelope all use
+            # state reconstructed from the same minimal packet.  Rich simulator
+            # values remain available only in passive telemetry/reward fields.
+            adapted_info["mechanism_state"] = output.mechanism_snapshot
+            adapted_info["learning_active"] = output.active
+            adapted_info["observation_source"] = "minimal_input_adapter"
+            adapted_info["minimal_input_adapter"] = {
+                "time_s": float(state.time_s),
+                "reset": reset,
+                "track_ids": [track.track_id for track in frame.missile_tracks],
+                "visible_track_ids": list(output.visible_track_ids),
+                "estimated_guidance_modes": list(
+                    output.mechanism_snapshot["red_guidance_modes"]
+                ),
+            }
+            return output.observation, adapted_info
+
         _send(connection, (True, {"index": worker_index, "pid": os.getpid()}))
         while True:
             operation, payload = _receive(connection)
@@ -50,15 +103,28 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
                 if operation == "reset":
                     result = env.reset(payload["seed"], episode_index=payload["episode_index"],
                                        missile_count=payload.get("missile_count"))
+                    if adapter is not None:
+                        result = adapted_observation(result[1], reset=True)
                 elif operation == "step":
+                    was_active = adapter.active if adapter is not None else False
                     if isinstance(payload, dict):
+                        executed_action = int(payload["action"])
                         observation, reward, terminated, truncated, info = env.step(
                             payload["action"], policy_action=payload.get("policy_action"),
                             action_mask=payload.get("action_mask"),
                             fallback_required=bool(payload.get("fallback_required", False)),
                         )
                     else:
+                        executed_action = int(payload)
                         observation, reward, terminated, truncated, info = env.step(payload)
+                    if adapter is not None:
+                        # Before first detection the blue module deliberately
+                        # executes cruise action zero, even if a direct pool
+                        # caller supplied another action.
+                        adapter.record_executed_action(
+                            executed_action if was_active else 0
+                        )
+                        observation, info = adapted_observation(info, reset=False)
                     result = BlueStepResult(observation, reward, terminated, truncated, info)
                 else:
                     raise ValueError(f"unknown blue environment operation: {operation}")
@@ -94,7 +160,8 @@ class BlueProcessEnvironmentPool:
     """Persistent spawned CPU workers used by the batched blue learner."""
 
     def __init__(self, environment: EnvironmentConfig, config: BlueEscapeEnvConfig,
-                 size: int, *, native_threads: int = 1, timeout_s: float = 300.0) -> None:
+                 size: int, *, native_threads: int = 1, timeout_s: float = 300.0,
+                 minimal_input_adapter: bool = False) -> None:
         if size < 1 or native_threads < 1 or timeout_s <= 0:
             raise ValueError("size, native_threads and timeout_s must be positive")
         self.size, self.timeout_s = int(size), float(timeout_s)
@@ -106,7 +173,9 @@ class BlueProcessEnvironmentPool:
                 for index in range(self.size):
                     parent, child = self._context.Pipe(duplex=True)
                     process = self._context.Process(
-                        target=_worker, args=(child, environment, config, index, native_threads),
+                        target=_worker,
+                        args=(child, environment, config, index, native_threads,
+                              bool(minimal_input_adapter)),
                         name=f"blue-env-{index:02d}", daemon=True,
                     )
                     process.start(); child.close()

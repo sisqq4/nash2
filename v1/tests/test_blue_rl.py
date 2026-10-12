@@ -15,6 +15,9 @@ from red_swarm_policy.blue_rl import (
     BLUE_ACTION_CONTEXT_DIM,
     BlueEscapeEnv,
     BlueEscapeEnvConfig,
+    BlueMinimalInput,
+    BlueMinimalInputAdapter,
+    BlueMissileTrack,
     BlueProcessEnvironmentPool,
     BlueRLController,
     EvaluationActionShaper,
@@ -406,6 +409,127 @@ def test_normalized_v4_exposes_physical_mechanism_state_and_padding() -> None:
     assert observation.shape[0] > blue_observation_dim("normalized_v3", 4)
 
 
+def _minimal_frame(
+    *,
+    time_s: float,
+    reset: bool,
+    tracks: tuple[BlueMissileTrack, ...],
+    command: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> BlueMinimalInput:
+    return BlueMinimalInput(
+        time_s=time_s,
+        reset=reset,
+        blue_position_m=(0.0, 10_000.0, 0.0),
+        blue_velocity_mps=(300.0, 0.0, 0.0),
+        missile_tracks=tracks,
+        previous_actual_load_command_body_g=command,
+    )
+
+
+def test_minimal_input_adapter_preserves_checkpoint_shape_and_internal_action() -> None:
+    config = EnvironmentConfig()
+    adapter = BlueMinimalInputAdapter(
+        config,
+        BlueEscapeEnvConfig(
+            missile_count=1,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    track = BlueMissileTrack(
+        "incoming-1",
+        (40_000.0, 10_000.0, 0.0),
+        (-config.missile.max_speed_mps, 0.0, 0.0),
+    )
+
+    initial = adapter.observe(
+        _minimal_frame(time_s=config.policy_entry_time_s, reset=True, tracks=(track,))
+    )
+    assert initial.observation.shape == (blue_observation_dim("normalized_v4", 1),)
+    assert initial.active is True
+    assert initial.visible_track_ids == ("incoming-1",)
+    # Per-missile energy/guidance/valid fields occupy offsets 10/11/12.
+    assert initial.observation[6 + 10] == pytest.approx(1.0)
+    assert initial.observation[6 + 11] == pytest.approx(0.25)  # boost
+    assert initial.observation[6 + 12] == pytest.approx(1.0)
+    assert initial.observation[-32] == pytest.approx(1.0)
+
+    adapter.record_executed_action(7)
+    command = tuple(float(value) for value in BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[7])
+    updated = adapter.observe(
+        _minimal_frame(
+            time_s=config.policy_entry_time_s + 0.1,
+            reset=False,
+            tracks=(track,),
+            command=command,
+        )
+    )
+    action_context_offset = updated.observation.size - BLUE_ACTION_CONTEXT_DIM
+    assert updated.observation[action_context_offset + 7] == pytest.approx(1.0)
+    assert np.count_nonzero(
+        updated.observation[action_context_offset:action_context_offset + 29]
+    ) == 1
+    np.testing.assert_allclose(
+        updated.observation[-3:],
+        np.asarray(command) / np.asarray([9.0, 9.0, np.pi]),
+    )
+
+
+def test_minimal_input_adapter_keeps_slots_stable_by_track_id_and_resets_history() -> None:
+    config = EnvironmentConfig()
+    adapter = BlueMinimalInputAdapter(
+        config,
+        BlueEscapeEnvConfig(
+            missile_count=2,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    first = BlueMissileTrack("first", (30_000.0, 10_000.0, 0.0), (-900.0, 0.0, 0.0))
+    second = BlueMissileTrack("second", (40_000.0, 10_000.0, 0.0), (-900.0, 0.0, 0.0))
+    initial = adapter.observe(
+        _minimal_frame(time_s=7.0, reset=True, tracks=(first, second))
+    )
+    reordered = adapter.observe(
+        _minimal_frame(time_s=7.1, reset=False, tracks=(second, first))
+    )
+
+    assert initial.visible_track_ids == reordered.visible_track_ids == ("first", "second")
+    np.testing.assert_allclose(reordered.observation[6:9], [0.15, 0.0, 0.0])
+    np.testing.assert_allclose(reordered.observation[19:22], [0.20, 0.0, 0.0])
+
+    adapter.record_executed_action(7)
+    reset_output = adapter.observe(
+        _minimal_frame(time_s=7.0, reset=True, tracks=(second, first))
+    )
+    assert adapter.previous_executed_action_index == 0
+    reset_action_offset = reset_output.observation.size - BLUE_ACTION_CONTEXT_DIM
+    assert reset_output.observation[reset_action_offset] == pytest.approx(1.0)
+    assert reset_output.visible_track_ids == ("second", "first")
+
+
+def test_minimal_input_adapter_requires_reset_monotonic_time_and_unique_ids() -> None:
+    adapter = BlueMinimalInputAdapter(
+        EnvironmentConfig(),
+        BlueEscapeEnvConfig(
+            missile_count=1,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    track = BlueMissileTrack("same", (30_000.0, 10_000.0, 0.0), (-900.0, 0.0, 0.0))
+
+    with pytest.raises(RuntimeError, match="reset=True"):
+        adapter.observe(_minimal_frame(time_s=7.0, reset=False, tracks=(track,)))
+    adapter.observe(_minimal_frame(time_s=7.0, reset=True, tracks=(track,)))
+    with pytest.raises(ValueError, match="increase strictly"):
+        adapter.observe(_minimal_frame(time_s=7.0, reset=False, tracks=(track,)))
+    with pytest.raises(ValueError, match="duplicate track_id"):
+        adapter.observe(
+            _minimal_frame(time_s=7.1, reset=False, tracks=(track, track))
+        )
+
+
 def _mechanism_snapshot(*, los_velocity_z_mps: float = 0.0,
                         missile_position_x_m: float = 10_000.0,
                         missile_velocity_x_mps: float = -900.0,
@@ -560,6 +684,10 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert args.jsonl_path is None
     assert not any((args.mechanism_threat, args.mechanism_timing,
                     args.mechanism_direction, args.mechanism_overload))
+    assert args.minimal_input_adapter is False
+    assert build_evaluation_parser().parse_args([
+        "checkpoint.pt", "--minimal-input-adapter",
+    ]).minimal_input_adapter is True
 
     path = tmp_path / "evaluation.jsonl"
     emit_evaluation_event({"event": "evaluation_progress", "completed_episodes": 10}, path)
@@ -1651,6 +1779,27 @@ def test_process_blue_pool_uses_global_episode_numbers(tmp_path) -> None:
         assert all(result.terminated or result.truncated for result in results.values())
     assert not (tmp_path / "episode_000001.acmi").exists()
     assert (tmp_path / "episode_000002.acmi").is_file()
+
+
+def test_process_blue_pool_can_rebuild_test_observation_from_minimal_input() -> None:
+    cfg = short_config()
+    blue = BlueEscapeEnvConfig(
+        missile_count=1,
+        observation_schema="normalized_v4",
+        decision_interval_s=cfg.time_step_s,
+        record_acmi=False,
+    )
+    with BlueProcessEnvironmentPool(
+        cfg, blue, 1, timeout_s=30.0, minimal_input_adapter=True
+    ) as pool:
+        observation, info = pool.reset({0: (11, 1)})[0]
+        assert observation.shape == (blue_observation_dim("normalized_v4", 1),)
+        assert info["observation_source"] == "minimal_input_adapter"
+        assert info["minimal_input_adapter"]["reset"] is True
+        result = pool.step({0: 0})[0]
+        assert result.observation.shape == observation.shape
+        assert result.info["minimal_input_adapter"]["reset"] is False
+        assert result.info["minimal_input_adapter"]["track_ids"] == [0]
 
 
 def _assert_nested_training_state_equal(expected: object, actual: object) -> None:
