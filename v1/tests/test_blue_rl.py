@@ -33,6 +33,7 @@ from red_swarm_policy.blue_rl import (
 )
 from red_swarm_policy.blue_rl.config_io import (
     configure_blue_mission_duration,
+    default_blue_environment_config,
     load_environment_config,
 )
 from red_swarm_policy.env import (
@@ -129,6 +130,7 @@ def test_blue_cli_defaults_match_v7_environment_contract() -> None:
     defaults = load_environment_config(None)
     assert defaults.missile.induced_drag_factor == pytest.approx(0.05)
     assert defaults.missile.lethal_radius_m == pytest.approx(3.0)
+    assert defaults.scenario.max_missiles_per_target == 6
     adapter = BlueEscapeEnv(config=BlueEscapeEnvConfig(record_acmi=False))
     assert adapter.environment_config.missile.induced_drag_factor == pytest.approx(0.05)
     assert adapter.environment_config.missile.lethal_radius_m == pytest.approx(3.0)
@@ -409,6 +411,26 @@ def test_normalized_v4_exposes_physical_mechanism_state_and_padding() -> None:
     assert observation.shape[0] > blue_observation_dim("normalized_v3", 4)
 
 
+def test_six_missile_environment_uses_fixed_149_dimension_and_steps() -> None:
+    base = default_blue_environment_config()
+    config = replace(base, max_steps=base.policy_entry_steps + 40)
+    env = BlueEscapeEnv(config, BlueEscapeEnvConfig(
+        missile_count=6,
+        max_missiles=6,
+        pad_observation_to_max_missiles=True,
+        observation_schema="normalized_v4",
+        decision_interval_s=0.1,
+        record_acmi=False,
+    ))
+
+    observation, info = env.reset(seed=17)
+    next_observation, _, _, _, _ = env.step(0)
+
+    assert env.observation_dim == blue_observation_dim("normalized_v4", 6) == 149
+    assert observation.shape == next_observation.shape == (149,)
+    assert info["missile_slot_mask"] == [True] * 6
+
+
 def _minimal_frame(
     *,
     time_s: float,
@@ -500,6 +522,33 @@ def test_minimal_input_adapter_matches_three_scenario_training_dimension() -> No
     assert output.observation[18] == pytest.approx(1.0)
     assert output.observation[31] == pytest.approx(0.0)
     assert output.observation[44] == pytest.approx(0.0)
+
+
+def test_minimal_input_adapter_matches_six_scenario_training_dimension() -> None:
+    config = default_blue_environment_config()
+    adapter = BlueMinimalInputAdapter(
+        config,
+        BlueEscapeEnvConfig(
+            missile_count=1,
+            max_missiles=6,
+            pad_observation_to_max_missiles=True,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    track = BlueMissileTrack(
+        "incoming-1", (40_000.0, 10_000.0, 0.0), (-900.0, 0.0, 0.0)
+    )
+
+    output = adapter.observe(
+        _minimal_frame(time_s=7.0, reset=True, tracks=(track,))
+    )
+
+    assert adapter.observation_dim == blue_observation_dim("normalized_v4", 6) == 149
+    assert output.observation.shape == (149,)
+    assert output.observation[18] == pytest.approx(1.0)
+    assert all(output.observation[offset] == pytest.approx(0.0)
+               for offset in (31, 44, 57, 70, 83))
 
 
 def test_minimal_input_adapter_keeps_slots_stable_by_track_id_and_resets_history() -> None:
@@ -698,10 +747,18 @@ def test_curriculum_rehearses_old_scenarios_and_ramps_probabilities() -> None:
     assert not within_forgetting_limit({1: .14}, {1: .20})
 
 
-@pytest.mark.parametrize(("value", "expected"), [("4", (4,)), ("1,2,3,4", (1, 2, 3, 4)),
-                                                   ("1,3,3", (1, 3))])
+@pytest.mark.parametrize(("value", "expected"), [
+    ("4", (4,)),
+    ("1,2,3,4,5,6", (1, 2, 3, 4, 5, 6)),
+    ("1,6,6", (1, 6)),
+])
 def test_parse_missile_scenarios(value: str, expected: tuple[int, ...]) -> None:
     assert parse_missile_scenarios(value) == expected
+
+
+def test_parse_missile_scenarios_rejects_more_than_six() -> None:
+    with pytest.raises(ValueError, match="1,2,3,4,5,6"):
+        parse_missile_scenarios("7")
 
 
 def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> None:
@@ -729,13 +786,15 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
 
 def test_evaluation_plan_runs_every_scenario_with_round_paired_seeds() -> None:
     plan = _build_paired_episode_plan(
-        seed=2000, episodes_per_scenario=3, missile_scenarios=(1, 2, 3),
+        seed=2000, episodes_per_scenario=3, missile_scenarios=(1, 2, 3, 4, 5, 6),
     )
 
-    assert [trial["episode"] for trial in plan] == list(range(1, 10))
-    assert [trial["missile_count"] for trial in plan] == [1, 1, 1, 2, 2, 2, 3, 3, 3]
-    assert [trial["scenario_episode"] for trial in plan] == [1, 2, 3] * 3
-    assert [trial["seed"] for trial in plan] == [2001, 2002, 2003] * 3
+    assert [trial["episode"] for trial in plan] == list(range(1, 19))
+    assert [trial["missile_count"] for trial in plan] == [
+        scenario for scenario in range(1, 7) for _ in range(3)
+    ]
+    assert [trial["scenario_episode"] for trial in plan] == [1, 2, 3] * 6
+    assert [trial["seed"] for trial in plan] == [2001, 2002, 2003] * 6
     assert build_evaluation_parser().parse_args([
         "checkpoint.pt", "--episodes-per-scenario", "7",
     ]).episodes == 7
@@ -754,12 +813,18 @@ def test_evaluation_plan_runs_every_scenario_with_round_paired_seeds() -> None:
 def test_training_parser_accepts_replay_capacity_override() -> None:
     from red_swarm_policy.train_blue_rl import build_parser
 
-    args = build_parser().parse_args(["--replay-size", "500000"])
+    args = build_parser().parse_args([
+        "--replay-size", "500000",
+        "--missiles", "1,2,3,4,5,6",
+        "--minimal-input-adapter",
+    ])
     assert args.replay_size == 500_000
+    assert parse_missile_scenarios(args.missiles) == (1, 2, 3, 4, 5, 6)
+    assert args.minimal_input_adapter is True
     assert args.checkpoint_eval_episodes == 100
     assert args.resume_from is None
     assert args.resume_save_interval == 100
-    assert args.minimal_input_adapter is False
+    assert build_parser().parse_args([]).minimal_input_adapter is False
     assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
@@ -857,11 +922,12 @@ def test_post_training_speed_load_plot_destinations_and_safe_call(
 
 
 def test_checkpoint_validation_plan_is_fixed_and_balanced_across_training_scenarios() -> None:
+    scenarios = (1, 2, 3, 4, 5, 6)
     first = _build_checkpoint_validation_plan(
-        seed=2000, episodes=100, missile_scenarios=(1, 2, 3),
+        seed=2000, episodes=100, missile_scenarios=scenarios,
     )
     repeated = _build_checkpoint_validation_plan(
-        seed=2000, episodes=100, missile_scenarios=(1, 2, 3),
+        seed=2000, episodes=100, missile_scenarios=scenarios,
     )
 
     assert repeated == first
@@ -870,7 +936,7 @@ def test_checkpoint_validation_plan_is_fixed_and_balanced_across_training_scenar
     assert len({trial["seed"] for trial in first}) == 100
     scenario_counts = {
         scenario: sum(trial["missile_count"] == scenario for trial in first)
-        for scenario in (1, 2, 3)
+        for scenario in scenarios
     }
     assert sum(scenario_counts.values()) == 100
     assert max(scenario_counts.values()) - min(scenario_counts.values()) <= 1

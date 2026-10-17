@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ..cli_utils import BLUE_MAX_MISSILE_SCENARIO
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.environment import RedBlueEngagementEnv
 from ..env.guidance import GUIDANCE_CONTRACT
@@ -78,8 +79,16 @@ class BlueEscapeEnvConfig:
     record_red_telemetry: bool = False
 
     def validate(self, environment: EnvironmentConfig) -> None:
-        if not 1 <= self.missile_count <= self.max_missiles <= 4:
-            raise ValueError("blue training supports one to four missiles against one aircraft")
+        if not 1 <= self.missile_count <= self.max_missiles <= BLUE_MAX_MISSILE_SCENARIO:
+            raise ValueError(
+                f"blue training supports one to {BLUE_MAX_MISSILE_SCENARIO} "
+                "missiles against one aircraft"
+            )
+        if environment.scenario.max_missiles_per_target < self.max_missiles:
+            raise ValueError(
+                "environment max_missiles_per_target must be at least the blue "
+                f"adapter max_missiles ({self.max_missiles})"
+            )
         if self.observation_schema not in {
             "legacy_v1", "normalized_v2", "normalized_v3", "normalized_v4"
         }:
@@ -717,7 +726,7 @@ class BlueEscapeEnv:
             # Versioned, dimensionless input.  Horizontal position is relative
             # to the blue aircraft (altitude remains absolute because ground
             # clearance matters).  A per-slot validity bit removes zero-padding
-            # ambiguity in mixed 1v1--1v4 training.
+            # ambiguity in mixed 1v1--1v6 training.
             values = [0.0, blue.position_m[1] / 20000.0, 0.0,
                       *(blue.velocity_mps / 2000.0)]
             if self.config.observation_schema in {"normalized_v2", "normalized_v3"}:

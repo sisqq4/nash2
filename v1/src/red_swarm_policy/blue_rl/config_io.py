@@ -5,6 +5,7 @@ from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ..cli_utils import BLUE_MAX_MISSILE_SCENARIO
 from ..env.types import EnvironmentConfig
 
 T = TypeVar("T")
@@ -33,6 +34,7 @@ def default_blue_environment_config() -> EnvironmentConfig:
             config.scenario,
             blue_altitude_range_m=BLUE_INITIAL_ALTITUDE_RANGE_M,
             red_spawn_mode="blue_center_random_sector",
+            max_missiles_per_target=BLUE_MAX_MISSILE_SCENARIO,
         ),
     )
 

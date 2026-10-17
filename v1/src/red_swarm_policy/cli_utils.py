@@ -3,15 +3,21 @@ from __future__ import annotations
 import math
 
 
+BLUE_MAX_MISSILE_SCENARIO = 6
+
+
 def parse_missile_scenarios(value: str | int) -> tuple[int, ...]:
-    """Parse a comma-separated, de-duplicated subset of the 1v1--1v4 scenarios."""
+    """Parse a comma-separated, de-duplicated subset of the 1v1--1v6 scenarios."""
+    supported = ",".join(str(item) for item in range(1, BLUE_MAX_MISSILE_SCENARIO + 1))
     try:
         items = [int(part.strip()) for part in str(value).split(",") if part.strip()]
     except ValueError as error:
-        raise ValueError("missiles must be a comma-separated subset of 1,2,3,4") from error
+        raise ValueError(f"missiles must be a comma-separated subset of {supported}") from error
     scenarios = tuple(dict.fromkeys(items))
-    if not scenarios or any(item not in range(1, 5) for item in scenarios):
-        raise ValueError("missiles must be a comma-separated subset of 1,2,3,4")
+    if not scenarios or any(
+        item not in range(1, BLUE_MAX_MISSILE_SCENARIO + 1) for item in scenarios
+    ):
+        raise ValueError(f"missiles must be a comma-separated subset of {supported}")
     return scenarios
 
 

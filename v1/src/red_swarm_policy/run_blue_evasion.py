@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from .blue_rl.config_io import default_blue_environment_config
+from .cli_utils import BLUE_MAX_MISSILE_SCENARIO
 from .env import (
     BlueEvasionConfig,
     BlueEvasionController,
@@ -207,20 +208,21 @@ def main(argv: list[str] | None = None) -> int:
         checkpoint_schema = agent.config.observation_schema
         checkpoint_slots = [
             count
-            for count in range(1, 5)
+            for count in range(1, BLUE_MAX_MISSILE_SCENARIO + 1)
             if blue_observation_dim(checkpoint_schema, count)
             == agent.config.observation_dim
         ]
         if len(checkpoint_slots) != 1:
             parser.error(
                 f"checkpoint expects observation_dim={agent.config.observation_dim}, "
-                "which is not a valid v1 one-to-four-threat observation"
+                "which is not a valid v1 one-to-six-threat observation"
             )
         controller = BlueRLController(
             agent,
             environment_config,
             BlueEscapeEnvConfig(
                 missile_count=checkpoint_slots[0],
+                max_missiles=checkpoint_slots[0],
                 observation_schema=checkpoint_schema,
                 decision_interval_s=args.decision_interval_s,
                 threat_detection_range_m=args.detection_range_m,

@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Total episode target, including episodes restored by --resume-from",
     )
     parser.add_argument("--missiles", default="1",
-                        help="Comma-separated scenarios to sample, e.g. 1,2,3,4 (default: 1)")
+                        help="Comma-separated scenarios to sample, e.g. 1,2,3,4,5,6 (default: 1)")
     parser.add_argument("--seed", type=int, default=0); parser.add_argument("--output", default="outputs/blue_rl/train")
     parser.add_argument("--device", default="cpu"); parser.add_argument("--env-config", default=None)
     parser.add_argument("--red-sector-width-deg", type=float, default=None,

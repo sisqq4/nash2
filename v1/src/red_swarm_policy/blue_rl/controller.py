@@ -5,6 +5,7 @@ import math
 
 import numpy as np
 
+from ..cli_utils import BLUE_MAX_MISSILE_SCENARIO
 from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G as ACTIONS
 from ..env.types import EngagementState, EnvironmentConfig
 from .environment import BlueEscapeEnvConfig, blue_action_context, blue_observation_dim
@@ -98,12 +99,12 @@ class BlueRLController:
             self.observation_dim = int(observation_dim)
             slots = [
                 count
-                for count in range(1, 5)
+                for count in range(1, BLUE_MAX_MISSILE_SCENARIO + 1)
                 if blue_observation_dim(self.schema, count) == self.observation_dim
             ]
             if len(slots) != 1:
                 raise ValueError(
-                    "checkpoint is incompatible with the v1 1-4 slot observation contract"
+                    "checkpoint is incompatible with the v1 1-6 slot observation contract"
                 )
             self.missile_slots = slots[0]
         action_dim = getattr(policy_config, "action_dim", len(ACTIONS))

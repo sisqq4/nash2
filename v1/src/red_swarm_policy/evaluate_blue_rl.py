@@ -40,7 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
               "uses seed + round_index in every missile-count scenario. The legacy "
               "--episodes spelling now has this per-scenario meaning too."),
     )
-    parser.add_argument("--missiles", default="1", help="Comma-separated scenarios to evaluate, e.g. 1,2,3,4")
+    parser.add_argument(
+        "--missiles", default="1",
+        help="Comma-separated scenarios to evaluate, e.g. 1,2,3,4,5,6",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="outputs/blue_rl/test"); parser.add_argument("--device", default="cpu")
     parser.add_argument("--env-config", default=None); parser.add_argument("--decision-interval", type=float, default=0.1)
