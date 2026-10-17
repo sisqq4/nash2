@@ -475,6 +475,33 @@ def test_minimal_input_adapter_preserves_checkpoint_shape_and_internal_action() 
     )
 
 
+def test_minimal_input_adapter_matches_three_scenario_training_dimension() -> None:
+    config = EnvironmentConfig()
+    adapter = BlueMinimalInputAdapter(
+        config,
+        BlueEscapeEnvConfig(
+            missile_count=1,
+            max_missiles=3,
+            pad_observation_to_max_missiles=True,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    track = BlueMissileTrack(
+        "incoming-1", (40_000.0, 10_000.0, 0.0), (-900.0, 0.0, 0.0)
+    )
+
+    output = adapter.observe(
+        _minimal_frame(time_s=7.0, reset=True, tracks=(track,))
+    )
+
+    assert adapter.observation_dim == blue_observation_dim("normalized_v4", 3) == 104
+    assert output.observation.shape == (104,)
+    assert output.observation[18] == pytest.approx(1.0)
+    assert output.observation[31] == pytest.approx(0.0)
+    assert output.observation[44] == pytest.approx(0.0)
+
+
 def test_minimal_input_adapter_keeps_slots_stable_by_track_id_and_resets_history() -> None:
     config = EnvironmentConfig()
     adapter = BlueMinimalInputAdapter(
@@ -684,10 +711,13 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert args.jsonl_path is None
     assert not any((args.mechanism_threat, args.mechanism_timing,
                     args.mechanism_direction, args.mechanism_overload))
-    assert args.minimal_input_adapter is False
+    assert args.minimal_input_adapter is None
     assert build_evaluation_parser().parse_args([
         "checkpoint.pt", "--minimal-input-adapter",
     ]).minimal_input_adapter is True
+    assert build_evaluation_parser().parse_args([
+        "checkpoint.pt", "--no-minimal-input-adapter",
+    ]).minimal_input_adapter is False
 
     path = tmp_path / "evaluation.jsonl"
     emit_evaluation_event({"event": "evaluation_progress", "completed_episodes": 10}, path)
@@ -729,10 +759,14 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
     assert args.checkpoint_eval_episodes == 100
     assert args.resume_from is None
     assert args.resume_save_interval == 100
+    assert args.minimal_input_adapter is False
     assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
     ]).reward_mechanisms == ("timing", "overload")
+    assert build_parser().parse_args([
+        "--minimal-input-adapter"
+    ]).minimal_input_adapter is True
 
 
 def test_resume_contract_includes_safe_boundary_save_interval() -> None:
@@ -765,10 +799,21 @@ def test_resume_contract_includes_safe_boundary_save_interval() -> None:
         env_config=blue_environment,
         rainbow_config=rainbow,
     )
+    adapter_changed = _resume_contract(
+        args=args,
+        training_scenarios=(1, 2, 3),
+        curriculum=None,
+        environment_config=environment,
+        env_config=blue_environment,
+        rainbow_config=replace(rainbow, minimal_input_adapter=True),
+    )
 
     assert original["resume_save_interval"] == 100
+    assert original["rainbow_config"]["minimal_input_adapter"] is False
     assert changed["resume_save_interval"] == 200
     assert changed != original
+    assert adapter_changed["rainbow_config"]["minimal_input_adapter"] is True
+    assert adapter_changed != original
 
 
 def test_post_training_speed_load_plot_destinations_and_safe_call(
@@ -1782,7 +1827,11 @@ def test_process_blue_pool_uses_global_episode_numbers(tmp_path) -> None:
 
 
 def test_process_blue_pool_can_rebuild_test_observation_from_minimal_input() -> None:
-    cfg = short_config()
+    # Leave one additional physics frame after the exercised step.  The common
+    # short fixture ends on its first step, correctly removing the terminal
+    # missile track before the adapter packet is built.
+    short = short_config()
+    cfg = replace(short, max_steps=short.max_steps + 1)
     blue = BlueEscapeEnvConfig(
         missile_count=1,
         observation_schema="normalized_v4",
@@ -1877,7 +1926,7 @@ def test_rainbow_full_training_state_round_trip_preserves_learning_state() -> No
     config = RainbowDQNConfig(
         3, 2, hidden_dim=8, atoms=5, value_min=-2.0, value_max=2.0,
         batch_size=2, replay_size=8, learning_starts=2, n_step=2,
-        target_update_interval=2, device="cpu",
+        target_update_interval=2, device="cpu", minimal_input_adapter=True,
     )
     torch.manual_seed(71)
     np.random.seed(71)
@@ -1906,6 +1955,7 @@ def test_rainbow_full_training_state_round_trip_preserves_learning_state() -> No
     restored = RainbowDQNAgent.from_training_state_dict(saved, device="cpu")
 
     _assert_nested_training_state_equal(saved, restored.training_state_dict())
+    assert restored.config.minimal_input_adapter is True
     assert restored.n_step is restored._n_step_by_env[0]
     assert set(restored._n_step_by_env) == {0, 1}
     assert all(not buffer.items for buffer in restored._n_step_by_env.values())
@@ -1915,6 +1965,18 @@ def test_rainbow_full_training_state_round_trip_preserves_learning_state() -> No
     np.random.seed(1701)
     actual_sample = restored.replay.sample(3, beta=0.8)
     _assert_nested_training_state_equal(expected_sample, actual_sample)
+
+
+def test_rainbow_old_training_state_defaults_to_direct_simulator_observation() -> None:
+    agent = RainbowDQNAgent(RainbowDQNConfig(
+        2, 2, hidden_dim=8, atoms=5, replay_size=8, learning_starts=100,
+    ))
+    saved = agent.training_state_dict()
+    del saved["config"]["minimal_input_adapter"]
+
+    restored = RainbowDQNAgent.from_training_state_dict(saved, device="cpu")
+
+    assert restored.config.minimal_input_adapter is False
 
 
 def test_rainbow_resume_safety_rejects_pending_n_step_transitions() -> None:

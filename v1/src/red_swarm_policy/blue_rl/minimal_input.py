@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Hashable, Sequence
+from typing import Any, Hashable, Mapping, Sequence
 
 import numpy as np
 
@@ -71,6 +71,41 @@ def _finite_vector(name: str, value: Sequence[float]) -> np.ndarray:
     if vector.shape != (3,) or not np.all(np.isfinite(vector)):
         raise ValueError(f"{name} must be a finite three-vector")
     return vector
+
+
+def blue_minimal_input_from_simulator(
+    state: Any,
+    info: Mapping[str, object],
+    *,
+    reset: bool,
+) -> BlueMinimalInput:
+    """Build the deployment packet from simulator-visible quantities only.
+
+    This bridge is shared by training and evaluation so both paths exercise
+    exactly the same compatibility contract.  Entity indices are stable for
+    one simulator episode and therefore serve as track identifiers here.
+    """
+    actual_command = (
+        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
+        if reset
+        else np.asarray(info["actual_load_command_body_g"], dtype=np.float64)
+    )
+    return BlueMinimalInput(
+        time_s=float(state.time_s),
+        reset=bool(reset),
+        blue_position_m=state.blue[0].position_m,
+        blue_velocity_mps=state.blue[0].velocity_mps,
+        missile_tracks=tuple(
+            BlueMissileTrack(
+                track_id=index,
+                position_m=missile.position_m,
+                velocity_mps=missile.velocity_mps,
+            )
+            for index, missile in enumerate(state.red)
+            if missile.alive
+        ),
+        previous_actual_load_command_body_g=actual_command,
+    )
 
 
 class BlueMinimalInputAdapter:

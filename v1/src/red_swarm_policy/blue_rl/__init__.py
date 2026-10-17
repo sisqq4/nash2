@@ -13,7 +13,8 @@ from .mechanism_reward import (BlueMechanismStateEstimator, MechanismRewardConfi
                                MECHANISM_REWARD_NAMES, encode_normalized_v4,
                                mechanism_observation_dim, parse_mechanism_rewards)
 from .minimal_input import (BlueMinimalAdapterOutput, BlueMinimalInput,
-                            BlueMinimalInputAdapter, BlueMissileTrack)
+                            BlueMinimalInputAdapter, BlueMissileTrack,
+                            blue_minimal_input_from_simulator)
 
 from .flight_quality import (FlightQualityTracker, append_flight_quality_episode,
                              replot_flight_quality_episodes, write_flight_quality_report)
@@ -50,6 +51,7 @@ __all__ = [
     "BlueMinimalInput",
     "BlueMinimalAdapterOutput",
     "BlueMinimalInputAdapter",
+    "blue_minimal_input_from_simulator",
     "FlightQualityTracker",
     "append_flight_quality_episode",
     "replot_flight_quality_episodes",

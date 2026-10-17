@@ -13,10 +13,12 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 import torch
 
-from ..env.actions import BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G
 from ..env.types import EnvironmentConfig
 from .environment import BlueEscapeEnv, BlueEscapeEnvConfig
-from .minimal_input import BlueMinimalInput, BlueMinimalInputAdapter, BlueMissileTrack
+from .minimal_input import (
+    BlueMinimalInputAdapter,
+    blue_minimal_input_from_simulator,
+)
 
 
 @dataclass(frozen=True)
@@ -54,26 +56,8 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
         ) -> tuple[np.ndarray, dict[str, object]]:
             assert env.inner.state is not None and adapter is not None
             state = env.inner.state
-            actual_command = (
-                BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
-                if reset
-                else np.asarray(info["actual_load_command_body_g"], dtype=np.float64)
-            )
-            frame = BlueMinimalInput(
-                time_s=float(state.time_s),
-                reset=reset,
-                blue_position_m=state.blue[0].position_m,
-                blue_velocity_mps=state.blue[0].velocity_mps,
-                missile_tracks=tuple(
-                    BlueMissileTrack(
-                        track_id=index,
-                        position_m=missile.position_m,
-                        velocity_mps=missile.velocity_mps,
-                    )
-                    for index, missile in enumerate(state.red)
-                    if missile.alive
-                ),
-                previous_actual_load_command_body_g=actual_command,
+            frame = blue_minimal_input_from_simulator(
+                state, info, reset=reset
             )
             output = adapter.observe(frame)
             adapted_info = dict(info)

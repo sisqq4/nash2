@@ -20,10 +20,12 @@ from .analysis.analyze_blue_training_load import safe_analyze_blue_training_load
 from .analysis.analyze_training import write_training_analysis_safely
 from .analysis.analyze_blue_training_results import record_episode_orientation, write_blue_training_results_safely
 from .blue_rl import (BlueEscapeEnv, BlueEscapeEnvConfig, BlueProcessEnvironmentPool,
+                      BlueMinimalInputAdapter,
                       FlightEnvelopeConfig, FlightEnvelopeConstraintLayer,
                       FlightQualityTracker, MechanismRewardConfig,
                       RainbowDQNAgent, RainbowDQNConfig,
                       append_flight_quality_episode,
+                      blue_minimal_input_from_simulator,
                       blue_observation_dim,
                       parse_mechanism_rewards,
                       write_flight_quality_report)
@@ -56,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Persistent CPU environment processes sampled in parallel")
     parser.add_argument("--env-worker-threads", type=int, default=1)
     parser.add_argument("--env-worker-timeout-s", type=float, default=300.0)
+    parser.add_argument(
+        "--minimal-input-adapter", action="store_true",
+        help=("Train from the same minimal-packet compatibility layer used at "
+              "deployment/evaluation while retaining the normalized-v4 network shape."),
+    )
     parser.add_argument("--updates-per-transition", type=float, default=1.0,
                         help="Gradient updates scheduled per collected environment transition")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -589,10 +596,18 @@ def _validate_resume_payload(
     saved_contract = payload.get("critical_config")
     if not isinstance(saved_contract, dict):
         raise ValueError("resume snapshot is missing critical_config")
-    if saved_contract != expected_contract:
+    normalized_saved_contract = dict(saved_contract)
+    saved_rainbow = normalized_saved_contract.get("rainbow_config")
+    if isinstance(saved_rainbow, dict):
+        saved_rainbow = dict(saved_rainbow)
+        # Old snapshots predate the adapter flag and therefore used direct
+        # simulator observations.
+        saved_rainbow.setdefault("minimal_input_adapter", False)
+        normalized_saved_contract["rainbow_config"] = saved_rainbow
+    if normalized_saved_contract != expected_contract:
         differing = sorted(
-            key for key in set(saved_contract) | set(expected_contract)
-            if saved_contract.get(key) != expected_contract.get(key)
+            key for key in set(normalized_saved_contract) | set(expected_contract)
+            if normalized_saved_contract.get(key) != expected_contract.get(key)
         )
         raise ValueError(
             "resume training configuration mismatch for: " + ", ".join(differing)
@@ -880,6 +895,19 @@ def _checkpoint_validation_learner_state(agent: RainbowDQNAgent) -> tuple[object
     )
 
 
+def _require_observation_dim(
+    observation: np.ndarray, expected_dim: int, *, context: str
+) -> np.ndarray:
+    """Fail at the environment boundary before a malformed sample reaches replay."""
+    values = np.asarray(observation, dtype=np.float32)
+    if values.shape != (expected_dim,):
+        raise RuntimeError(
+            f"{context} observation has shape {values.shape}; "
+            f"expected ({expected_dim},)"
+        )
+    return values
+
+
 def _evaluate_checkpoint_without_updates(
     agent: RainbowDQNAgent,
     pool: BlueProcessEnvironmentPool,
@@ -891,6 +919,13 @@ def _evaluate_checkpoint_without_updates(
         raise ValueError("checkpoint validation plan must not be empty")
     learner_state = _checkpoint_validation_learner_state(agent)
     online_training = bool(agent.online.training)
+    configured_observation_dim = getattr(
+        getattr(agent, "config", None), "observation_dim", None
+    )
+    expected_observation_dim = (
+        int(configured_observation_dim)
+        if configured_observation_dim is not None else None
+    )
     started = time.monotonic()
     observations: dict[int, np.ndarray] = {}
     learning_active: dict[int, bool] = {}
@@ -916,9 +951,21 @@ def _evaluate_checkpoint_without_updates(
             constraints[worker].reset()
             next_trial += 1
         for worker, (observation, info) in pool.reset(assignments).items():
-            observations[worker] = observation
+            if expected_observation_dim is None:
+                values = np.asarray(observation)
+                if values.ndim != 1:
+                    raise RuntimeError(
+                        f"checkpoint reset observation has shape {values.shape}; expected a vector"
+                    )
+                expected_observation_dim = int(values.shape[0])
+            observations[worker] = _require_observation_dim(
+                observation, expected_observation_dim,
+                context="checkpoint reset",
+            )
             learning_active[worker] = bool(info["learning_active"])
-            envelope_states[worker] = dict(info["flight_quality_state"])
+            envelope_states[worker] = dict(
+                info.get("mechanism_state", info["flight_quality_state"])
+            )
 
         while observations:
             workers = sorted(observations)
@@ -957,9 +1004,14 @@ def _evaluate_checkpoint_without_updates(
             resets: dict[int, tuple[int, int, int]] = {}
             for worker in workers:
                 result = results[worker]
-                observations[worker] = result.observation
+                observations[worker] = _require_observation_dim(
+                    result.observation, expected_observation_dim,
+                    context="checkpoint step",
+                )
                 learning_active[worker] = bool(result.info["learning_active"])
-                envelope_states[worker] = dict(result.info["flight_quality_state"])
+                envelope_states[worker] = dict(result.info.get(
+                    "mechanism_state", result.info["flight_quality_state"]
+                ))
                 if not (result.terminated or result.truncated):
                     continue
                 trial = plan[trial_by_worker[worker]]
@@ -990,9 +1042,14 @@ def _evaluate_checkpoint_without_updates(
                     trial_by_worker.pop(worker)
             if resets:
                 for worker, (observation, info) in pool.reset(resets).items():
-                    observations[worker] = observation
+                    observations[worker] = _require_observation_dim(
+                        observation, expected_observation_dim,
+                        context="checkpoint reset",
+                    )
                     learning_active[worker] = bool(info["learning_active"])
-                    envelope_states[worker] = dict(info["flight_quality_state"])
+                    envelope_states[worker] = dict(
+                        info.get("mechanism_state", info["flight_quality_state"])
+                    )
                     constraints[worker].reset()
     finally:
         agent.online.train(online_training)
@@ -1019,11 +1076,40 @@ def _evaluate_checkpoint_without_updates(
 
 def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                            env_config: BlueEscapeEnvConfig, scenarios: list[int],
-                           episodes: int, seed: int) -> dict[str, Any]:
+                           episodes: int, seed: int, *,
+                           minimal_input_adapter: bool = False) -> dict[str, Any]:
     """Evaluate without replay writes, optimizer steps, or NoisyNet exploration."""
-    evaluation_env = BlueEscapeEnv(environment_config, replace(
+    evaluation_config = replace(
         env_config, record_acmi=False, acmi_episode_interval=0,
-    ))
+    )
+    evaluation_env = BlueEscapeEnv(environment_config, evaluation_config)
+    adapter = (
+        BlueMinimalInputAdapter(environment_config, evaluation_config)
+        if minimal_input_adapter else None
+    )
+
+    def adapt(
+        observation: np.ndarray,
+        info: dict[str, object],
+        *,
+        reset: bool,
+        executed_action: int = 0,
+        was_active: bool = False,
+    ) -> tuple[np.ndarray, dict[str, object]]:
+        if adapter is None:
+            return observation, info
+        assert evaluation_env.inner.state is not None
+        if not reset:
+            adapter.record_executed_action(executed_action if was_active else 0)
+        output = adapter.observe(blue_minimal_input_from_simulator(
+            evaluation_env.inner.state, info, reset=reset,
+        ))
+        adapted_info = dict(info)
+        adapted_info["mechanism_state"] = output.mechanism_snapshot
+        adapted_info["learning_active"] = output.active
+        adapted_info["observation_source"] = "minimal_input_adapter"
+        return output.observation, adapted_info
+
     rates: dict[int, float] = {}; mean_times: dict[int, float] = {}
     saved_envelope = agent.config.flight_envelope_config
     envelope_config = (FlightEnvelopeConfig(**saved_envelope) if saved_envelope else
@@ -1035,8 +1121,17 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                 seed=seed + scenario * 100_000 + index, episode_index=index + 1,
                 missile_count=scenario,
             )
+            observation, reset_info = adapt(
+                observation, reset_info, reset=True,
+            )
+            observation = _require_observation_dim(
+                observation, agent.config.observation_dim,
+                context="curriculum evaluation reset",
+            )
             learning_active = bool(reset_info["learning_active"])
-            mechanism_state = dict(reset_info["flight_quality_state"])
+            mechanism_state = dict(reset_info.get(
+                "mechanism_state", reset_info["flight_quality_state"]
+            ))
             constraint_layer = FlightEnvelopeConstraintLayer(envelope_config)
             done = False
             while not done:
@@ -1046,6 +1141,7 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                     policy_action = int(diagnostic["raw_action"])
                 else:
                     action = policy_action = 0
+                was_active = adapter.active if adapter is not None else False
                 observation, _, terminated, truncated, info = evaluation_env.step(
                     action, policy_action=policy_action,
                     action_mask=np.asarray(diagnostic["effective_action_mask"], dtype=bool)
@@ -1053,8 +1149,18 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                     fallback_required=bool(diagnostic.get("fallback_required", False))
                     if learning_active else False,
                 )
+                observation, info = adapt(
+                    observation, info, reset=False,
+                    executed_action=action, was_active=was_active,
+                )
+                observation = _require_observation_dim(
+                    observation, agent.config.observation_dim,
+                    context="curriculum evaluation step",
+                )
                 learning_active = bool(info["learning_active"])
-                mechanism_state = dict(info["flight_quality_state"])
+                mechanism_state = dict(info.get(
+                    "mechanism_state", info["flight_quality_state"]
+                ))
                 done = terminated or truncated
             survived.append(float(info["blue_survived"])); times.append(float(info.get("time_s", 0.0)))
         rates[scenario] = float(np.mean(survived)); mean_times[scenario] = float(np.mean(times))
@@ -1129,6 +1235,7 @@ def main() -> int:
     rainbow_config = RainbowDQNConfig(
         blue_observation_dim(env_config.observation_schema, max(training_scenarios)), 29,
         observation_schema=env_config.observation_schema,
+        minimal_input_adapter=args.minimal_input_adapter,
         batch_size=args.batch_size,
         replay_size=args.replay_size,
         gamma=env_config.shaping_discount, device=args.device,
@@ -1204,10 +1311,12 @@ def main() -> int:
         environment_config, env_config, pool_size,
         native_threads=args.env_worker_threads,
         timeout_s=args.env_worker_timeout_s,
+        minimal_input_adapter=args.minimal_input_adapter,
     ) as pool, BlueProcessEnvironmentPool(
         environment_config, checkpoint_eval_env_config, checkpoint_eval_pool_size,
         native_threads=args.env_worker_threads,
         timeout_s=args.env_worker_timeout_s,
+        minimal_input_adapter=args.minimal_input_adapter,
     ) as checkpoint_eval_pool:
         # Keep CUDA initialization in the parent until every Windows worker has
         # spawned.  A resumed RNG state is restored after constructing/loading
@@ -1273,6 +1382,9 @@ def main() -> int:
             "guidance_contract": GUIDANCE_CONTRACT,
             "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
             "seed": args.seed, "decision_interval_s": args.decision_interval,
+            "observation_source": ("minimal_input_adapter"
+                                   if args.minimal_input_adapter else "simulator"),
+            "observation_dim": rainbow_config.observation_dim,
             "updates_per_transition": args.updates_per_transition, "completed_environment_transitions": 0,
             "completed_optimizer_updates": 0, "completed_target_updates": 0,
             "rainbow_config": asdict(rainbow_config), "blue_environment_config": asdict(env_config),
@@ -1495,10 +1607,15 @@ def main() -> int:
                 record_episode_orientation(
                     episode_orientations, episode_by_worker[worker], info
                 )
-                observations[worker] = observation
+                observations[worker] = _require_observation_dim(
+                    observation, rainbow_config.observation_dim,
+                    context="training reset",
+                )
                 learning_active_by_worker[worker] = bool(info["learning_active"])
                 quality[worker].add(info["flight_quality_state"])
-                envelope_states[worker] = dict(info["flight_quality_state"])
+                envelope_states[worker] = dict(info.get(
+                    "mechanism_state", info["flight_quality_state"]
+                ))
                 constraints[worker].reset()
 
         def save_resume_snapshot(
@@ -1686,11 +1803,14 @@ def main() -> int:
                 done = result.terminated or result.truncated
                 learning_transition = bool(result.info["learning_transition"])
                 executed_action = int(result.info["executed_action_index"])
+                next_envelope_state = dict(result.info.get(
+                    "mechanism_state", result.info["flight_quality_state"]
+                ))
                 if learning_transition:
                     if executed_action != actions[worker]:
                         raise RuntimeError("replay action must equal the post-constraint executed action")
                     next_mask, next_penalty, _ = constraints[worker].constraints(
-                        result.info["flight_quality_state"]
+                        next_envelope_state
                     )
                     agent.observe_for_env(
                         worker, previous, executed_action, result.reward, result.observation, done,
@@ -1709,9 +1829,12 @@ def main() -> int:
                     for name, value in dict(result.info.get("reward_diagnostics", {})).items():
                         reward_diagnostics_by_worker[worker][str(name)] += float(value)
                 reward_by_worker[worker] += result.reward
-                observations[worker] = result.observation
+                observations[worker] = _require_observation_dim(
+                    result.observation, rainbow_config.observation_dim,
+                    context="training step",
+                )
                 learning_active_by_worker[worker] = bool(result.info["learning_active"])
-                envelope_states[worker] = dict(result.info["flight_quality_state"])
+                envelope_states[worker] = next_envelope_state
                 diagnostic = action_diagnostics.get(worker, {}) if learning_transition else {}
                 quality[worker].add(result.info["flight_quality_state"],
                                     policy_action=policy_actions[worker] if learning_transition else None,
@@ -1796,6 +1919,7 @@ def main() -> int:
                 evaluation = _curriculum_evaluation(
                     agent, environment_config, env_config, introduced,
                     args.curriculum_eval_episodes, args.seed + 10_000_000,
+                    minimal_input_adapter=args.minimal_input_adapter,
                 )
                 rates = {int(key): float(value) for key, value in evaluation["survival_rates"].items()}
                 eligible = within_forgetting_limit(rates, historical_best)

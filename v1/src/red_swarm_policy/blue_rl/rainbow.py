@@ -90,6 +90,9 @@ class RainbowDQNConfig:
     flight_envelope_config: dict[str, object] | None = None
     # Versioned physical-state estimator used by normalized_v4 and its reward.
     mechanism_reward_config: dict[str, object] | None = None
+    # Records how the fixed-size observation was constructed.  It does not
+    # change the network shape; evaluation uses it to mirror new training runs.
+    minimal_input_adapter: bool = False
 
 
 class RainbowDQNAgent:
@@ -330,6 +333,9 @@ class RainbowDQNAgent:
             raise TypeError("Rainbow training config must be a mapping")
         expected_config = asdict(self.config)
         comparable_saved = dict(saved_config); comparable_saved.pop("device", None)
+        # Training states written before the compatibility adapter was added
+        # implicitly used direct simulator observations.
+        comparable_saved.setdefault("minimal_input_adapter", False)
         comparable_expected = dict(expected_config); comparable_expected.pop("device", None)
         if comparable_saved != comparable_expected:
             differing = sorted(

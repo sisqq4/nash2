@@ -83,12 +83,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip aggregate result figures; preserve evaluation and telemetry data")
     parser.add_argument("--result-plots-dir", default=None,
                         help="Aggregate result figures directory; defaults to OUTPUT/evaluation_analysis")
-    parser.add_argument(
-        "--minimal-input-adapter", action="store_true",
+    observation_source = parser.add_mutually_exclusive_group()
+    observation_source.add_argument(
+        "--minimal-input-adapter", dest="minimal_input_adapter", action="store_true",
         help=("Rebuild normalized-v4 observations from test-time minimal packets "
               "(time/reset, ownship kinematics, stable missile track_id plus "
               "kinematics, and the previous actual maneuver)."),
     )
+    observation_source.add_argument(
+        "--no-minimal-input-adapter", dest="minimal_input_adapter", action="store_false",
+        help="Use direct simulator observations even if the checkpoint records adapter training.",
+    )
+    parser.set_defaults(minimal_input_adapter=None)
     return parser
 
 
@@ -246,6 +252,10 @@ def main() -> int:
         raise ValueError(
             f"checkpoint schema/dimension ({checkpoint_schema}, {agent.config.observation_dim}) "
             f"does not match --missiles; expected {schema_dimensions}"
+        )
+    if args.minimal_input_adapter is None:
+        args.minimal_input_adapter = bool(
+            getattr(agent.config, "minimal_input_adapter", False)
         )
     if args.minimal_input_adapter and observation_schema != "normalized_v4":
         raise ValueError("--minimal-input-adapter requires a normalized_v4 checkpoint")
