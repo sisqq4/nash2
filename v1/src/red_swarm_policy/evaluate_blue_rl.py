@@ -98,6 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use direct simulator observations even if the checkpoint records adapter training.",
     )
     parser.set_defaults(minimal_input_adapter=None)
+    scenario_start = parser.add_mutually_exclusive_group()
+    scenario_start.add_argument(
+        "--start-at-first-detection",
+        dest="start_at_first_detection",
+        action="store_true",
+        help=("Pre-roll with straight-and-level blue flight to the first physics "
+              "frame strictly inside detection range, then start evaluation."),
+    )
+    scenario_start.add_argument(
+        "--no-start-at-first-detection",
+        dest="start_at_first_detection",
+        action="store_false",
+        help="Retain the legacy post-boost reset and pre-detection warmup transitions.",
+    )
+    parser.set_defaults(start_at_first_detection=None)
     return parser
 
 
@@ -185,6 +200,10 @@ def _aggregate_results(rows: list[dict[str, object]]) -> dict[str, object]:
             [float(row["miss_distance_m"]) for row in rows]
         ),
         "simulation_time_s": _numeric_distribution([float(row["simulation_time_s"]) for row in rows]),
+        "evaluated_duration_s": _numeric_distribution([
+            float(row.get("evaluated_duration_s", row["simulation_time_s"]))
+            for row in rows
+        ]),
         "decision_steps": _numeric_distribution([float(row["decision_steps"]) for row in rows]),
     }
 
@@ -262,6 +281,15 @@ def main() -> int:
         )
     if args.minimal_input_adapter and observation_schema != "normalized_v4":
         raise ValueError("--minimal-input-adapter requires a normalized_v4 checkpoint")
+    if args.start_at_first_detection is None:
+        # The current deployment-compatible checkpoint uses normalized-v4.
+        # Older schemas expose undetected entities directly and therefore keep
+        # their legacy start unless the observation contract is upgraded.
+        args.start_at_first_detection = observation_schema == "normalized_v4"
+    if args.start_at_first_detection and observation_schema != "normalized_v4":
+        raise ValueError(
+            "--start-at-first-detection requires a normalized_v4 checkpoint"
+        )
     mechanism_reward_config = (
         MechanismRewardConfig(**agent.config.mechanism_reward_config)
         if agent.config.mechanism_reward_config else MechanismRewardConfig(enabled=False)
@@ -303,6 +331,7 @@ def main() -> int:
     mechanism_traces: dict[int, list[dict[str, object]]] = {}; quality: dict[int, FlightQualityTracker] = {}
     quality_episodes: list[dict[str, Any]] = []
     decisions: dict[int, int] = {}; action_counts: dict[int, Counter[int]] = {}; initializations = {}
+    pre_detection_initializations: dict[int, dict[str, object]] = {}
     reward_component_sums: dict[int, Counter[str]] = {}; reward_diagnostic_sums: dict[int, Counter[str]] = {}
     rows: list[dict[str, object]] = []; window_rows: list[dict[str, object]] = []; next_episode = 1
     completed = 0; next_log = args.log_interval; vector_iterations = 0
@@ -316,6 +345,7 @@ def main() -> int:
            "parallel_cpu_envs": pool_size, "env_worker_threads": args.env_worker_threads,
            "env_worker_timeout_s": args.env_worker_timeout_s, "inference_batch_size_max": pool_size,
            "seed": args.seed, "decision_interval_s": args.decision_interval,
+           "start_at_first_detection": bool(args.start_at_first_detection),
            "observation_source": ("minimal_input_adapter"
                                   if args.minimal_input_adapter else "simulator"),
            "guidance_contract": GUIDANCE_CONTRACT,
@@ -334,7 +364,8 @@ def main() -> int:
     with BlueProcessEnvironmentPool(environment_config, config, pool_size,
                                     native_threads=args.env_worker_threads,
                                     timeout_s=args.env_worker_timeout_s,
-                                    minimal_input_adapter=args.minimal_input_adapter) as pool:
+                                    minimal_input_adapter=args.minimal_input_adapter,
+                                    start_at_first_detection=args.start_at_first_detection) as pool:
         assignments = {}
         for worker in range(pool_size):
             trial = episodes_by_id[next_episode]
@@ -348,6 +379,10 @@ def main() -> int:
             reward_diagnostic_sums[worker] = Counter(); next_episode += 1
         for worker, (observation, reset_info) in pool.reset(assignments).items():
             observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+            if "pre_detection_initialization" in reset_info:
+                pre_detection_initializations[worker] = reset_info[
+                    "pre_detection_initialization"
+                ]
             learning_active_by_worker[worker] = bool(reset_info["learning_active"])
             mechanism_states[worker] = reset_info["mechanism_state"]
             quality[worker].add(reset_info["flight_quality_state"])
@@ -437,8 +472,17 @@ def main() -> int:
                            "seed": trial["seed"], "missile_count": trial["missile_count"],
                            "reward": rewards[worker], **result.info,
                            "initialization": initializations[worker],
+                           **({"pre_detection_initialization":
+                               pre_detection_initializations[worker]}
+                              if worker in pre_detection_initializations else {}),
                            "blue_orientation": initializations[worker]["blue_orientation"],
                            "simulation_time_s": float(result.info.get("time_s", 0.0)),
+                           "evaluated_duration_s": float(
+                               result.info.get(
+                                   "scenario_elapsed_s",
+                                   decisions[worker] * args.decision_interval,
+                               )
+                           ),
                            "physics_steps": int(result.info.get("step_count", 0)),
                            "decision_steps": decisions[worker],
                            "action_histogram": {str(key): value for key, value in sorted(action_counts[worker].items())},
@@ -496,6 +540,7 @@ def main() -> int:
                         observations.pop(worker); episode_by_worker.pop(worker); rewards.pop(worker)
                         learning_active_by_worker.pop(worker)
                         decisions.pop(worker); action_counts.pop(worker); initializations.pop(worker)
+                        pre_detection_initializations.pop(worker, None)
                         reward_component_sums.pop(worker); reward_diagnostic_sums.pop(worker)
                         mechanism_states.pop(worker); mechanism_interventions.pop(worker)
                         mechanism_traces.pop(worker)
@@ -503,6 +548,12 @@ def main() -> int:
             if resets:
                 for worker, (observation, reset_info) in pool.reset(resets).items():
                     observations[worker] = observation; initializations[worker] = reset_info["initialization"]
+                    if "pre_detection_initialization" in reset_info:
+                        pre_detection_initializations[worker] = reset_info[
+                            "pre_detection_initialization"
+                        ]
+                    else:
+                        pre_detection_initializations.pop(worker, None)
                     learning_active_by_worker[worker] = bool(reset_info["learning_active"])
                     mechanism_states[worker] = reset_info["mechanism_state"]
                     constraints[worker].reset(); shapers[worker].reset()
@@ -564,6 +615,7 @@ def main() -> int:
                "by_scenario": by_scenario, "parallel_envs": pool_size,
                "inference_batch_size": pool_size,
                "evaluation_only": True, "learner_state_unchanged": True,
+                "start_at_first_detection": bool(args.start_at_first_detection),
                 "observation_source": ("minimal_input_adapter"
                                        if args.minimal_input_adapter else "simulator"),
                "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),

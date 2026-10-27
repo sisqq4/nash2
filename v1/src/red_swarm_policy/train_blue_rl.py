@@ -63,6 +63,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=("Train from the same minimal-packet compatibility layer used at "
               "deployment/evaluation while retaining the normalized-v4 network shape."),
     )
+    scenario_start = parser.add_mutually_exclusive_group()
+    scenario_start.add_argument(
+        "--start-at-first-detection",
+        dest="start_at_first_detection",
+        action="store_true",
+        help=("Pre-roll each episode with straight-and-level blue flight to the "
+              "first physics frame strictly inside detection range, then start training."),
+    )
+    scenario_start.add_argument(
+        "--no-start-at-first-detection",
+        dest="start_at_first_detection",
+        action="store_false",
+        help="Retain the legacy post-boost reset and pre-detection warmup transitions.",
+    )
+    parser.set_defaults(start_at_first_detection=True)
     parser.add_argument("--updates-per-transition", type=float, default=1.0,
                         help="Gradient updates scheduled per collected environment transition")
     parser.add_argument("--batch-size", type=int, default=64)
@@ -425,6 +440,7 @@ def _resume_contract(
         "seed": int(args.seed),
         "missile_scenarios": list(training_scenarios),
         "updates_per_transition": float(args.updates_per_transition),
+        "start_at_first_detection": bool(args.start_at_first_detection),
         # Draining at each full-state boundary changes parallel batch
         # composition, so this cadence is part of the learning trajectory.
         "resume_save_interval": int(args.resume_save_interval),
@@ -597,6 +613,11 @@ def _validate_resume_payload(
     if not isinstance(saved_contract, dict):
         raise ValueError("resume snapshot is missing critical_config")
     normalized_saved_contract = dict(saved_contract)
+    # Snapshots written before the detection-anchored training entry point
+    # necessarily used the legacy post-boost reset.  They may still be resumed
+    # explicitly with --no-start-at-first-detection, but must never be mixed
+    # into the new default trajectory.
+    normalized_saved_contract.setdefault("start_at_first_detection", False)
     saved_rainbow = normalized_saved_contract.get("rainbow_config")
     if isinstance(saved_rainbow, dict):
         saved_rainbow = dict(saved_rainbow)
@@ -1077,7 +1098,8 @@ def _evaluate_checkpoint_without_updates(
 def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                            env_config: BlueEscapeEnvConfig, scenarios: list[int],
                            episodes: int, seed: int, *,
-                           minimal_input_adapter: bool = False) -> dict[str, Any]:
+                           minimal_input_adapter: bool = False,
+                           start_at_first_detection: bool = True) -> dict[str, Any]:
     """Evaluate without replay writes, optimizer steps, or NoisyNet exploration."""
     evaluation_config = replace(
         env_config, record_acmi=False, acmi_episode_interval=0,
@@ -1102,7 +1124,13 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
         if not reset:
             adapter.record_executed_action(executed_action if was_active else 0)
         output = adapter.observe(blue_minimal_input_from_simulator(
-            evaluation_env.inner.state, info, reset=reset,
+            evaluation_env.inner.state,
+            info,
+            reset=reset,
+            detected_only_range_m=(
+                evaluation_config.threat_detection_range_m
+                if start_at_first_detection else None
+            ),
         ))
         adapted_info = dict(info)
         adapted_info["mechanism_state"] = output.mechanism_snapshot
@@ -1120,6 +1148,7 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
             observation, reset_info = evaluation_env.reset(
                 seed=seed + scenario * 100_000 + index, episode_index=index + 1,
                 missile_count=scenario,
+                start_at_first_detection=start_at_first_detection,
             )
             observation, reset_info = adapt(
                 observation, reset_info, reset=True,
@@ -1162,7 +1191,9 @@ def _curriculum_evaluation(agent: RainbowDQNAgent, environment_config: Any,
                     "mechanism_state", info["flight_quality_state"]
                 ))
                 done = terminated or truncated
-            survived.append(float(info["blue_survived"])); times.append(float(info.get("time_s", 0.0)))
+            survived.append(float(info["blue_survived"])); times.append(float(
+                info.get("scenario_elapsed_s", info.get("time_s", 0.0))
+            ))
         rates[scenario] = float(np.mean(survived)); mean_times[scenario] = float(np.mean(times))
     return {"survival_rates": rates, "mean_survival_time_s": mean_times,
             "episodes_per_scenario": episodes, "seed_base": seed}
@@ -1312,11 +1343,13 @@ def main() -> int:
         native_threads=args.env_worker_threads,
         timeout_s=args.env_worker_timeout_s,
         minimal_input_adapter=args.minimal_input_adapter,
+        start_at_first_detection=args.start_at_first_detection,
     ) as pool, BlueProcessEnvironmentPool(
         environment_config, checkpoint_eval_env_config, checkpoint_eval_pool_size,
         native_threads=args.env_worker_threads,
         timeout_s=args.env_worker_timeout_s,
         minimal_input_adapter=args.minimal_input_adapter,
+        start_at_first_detection=args.start_at_first_detection,
     ) as checkpoint_eval_pool:
         # Keep CUDA initialization in the parent until every Windows worker has
         # spawned.  A resumed RNG state is restored after constructing/loading
@@ -1382,6 +1415,10 @@ def main() -> int:
             "guidance_contract": GUIDANCE_CONTRACT,
             "active_reward_mechanisms": list(mechanism_reward_config.active_mechanisms()),
             "seed": args.seed, "decision_interval_s": args.decision_interval,
+            "scenario_start_mode": (
+                "first_detection" if args.start_at_first_detection else "post_boost"
+            ),
+            "start_at_first_detection": bool(args.start_at_first_detection),
             "observation_source": ("minimal_input_adapter"
                                    if args.minimal_input_adapter else "simulator"),
             "observation_dim": rainbow_config.observation_dim,
@@ -1851,8 +1888,28 @@ def main() -> int:
                         "termination_reason": result.info.get("termination_reason"),
                         "hit_count": int(result.info.get("hit_count", 0)),
                         "miss_distance_m": float(result.info.get("miss_distance_m", 0.0)),
+                        "scenario_start_mode": result.info.get(
+                            "scenario_start_mode", "post_boost"
+                        ),
                         "simulation_time_s": float(result.info.get("time_s", 0.0)),
+                        "scenario_start_time_s": result.info.get("scenario_start_time_s"),
+                        "evaluated_duration_s": float(result.info.get(
+                            "scenario_elapsed_s", result.info.get("time_s", 0.0)
+                        )),
+                        "pre_detection_warmup_time_s": float(result.info.get(
+                            "pre_detection_warmup_time_s", 0.0
+                        )),
                         "physics_steps": int(result.info.get("step_count", 0)),
+                        "scenario_start_step_count": result.info.get(
+                            "scenario_start_step_count"
+                        ),
+                        "evaluated_physics_steps": (
+                            int(result.info.get("step_count", 0))
+                            - int(result.info.get("scenario_start_step_count", 0))
+                        ),
+                        "pre_detection_warmup_steps": int(result.info.get(
+                            "pre_detection_warmup_steps", 0
+                        )),
                         "decision_steps": decisions_by_worker[worker],
                         "learning_activation_time_s": result.info.get("learning_activation_time_s"),
                         "learning_activation_range_m": result.info.get("learning_activation_range_m"),
@@ -1920,6 +1977,7 @@ def main() -> int:
                     agent, environment_config, env_config, introduced,
                     args.curriculum_eval_episodes, args.seed + 10_000_000,
                     minimal_input_adapter=args.minimal_input_adapter,
+                    start_at_first_detection=args.start_at_first_detection,
                 )
                 rates = {int(key): float(value) for key, value in evaluation["survival_rates"].items()}
                 eligible = within_forgetting_limit(rates, historical_best)
@@ -1943,6 +2001,14 @@ def main() -> int:
                 now = time.monotonic(); rewards = [float(row["reward"]) for row in window_episodes]
                 misses = [float(row["miss_distance_m"]) for row in window_episodes]
                 simulation_times = [float(row["simulation_time_s"]) for row in window_episodes]
+                evaluated_durations = [
+                    float(row["evaluated_duration_s"]) for row in window_episodes
+                ]
+                scenario_start_times = [
+                    float(row["scenario_start_time_s"])
+                    for row in window_episodes
+                    if row["scenario_start_time_s"] is not None
+                ]
                 action_total = sum(window_actions.values())
                 probabilities = np.asarray(list(window_actions.values()), dtype=np.float64) / max(action_total, 1)
                 report = {
@@ -1962,6 +2028,8 @@ def main() -> int:
                     "miss_distance_mean_m": _mean(misses),
                     "miss_distance_p95_m": float(np.percentile(misses, 95)) if misses else None,
                     "simulation_time_mean_s": _mean(simulation_times),
+                    "scenario_start_time_mean_s": _mean(scenario_start_times),
+                    "evaluated_duration_mean_s": _mean(evaluated_durations),
                     "termination_counts": dict(Counter(str(row["termination_reason"]) for row in window_episodes)),
                     "rollout_diagnostics": {
                         "wall_time_s": window_elapsed_before_resume + now - window_started,
@@ -2069,6 +2137,15 @@ def main() -> int:
             "completed_environment_transitions": agent.total_steps,
             "completed_optimizer_updates": agent.optimizer_updates,
             "completed_target_updates": agent.target_updates, "replay_size": agent.replay.size,
+            "scenario_start_mode": (
+                "first_detection" if args.start_at_first_detection else "post_boost"
+            ),
+            "simulation_time_mean_s": _mean([
+                float(row["simulation_time_s"]) for row in summaries
+            ]),
+            "evaluated_duration_mean_s": _mean([
+                float(row["evaluated_duration_s"]) for row in summaries
+            ]),
             "final_checkpoint": str(final_checkpoint),
             "resume_snapshot": str(final_resume_path),
             "resume_manifest": str(resume_manifest_path),

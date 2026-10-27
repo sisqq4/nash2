@@ -173,6 +173,12 @@ class BlueEscapeEnv:
         self._learning_active = False
         self._activation_time_s: float | None = None
         self._activation_range_m: float | None = None
+        self._detection_anchored_start = False
+        self._scenario_start_time_s: float | None = None
+        self._scenario_start_step_count: int | None = None
+        self._scenario_horizon_s: float | None = None
+        self._pre_detection_warmup_time_s = 0.0
+        self._pre_detection_warmup_steps = 0
         self._previous_executed_action_index = 0
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self.mechanism_estimator = BlueMechanismStateEstimator(config.mechanism_reward)
@@ -182,7 +188,8 @@ class BlueEscapeEnv:
         self._red_termination_events: list[dict[str, object]] = []
 
     def reset(self, seed: int | None = None, *, episode_index: int | None = None,
-              missile_count: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+              missile_count: int | None = None,
+              start_at_first_detection: bool = False) -> tuple[np.ndarray, dict[str, object]]:
         if missile_count is not None:
             if not 1 <= int(missile_count) <= self.config.max_missiles:
                 raise ValueError(f"missile_count must be in [1, {self.config.max_missiles}]")
@@ -203,17 +210,50 @@ class BlueEscapeEnv:
         assert self.inner.state is not None
         self._telemetry_red_alive = [bool(red.alive) for red in self.inner.state.red]
         self._red_termination_events = []
-        if self._record_current_episode:
-            self.recorder.record(self.inner.state)
         self._learning_active = False
         self._activation_time_s = None
         self._activation_range_m = None
+        self._detection_anchored_start = bool(start_at_first_detection)
+        self._scenario_start_time_s = None
+        self._scenario_start_step_count = None
+        self._scenario_horizon_s = None
+        self._pre_detection_warmup_time_s = 0.0
+        self._pre_detection_warmup_steps = 0
         self._previous_executed_action_index = 0
         self._applied_load_command_body_g = BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].copy()
         self.mechanism_estimator.reset()
         self._policy_red_slots = ()
         self._mechanism_reward_state = self._neutral_mechanism_state()
+        pre_detection_initialization = self._initialization_snapshot()
+        pre_detection_time_s = float(self.inner.state.time_s)
+        pre_detection_step_count = int(self.inner.state.step_count)
         self._activate_if_threat_observed()
+        if self._detection_anchored_start and not self._learning_active:
+            self._advance_to_first_detection()
+        assert self.inner.state is not None
+        self._scenario_start_time_s = float(self.inner.state.time_s)
+        self._scenario_start_step_count = int(self.inner.state.step_count)
+        self._scenario_horizon_s = max(
+            self.config.decision_interval_s,
+            (self.environment_config.max_steps - self._scenario_start_step_count)
+            * self.environment_config.time_step_s,
+        )
+        self._pre_detection_warmup_time_s = (
+            self._scenario_start_time_s - pre_detection_time_s
+        )
+        self._pre_detection_warmup_steps = (
+            self._scenario_start_step_count - pre_detection_step_count
+        )
+        # Telemetry, ACMI, action history and blue-side estimator state begin at
+        # the detection anchor.  Physical time, missile age, energy, seeker
+        # state and kinematics deliberately remain untouched.
+        if self._detection_anchored_start:
+            self._telemetry_red_alive = [
+                bool(red.alive) for red in self.inner.state.red
+            ]
+            self._red_termination_events = []
+        if self._record_current_episode:
+            self.recorder.record(self.inner.state)
         if self._learning_active:
             self._mechanism_reward_state = self._refresh_mechanism_state()
         self._previous_potential = (
@@ -232,9 +272,35 @@ class BlueEscapeEnv:
             **self._learning_status(learning_transition=False, requested_action=0,
                                     constrained_action=0, executed_action=0),
         }
+        if self._detection_anchored_start:
+            info["pre_detection_initialization"] = pre_detection_initialization
         if self.config.expose_evaluation_mechanism_state:
             info["mechanism_state"] = self._mechanism_snapshot()
         return self._observation(), info
+
+    def _advance_to_first_detection(self) -> None:
+        """Pre-roll one physics frame at a time to the strict detection edge."""
+        while not self._learning_active:
+            assert self.inner.state is not None
+            red = RedAction(
+                np.zeros(len(self.inner.state.red), dtype=np.int64),
+                np.zeros((len(self.inner.state.red), 2), dtype=np.float64),
+            )
+            result = self.inner.step(
+                red_action=red,
+                blue_action={
+                    "load_command_body_g": [
+                        BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0].tolist()
+                    ]
+                },
+            )
+            if result.done:
+                raise RuntimeError(
+                    "blue evaluation reached terminal state before any live "
+                    "missile entered the strict detection range; "
+                    f"reason={result.info.get('termination_reason', 'unknown')}"
+                )
+            self._activate_if_threat_observed()
 
     def _visible_red_slots(self) -> tuple[int, ...]:
         """Select v7's nearest, detected threats, preserving entity order."""
@@ -595,7 +661,13 @@ class BlueEscapeEnv:
 
     def _learning_status(self, *, learning_transition: bool, requested_action: int,
                          constrained_action: int, executed_action: int) -> dict[str, object]:
-        return {
+        assert self.inner.state is not None
+        scenario_elapsed_s = (
+            0.0
+            if self._scenario_start_time_s is None
+            else max(0.0, float(self.inner.state.time_s) - self._scenario_start_time_s)
+        )
+        status: dict[str, object] = {
             "learning_active": bool(self._learning_active),
             "learning_transition": bool(learning_transition),
             "threat_detection_range_m": float(self.config.threat_detection_range_m),
@@ -606,6 +678,22 @@ class BlueEscapeEnv:
             "constrained_action_index": int(constrained_action),
             "executed_action_index": int(executed_action),
         }
+        if self._detection_anchored_start:
+            status.update({
+                "scenario_start_mode": "first_detection",
+                "scenario_start_time_s": self._scenario_start_time_s,
+                "scenario_start_step_count": self._scenario_start_step_count,
+                "scenario_elapsed_s": scenario_elapsed_s,
+                "scenario_horizon_s": self._scenario_horizon_s,
+                "scenario_remaining_s": max(
+                    0.0, float(self._scenario_horizon_s or 0.0) - scenario_elapsed_s
+                ),
+                "pre_detection_warmup_time_s": float(
+                    self._pre_detection_warmup_time_s
+                ),
+                "pre_detection_warmup_steps": int(self._pre_detection_warmup_steps),
+            })
+        return status
 
     @staticmethod
     def _zero_potential() -> dict[str, float]:
@@ -707,8 +795,20 @@ class BlueEscapeEnv:
 
     def _terminal_reward(self, info: dict[str, object]) -> float:
         reason = str(info.get("termination_reason", "none"))
-        horizon = max(self.environment_config.policy_horizon_s, self.config.decision_interval_s)
-        elapsed = max(0.0, float(info.get("time_s", 0.0)) - self.environment_config.policy_entry_time_s)
+        horizon = (
+            float(self._scenario_horizon_s)
+            if self._detection_anchored_start and self._scenario_horizon_s is not None
+            else max(
+                self.environment_config.policy_horizon_s,
+                self.config.decision_interval_s,
+            )
+        )
+        reward_start_time_s = (
+            self._scenario_start_time_s
+            if self._detection_anchored_start and self._scenario_start_time_s is not None
+            else self.environment_config.policy_entry_time_s
+        )
+        elapsed = max(0.0, float(info.get("time_s", 0.0)) - reward_start_time_s)
         progress = float(np.clip(elapsed / horizon, 0.0, 1.0))
         if reason == "success":  # adjudication names this from the red side
             return self.config.terminal_killed_reward + self.config.survival_progress_bonus * progress

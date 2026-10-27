@@ -40,7 +40,8 @@ def _receive(connection: Connection) -> Any:
 
 def _worker(connection: Connection, environment: EnvironmentConfig,
             config: BlueEscapeEnvConfig, worker_index: int, native_threads: int,
-            minimal_input_adapter: bool) -> None:
+            minimal_input_adapter: bool,
+            start_at_first_detection: bool) -> None:
     try:
         for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
             os.environ[name] = str(native_threads)
@@ -57,7 +58,13 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
             assert env.inner.state is not None and adapter is not None
             state = env.inner.state
             frame = blue_minimal_input_from_simulator(
-                state, info, reset=reset
+                state,
+                info,
+                reset=reset,
+                detected_only_range_m=(
+                    config.threat_detection_range_m
+                    if start_at_first_detection else None
+                ),
             )
             output = adapter.observe(frame)
             adapted_info = dict(info)
@@ -72,6 +79,7 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
                 "reset": reset,
                 "track_ids": [track.track_id for track in frame.missile_tracks],
                 "visible_track_ids": list(output.visible_track_ids),
+                "detected_tracks_only": bool(start_at_first_detection),
                 "estimated_guidance_modes": list(
                     output.mechanism_snapshot["red_guidance_modes"]
                 ),
@@ -86,7 +94,8 @@ def _worker(connection: Connection, environment: EnvironmentConfig,
             try:
                 if operation == "reset":
                     result = env.reset(payload["seed"], episode_index=payload["episode_index"],
-                                       missile_count=payload.get("missile_count"))
+                                       missile_count=payload.get("missile_count"),
+                                       start_at_first_detection=start_at_first_detection)
                     if adapter is not None:
                         result = adapted_observation(result[1], reset=True)
                 elif operation == "step":
@@ -145,7 +154,8 @@ class BlueProcessEnvironmentPool:
 
     def __init__(self, environment: EnvironmentConfig, config: BlueEscapeEnvConfig,
                  size: int, *, native_threads: int = 1, timeout_s: float = 300.0,
-                 minimal_input_adapter: bool = False) -> None:
+                 minimal_input_adapter: bool = False,
+                 start_at_first_detection: bool = False) -> None:
         if size < 1 or native_threads < 1 or timeout_s <= 0:
             raise ValueError("size, native_threads and timeout_s must be positive")
         self.size, self.timeout_s = int(size), float(timeout_s)
@@ -159,7 +169,8 @@ class BlueProcessEnvironmentPool:
                     process = self._context.Process(
                         target=_worker,
                         args=(child, environment, config, index, native_threads,
-                              bool(minimal_input_adapter)),
+                              bool(minimal_input_adapter),
+                              bool(start_at_first_detection)),
                         name=f"blue-env-{index:02d}", daemon=True,
                     )
                     process.start(); child.close()

@@ -28,6 +28,7 @@ from red_swarm_policy.blue_rl import (
     MechanismRewardConfig,
     RainbowDQNAgent,
     RainbowDQNConfig,
+    blue_minimal_input_from_simulator,
     blue_observation_dim,
     parse_mechanism_rewards,
 )
@@ -769,12 +770,19 @@ def test_evaluation_progress_logging_defaults_and_jsonl(tmp_path, capsys) -> Non
     assert not any((args.mechanism_threat, args.mechanism_timing,
                     args.mechanism_direction, args.mechanism_overload))
     assert args.minimal_input_adapter is None
+    assert args.start_at_first_detection is None
     assert build_evaluation_parser().parse_args([
         "checkpoint.pt", "--minimal-input-adapter",
     ]).minimal_input_adapter is True
     assert build_evaluation_parser().parse_args([
         "checkpoint.pt", "--no-minimal-input-adapter",
     ]).minimal_input_adapter is False
+    assert build_evaluation_parser().parse_args([
+        "checkpoint.pt", "--start-at-first-detection",
+    ]).start_at_first_detection is True
+    assert build_evaluation_parser().parse_args([
+        "checkpoint.pt", "--no-start-at-first-detection",
+    ]).start_at_first_detection is False
 
     path = tmp_path / "evaluation.jsonl"
     emit_evaluation_event({"event": "evaluation_progress", "completed_episodes": 10}, path)
@@ -825,6 +833,10 @@ def test_training_parser_accepts_replay_capacity_override() -> None:
     assert args.resume_from is None
     assert args.resume_save_interval == 100
     assert build_parser().parse_args([]).minimal_input_adapter is False
+    assert build_parser().parse_args([]).start_at_first_detection is True
+    assert build_parser().parse_args([
+        "--no-start-at-first-detection"
+    ]).start_at_first_detection is False
     assert args.reward_mechanisms == ("threat", "timing", "direction", "overload")
     assert build_parser().parse_args([
         "--reward-mechanisms", "timing,overload"
@@ -843,6 +855,7 @@ def test_resume_contract_includes_safe_boundary_save_interval() -> None:
         resume_save_interval=100,
         curriculum_eval_interval=500,
         curriculum_eval_episodes=0,
+        start_at_first_detection=True,
     )
     environment = EnvironmentConfig()
     blue_environment = BlueEscapeEnvConfig(record_acmi=False)
@@ -872,13 +885,24 @@ def test_resume_contract_includes_safe_boundary_save_interval() -> None:
         env_config=blue_environment,
         rainbow_config=replace(rainbow, minimal_input_adapter=True),
     )
+    start_changed = _resume_contract(
+        args=SimpleNamespace(**{**vars(args), "start_at_first_detection": False}),
+        training_scenarios=(1, 2, 3),
+        curriculum=None,
+        environment_config=environment,
+        env_config=blue_environment,
+        rainbow_config=rainbow,
+    )
 
     assert original["resume_save_interval"] == 100
+    assert original["start_at_first_detection"] is True
     assert original["rainbow_config"]["minimal_input_adapter"] is False
     assert changed["resume_save_interval"] == 200
     assert changed != original
     assert adapter_changed["rainbow_config"]["minimal_input_adapter"] is True
     assert adapter_changed != original
+    assert start_changed["start_at_first_detection"] is False
+    assert start_changed != original
 
 
 def test_post_training_speed_load_plot_destinations_and_safe_call(
@@ -1540,6 +1564,106 @@ def test_blue_rl_waits_for_strict_60km_detection_before_maneuver_and_reward() ->
     assert env.inner.state.blue[0].bank_angle_rad == pytest.approx(
         np.arccos(1.0 / 9.0)
     )
+
+
+def test_first_detection_anchored_reset_preserves_physics_and_has_no_action_lag() -> None:
+    cfg = EnvironmentConfig()
+    blue = BlueEscapeEnvConfig(
+        missile_count=1,
+        observation_schema="normalized_v4",
+        decision_interval_s=0.1,
+        record_acmi=False,
+    )
+    env = BlueEscapeEnv(cfg, blue)
+
+    observation, info = env.reset(seed=2, start_at_first_detection=True)
+
+    assert env.inner.state is not None
+    state = env.inner.state
+    assert observation.shape == (blue_observation_dim("normalized_v4", 1),)
+    assert info["scenario_start_mode"] == "first_detection"
+    assert info["learning_active"] is True
+    assert info["learning_transition"] is False
+    assert info["scenario_elapsed_s"] == pytest.approx(0.0)
+    assert info["scenario_horizon_s"] == pytest.approx(
+        (cfg.max_steps - info["scenario_start_step_count"]) * cfg.time_step_s
+    )
+    assert info["scenario_remaining_s"] == pytest.approx(info["scenario_horizon_s"])
+    assert info["pre_detection_warmup_time_s"] > 0.0
+    assert info["pre_detection_warmup_steps"] > 0
+    assert info["time_s"] == pytest.approx(info["scenario_start_time_s"])
+    assert info["learning_activation_time_s"] == pytest.approx(info["time_s"])
+    assert info["learning_activation_range_m"] < blue.threat_detection_range_m
+    assert info["learning_activation_range_m"] > blue.threat_detection_range_m - 50.0
+    assert state.red[0].age_s > cfg.missile.boost_duration_s
+    assert state.time_s > cfg.policy_entry_time_s
+    assert info["executed_action_index"] == 0
+
+    frame = blue_minimal_input_from_simulator(
+        state,
+        info,
+        reset=True,
+        detected_only_range_m=blue.threat_detection_range_m,
+    )
+    adapter = BlueMinimalInputAdapter(env.environment_config, blue)
+    adapted = adapter.observe(frame)
+    assert adapted.active is True
+    assert adapted.visible_track_ids == (0,)
+    assert adapted.mechanism_snapshot["red_guidance_modes"] != ["boost"]
+
+    start_time_s = state.time_s
+    _, _, terminated, truncated, step_info = env.step(7)
+    assert not (terminated or truncated)
+    assert step_info["learning_transition"] is True
+    assert step_info["executed_action_index"] == 7
+    assert step_info["scenario_elapsed_s"] == pytest.approx(0.1)
+    assert step_info["scenario_remaining_s"] == pytest.approx(
+        info["scenario_horizon_s"] - 0.1
+    )
+    assert env.inner.state.time_s == pytest.approx(start_time_s + 0.1)
+
+
+def test_first_detection_anchored_reset_fails_cleanly_if_detection_never_occurs() -> None:
+    cfg = short_config()
+    env = BlueEscapeEnv(
+        cfg,
+        BlueEscapeEnvConfig(
+            missile_count=1,
+            observation_schema="normalized_v4",
+            decision_interval_s=cfg.time_step_s,
+            record_acmi=False,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="before any live missile entered"):
+        env.reset(seed=2, start_at_first_detection=True)
+
+
+def test_minimal_simulator_packet_can_exclude_undetected_tracks() -> None:
+    env = BlueEscapeEnv(
+        EnvironmentConfig(),
+        BlueEscapeEnvConfig(
+            missile_count=2,
+            max_missiles=2,
+            observation_schema="normalized_v4",
+            record_acmi=False,
+        ),
+    )
+    _, info = env.reset(seed=4)
+    assert env.inner.state is not None
+    state = env.inner.state
+    blue_position = state.blue[0].position_m.copy()
+    state.red[0].position_m = blue_position + np.array([59_999.0, 0.0, 0.0])
+    state.red[1].position_m = blue_position + np.array([60_000.0, 0.0, 0.0])
+
+    frame = blue_minimal_input_from_simulator(
+        state,
+        info,
+        reset=True,
+        detected_only_range_m=60_000.0,
+    )
+
+    assert [track.track_id for track in frame.missile_tracks] == [0]
 
 
 def test_normalized_v4_uses_v7_visible_nearest_slot_contract() -> None:

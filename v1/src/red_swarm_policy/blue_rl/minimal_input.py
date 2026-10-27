@@ -78,18 +78,25 @@ def blue_minimal_input_from_simulator(
     info: Mapping[str, object],
     *,
     reset: bool,
+    detected_only_range_m: float | None = None,
 ) -> BlueMinimalInput:
     """Build the deployment packet from simulator-visible quantities only.
 
     This bridge is shared by training and evaluation so both paths exercise
     exactly the same compatibility contract.  Entity indices are stable for
     one simulator episode and therefore serve as track identifiers here.
+
+    ``detected_only_range_m`` is reserved for deployment-matched evaluation:
+    the external simulator is then treated as the detection authority and
+    only tracks strictly inside that range enter the blue module.  Training
+    keeps the historical ``None`` default and therefore remains unchanged.
     """
     actual_command = (
         BLUE_AIRCRAFT_LOAD_COMMANDS_BODY_G[0]
         if reset
         else np.asarray(info["actual_load_command_body_g"], dtype=np.float64)
     )
+    blue_position = np.asarray(state.blue[0].position_m, dtype=np.float64)
     return BlueMinimalInput(
         time_s=float(state.time_s),
         reset=bool(reset),
@@ -103,6 +110,11 @@ def blue_minimal_input_from_simulator(
             )
             for index, missile in enumerate(state.red)
             if missile.alive
+            and (
+                detected_only_range_m is None
+                or float(np.linalg.norm(missile.position_m - blue_position))
+                < float(detected_only_range_m)
+            )
         ),
         previous_actual_load_command_body_g=actual_command,
     )
