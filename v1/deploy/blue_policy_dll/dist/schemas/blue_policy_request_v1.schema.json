@@ -1,0 +1,164 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nash-ver2.local/schemas/blue_policy_request_v1.schema.json",
+  "title": "Blue Policy JSON Request Protocol v1",
+  "description": "Blue-policy DLL API v2 JSON request. Public positions are WGS-84 geodetic coordinates and public velocity order is north, up, east.",
+  "oneOf": [
+    { "$ref": "#/$defs/infoRequest" },
+    { "$ref": "#/$defs/resetRequest" },
+    { "$ref": "#/$defs/stepRequest" },
+    { "$ref": "#/$defs/closeSessionRequest" }
+  ],
+  "$defs": {
+    "protocolVersion": { "type": "integer", "const": 1 },
+    "requestId": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        { "type": "string", "minLength": 1, "maxLength": 64 }
+      ]
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "aircraftId": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "aircraftType": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "nonnegativeInt64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "signedInt64": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "vector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "loadCommandBodyG": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        { "type": "number", "minimum": -10.0, "maximum": 10.0 },
+        { "type": "number", "minimum": -10.0, "maximum": 10.0 },
+        { "type": "number", "minimum": -3.141592653589793, "maximum": 3.141592653589793 }
+      ],
+      "items": false
+    },
+    "geodeticPosition": {
+      "type": "object",
+      "required": ["longitude_deg", "latitude_deg", "altitude_m"],
+      "properties": {
+        "longitude_deg": { "type": "number", "minimum": -180.0, "maximum": 180.0 },
+        "latitude_deg": { "type": "number", "minimum": -90.0, "maximum": 90.0 },
+        "altitude_m": { "type": "number", "minimum": -1000.0, "maximum": 100000.0 }
+      },
+      "additionalProperties": false
+    },
+    "ownship": {
+      "type": "object",
+      "required": ["geodetic_position", "velocity_north_up_east_mps", "alive"],
+      "properties": {
+        "geodetic_position": { "$ref": "#/$defs/geodeticPosition" },
+        "velocity_north_up_east_mps": { "$ref": "#/$defs/vector3" },
+        "alive": { "type": "boolean" },
+        "actual_load_command_body_g": { "$ref": "#/$defs/loadCommandBodyG" }
+      },
+      "additionalProperties": false
+    },
+    "missile": {
+      "type": "object",
+      "required": ["missile_id", "geodetic_position", "velocity_north_up_east_mps", "alive"],
+      "properties": {
+        "missile_id": { "$ref": "#/$defs/signedInt64" },
+        "missile_type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "geodetic_position": { "$ref": "#/$defs/geodeticPosition" },
+        "velocity_north_up_east_mps": { "$ref": "#/$defs/vector3" },
+        "alive": { "type": "boolean" },
+        "energy": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "guidance_mode": {
+          "type": "string",
+          "enum": ["boost", "locked", "lock_hold", "inertial"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "infoRequest": {
+      "type": "object",
+      "required": ["protocol_version", "request_id", "op"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "op": { "const": "info" }
+      },
+      "additionalProperties": false
+    },
+    "resetRequest": {
+      "type": "object",
+      "required": [
+        "protocol_version", "request_id", "op", "session_id", "aircraft_id",
+        "aircraft_type", "episode_id", "input_mode"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "op": { "const": "reset" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" },
+        "aircraft_type": { "$ref": "#/$defs/aircraftType" },
+        "episode_id": { "$ref": "#/$defs/nonnegativeInt64" },
+        "input_mode": { "type": "string", "enum": ["exact", "kinematics_only"] }
+      },
+      "additionalProperties": false
+    },
+    "stepRequest": {
+      "type": "object",
+      "required": [
+        "protocol_version", "request_id", "op", "session_id", "aircraft_id",
+        "aircraft_type", "step_count", "scenario_time_s", "ownship",
+        "incoming_missiles"
+      ],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "op": { "const": "step" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" },
+        "aircraft_type": { "$ref": "#/$defs/aircraftType" },
+        "step_count": { "$ref": "#/$defs/nonnegativeInt64" },
+        "scenario_time_s": { "type": "number", "minimum": 0.0 },
+        "ownship": { "$ref": "#/$defs/ownship" },
+        "incoming_missiles": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/missile" }
+        },
+        "include_diagnostics": { "type": "boolean", "default": false }
+      },
+      "additionalProperties": false
+    },
+    "closeSessionRequest": {
+      "type": "object",
+      "required": ["protocol_version", "request_id", "op", "session_id", "aircraft_id"],
+      "properties": {
+        "protocol_version": { "$ref": "#/$defs/protocolVersion" },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "op": { "const": "close_session" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

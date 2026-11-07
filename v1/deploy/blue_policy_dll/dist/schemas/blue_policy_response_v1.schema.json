@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nash-ver2.local/schemas/blue_policy_response_v1.schema.json",
+  "title": "Blue Policy JSON Response Protocol v1",
+  "description": "Blue-policy DLL API v2 JSON response. The public step result returns aircraft identity and next-frame north/up/east velocity; action indices are not part of the business interface.",
+  "oneOf": [
+    { "$ref": "#/$defs/successResponse" },
+    { "$ref": "#/$defs/errorResponse" }
+  ],
+  "$defs": {
+    "requestId": {
+      "oneOf": [
+        { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
+        { "type": "string", "minLength": 1, "maxLength": 64 }
+      ]
+    },
+    "requestIdOrNull": {
+      "oneOf": [
+        { "$ref": "#/$defs/requestId" },
+        { "type": "null" }
+      ]
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.:-]+$"
+    },
+    "aircraftId": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "nonnegativeInt64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9223372036854775807
+    },
+    "signedInt64": {
+      "type": "integer",
+      "minimum": -9223372036854775808,
+      "maximum": 9223372036854775807
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "vector3": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "number" }
+    },
+    "infoResult": {
+      "type": "object",
+      "required": [
+        "operation", "dll_api_version", "json_protocol_version", "capabilities",
+        "model_id", "model_sha256", "python_bundle_sha256", "python_version",
+        "numpy_version", "architecture", "python_module_dir", "sys_prefix",
+        "interpreter_ownership", "native_dll_search_dirs", "observation_schema",
+        "observation_dim", "action_count", "atom_count", "threat_slot_count",
+        "physics_step_s", "decision_interval_s", "detection_range_m",
+        "detection_boundary", "coordinates", "supported_input_modes",
+        "aircraft_type_handling", "velocity_output_semantics", "limits",
+        "concurrency_mode"
+      ],
+      "properties": {
+        "operation": { "const": "info" },
+        "dll_api_version": { "const": 2 },
+        "json_protocol_version": { "const": 1 },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 },
+          "contains": { "const": "json_v1" }
+        },
+        "model_id": { "type": "string", "minLength": 1 },
+        "model_sha256": { "$ref": "#/$defs/sha256" },
+        "python_bundle_sha256": { "$ref": "#/$defs/sha256" },
+        "python_version": { "type": "string", "minLength": 1 },
+        "numpy_version": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "python_module_dir": { "type": "string", "minLength": 1 },
+        "sys_prefix": { "type": "string", "minLength": 1 },
+        "interpreter_ownership": { "type": "string", "enum": ["owned", "borrowed"] },
+        "native_dll_search_dirs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "observation_schema": { "const": "normalized_v4" },
+        "observation_dim": { "const": 104 },
+        "action_count": { "const": 29 },
+        "atom_count": { "const": 61 },
+        "threat_slot_count": { "const": 3 },
+        "physics_step_s": { "const": 0.005 },
+        "decision_interval_s": { "const": 0.1 },
+        "detection_range_m": { "const": 60000 },
+        "detection_boundary": { "const": "strictly_less_than" },
+        "coordinates": {
+          "type": "object",
+          "required": [
+            "public_position", "public_velocity_order", "internal_axes",
+            "position_unit", "velocity_unit", "time_unit"
+          ],
+          "properties": {
+            "public_position": { "const": "WGS-84 longitude_deg,latitude_deg,altitude_m" },
+            "public_velocity_order": { "const": "north,up,east" },
+            "internal_axes": { "const": "x=north,y=up,z=east" },
+            "position_unit": { "const": "m" },
+            "velocity_unit": { "const": "m/s" },
+            "time_unit": { "const": "s" }
+          },
+          "additionalProperties": true
+        },
+        "supported_input_modes": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": { "type": "string", "enum": ["exact", "kinematics_only"] }
+        },
+        "aircraft_type_handling": { "const": "metadata_only_shared_model_v1" },
+        "velocity_output_semantics": { "const": "next_physics_frame_velocity" },
+        "limits": {
+          "type": "object",
+          "required": ["request_size_bytes", "max_depth", "max_tracks", "max_sessions"],
+          "properties": {
+            "request_size_bytes": { "const": 1048576 },
+            "max_depth": { "const": 32 },
+            "max_tracks": { "const": 256 },
+            "max_sessions": { "const": 1024 }
+          },
+          "additionalProperties": true
+        },
+        "concurrency_mode": { "const": "serialized_gil_v1" }
+      },
+      "additionalProperties": true
+    },
+    "resetResult": {
+      "type": "object",
+      "required": [
+        "operation", "session_id", "aircraft_id", "aircraft_type",
+        "episode_id", "input_mode", "reset"
+      ],
+      "properties": {
+        "operation": { "const": "reset" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" },
+        "aircraft_type": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "episode_id": { "$ref": "#/$defs/nonnegativeInt64" },
+        "input_mode": { "type": "string", "enum": ["exact", "kinematics_only"] },
+        "reset": { "const": true }
+      },
+      "additionalProperties": true
+    },
+    "stepDiagnostics": {
+      "type": "object",
+      "required": [
+        "mode", "decision_updated", "visible_missile_ids", "decision_count",
+        "action_intervened", "safety_intervened", "applied_load_command_body_g"
+      ],
+      "properties": {
+        "mode": { "type": "string", "enum": ["inactive", "cruise", "rainbow"] },
+        "decision_updated": { "type": "boolean" },
+        "visible_missile_ids": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/signedInt64" }
+        },
+        "decision_count": { "$ref": "#/$defs/nonnegativeInt64" },
+        "action_intervened": { "type": "boolean" },
+        "safety_intervened": { "type": "boolean" },
+        "applied_load_command_body_g": { "$ref": "#/$defs/vector3" }
+      },
+      "additionalProperties": false
+    },
+    "stepResult": {
+      "type": "object",
+      "required": [
+        "operation", "session_id", "aircraft_id", "step_count",
+        "scenario_time_s", "velocity_effective_time_s",
+        "next_velocity_north_up_east_mps", "active", "fallback_required"
+      ],
+      "properties": {
+        "operation": { "const": "step" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" },
+        "step_count": { "$ref": "#/$defs/nonnegativeInt64" },
+        "scenario_time_s": { "type": "number", "minimum": 0.0 },
+        "velocity_effective_time_s": { "type": "number", "minimum": 0.0 },
+        "next_velocity_north_up_east_mps": { "$ref": "#/$defs/vector3" },
+        "active": { "type": "boolean" },
+        "fallback_required": { "type": "boolean" },
+        "diagnostics": { "$ref": "#/$defs/stepDiagnostics" }
+      },
+      "additionalProperties": false
+    },
+    "closeSessionResult": {
+      "type": "object",
+      "required": ["operation", "session_id", "aircraft_id", "closed"],
+      "properties": {
+        "operation": { "const": "close_session" },
+        "session_id": { "$ref": "#/$defs/sessionId" },
+        "aircraft_id": { "$ref": "#/$defs/aircraftId" },
+        "closed": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "successResult": {
+      "oneOf": [
+        { "$ref": "#/$defs/infoResult" },
+        { "$ref": "#/$defs/resetResult" },
+        { "$ref": "#/$defs/stepResult" },
+        { "$ref": "#/$defs/closeSessionResult" }
+      ]
+    },
+    "successResponse": {
+      "type": "object",
+      "required": ["protocol_version", "request_id", "ok", "result"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/requestId" },
+        "ok": { "const": true },
+        "result": { "$ref": "#/$defs/successResult" }
+      },
+      "additionalProperties": true
+    },
+    "errorObject": {
+      "type": "object",
+      "required": [
+        "code", "message", "path", "retryable", "state_changed",
+        "reset_required", "details"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "BPJ_INVALID_UTF8", "BPJ_INVALID_JSON", "BPJ_UNSUPPORTED_PROTOCOL",
+            "BPJ_UNSUPPORTED_OPERATION", "BPJ_MISSING_FIELD", "BPJ_UNKNOWN_FIELD",
+            "BPJ_TYPE_MISMATCH", "BPJ_OUT_OF_RANGE", "BPJ_DUPLICATE_TRACK_ID",
+            "BPJ_SESSION_NOT_FOUND", "BPJ_SEQUENCE_ERROR", "BPJ_AIRCRAFT_IN_USE",
+            "BPJ_AIRCRAFT_MISMATCH", "BPJ_MODEL_UNAVAILABLE", "BPJ_SESSION_TAINTED",
+            "BPJ_INTERNAL_ERROR"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "path": { "oneOf": [{ "type": "string" }, { "type": "null" }] },
+        "retryable": { "type": "boolean" },
+        "state_changed": { "oneOf": [{ "type": "boolean" }, { "type": "null" }] },
+        "reset_required": { "type": "boolean" },
+        "details": { "type": "object", "additionalProperties": true }
+      },
+      "additionalProperties": true
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": ["protocol_version", "request_id", "ok", "error"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "request_id": { "$ref": "#/$defs/requestIdOrNull" },
+        "ok": { "const": false },
+        "error": { "$ref": "#/$defs/errorObject" }
+      },
+      "additionalProperties": true
+    }
+  }
+}
