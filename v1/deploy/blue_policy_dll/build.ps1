@@ -59,4 +59,6 @@ if ($Install) {
 }
 
 Write-Host "Built DLL: $(Join-Path $BuildDirectory 'Release\blue_policy_bridge.dll')"
-Write-Host "Built example: $(Join-Path $BuildDirectory 'Release\blue_policy_test_host.exe')"
+Write-Host "Built typed client: $(Join-Path $BuildDirectory 'Release\blue_policy_client.lib')"
+Write-Host "Built example: $(Join-Path $BuildDirectory 'Release\blue_policy_client_example.exe')"
+Write-Host "Built tests: $(Join-Path $BuildDirectory 'Release\blue_policy_client_test.exe')"

@@ -29,6 +29,10 @@ API v2 的首选业务接口是 `blue_policy_call_json`。它接收 UTF-8 JSON�
 `BLUE_POLICY_API_VERSION=2`。所有函数使用 `extern "C"` 和 Windows `__cdecl`，C ABI
 边界不传递 STL、Python 对象或 C++ 异常。
 
+大项目推荐直接使用 [`include/blue_policy_client.hpp`](include/blue_policy_client.hpp)
+提供的强类型 C++17 客户端。该客户端编译为静态库，不需要第三方 JSON 库，并把 STL 与
+C++ 异常限制在宿主编译单元内，不跨 DLL 边界。
+
 | 接口 | 用途 |
 |---|---|
 | `blue_policy_api_version` | 返回原生 API 版本，JSON 客户端要求值为 `2` |
@@ -67,13 +71,17 @@ dist/
 ├─ zlib.dll
 ├─ requirements-inference.txt
 ├─ include/
-│  └─ blue_policy_api.h
+│  ├─ blue_policy_api.h
+│  └─ blue_policy_client.hpp
 ├─ lib/
-│  └─ blue_policy_bridge.lib
+│  ├─ blue_policy_bridge.lib
+│  └─ blue_policy_client.lib
 ├─ schemas/
 │  ├─ blue_policy_request_v1.schema.json
 │  └─ blue_policy_response_v1.schema.json
 ├─ blue_policy_test_host.exe
+├─ blue_policy_client_example.exe
+├─ blue_policy_client_test.exe
 └─ python_app/
    ├─ blue_policy_entry.py
    ├─ blue_policy_json.py
@@ -102,11 +110,13 @@ Set-Location v1\deploy\blue_policy_dll
 .\build.ps1 -PythonExecutable D:\Anaconda\python.exe -Install
 ```
 
-脚本执行 Release x64 配置、编译、原生 CTest，并安装到 `dist/`。原生测试主机同时覆盖：
+脚本执行 Release x64 配置、编译、原生 CTest，并安装到 `dist/`。原生测试覆盖：
 
 - API v2 JSON调用和响应释放；
+- 强类型 C++ 客户端的 `info/reset/step/close/shutdown` 完整生命周期；
 - 旧 POD兼容路径；
 - 多架飞机从多个 C++线程提交请求；
+- 类型化业务错误、乱序错误不推进状态和大于 `2^53` 的 int64 飞机编号；
 - JSON业务输出包含飞机编号和速度且不含动作序号。
 
 Python回归测试：
@@ -344,7 +354,75 @@ if (blue_policy_initialize(&config) != BLUE_POLICY_STATUS_OK) {
 关闭不存在的 session 返回 `closed=false`，因此可安全重复关闭。解释器关闭只能通过原生
 `blue_policy_shutdown()` 执行，JSON协议没有 `shutdown` 操作。
 
-## 11. 最小 C++ JSON 调用
+## 11. C++ 调用
+
+### 11.1 推荐：强类型 C++17 客户端
+
+公共类型和接口位于 [`include/blue_policy_client.hpp`](include/blue_policy_client.hpp)，实现位于
+[`src/blue_policy_client.cpp`](src/blue_policy_client.cpp)。调用方链接：
+
+```text
+blue_policy_client.lib
+blue_policy_bridge.lib
+```
+
+大项目 CMake 可直接写为：
+
+```cmake
+set(BLUE_POLICY_DIST "D:/BigProject/blue_policy")
+target_include_directories(my_app PRIVATE "${BLUE_POLICY_DIST}/include")
+target_link_libraries(my_app PRIVATE
+    "${BLUE_POLICY_DIST}/lib/blue_policy_client.lib"
+    "${BLUE_POLICY_DIST}/lib/blue_policy_bridge.lib"
+)
+```
+
+运行时还需让 `blue_policy_bridge.dll`、`python311.dll` 和 `zlib.dll` 位于 EXE 可安全搜索到的
+目录，并把 `${BLUE_POLICY_DIST}/python_app` 传入初始化选项。
+
+完整可运行示例见
+[`examples/blue_policy_client_example.cpp`](examples/blue_policy_client_example.cpp)，集成测试见
+[`tests/test_cpp_client.cpp`](tests/test_cpp_client.cpp)。最小调用形状：
+
+```cpp
+blue_policy::InitializationOptions options;
+options.python_home_utf8 = "D:/Anaconda";
+options.python_module_dir_utf8 = "D:/app/blue_policy/python_app";
+options.bundle_dir_utf8 = options.python_module_dir_utf8;
+
+blue_policy::Client client(options);
+const auto info = client.info();
+
+blue_policy::ResetRequest reset;
+reset.session_id = "blue-101";
+reset.aircraft_id = 101;
+reset.aircraft_type = "fighter-a";
+reset.episode_id = 1;
+reset.input_mode = blue_policy::InputMode::KinematicsOnly;
+static_cast<void>(client.reset(reset));
+
+blue_policy::StepRequest step;
+step.session_id = reset.session_id;
+step.aircraft_id = reset.aircraft_id;
+step.aircraft_type = reset.aircraft_type;
+step.step_count = 0;
+step.scenario_time_s = 0.0;
+step.ownship.position = {108.0, 34.0, 10000.0};
+step.ownship.velocity = {300.0, 0.0, 0.0};
+
+const blue_policy::StepResult output = client.step(step);
+// 在 output.velocity_effective_time_s 对应的下一帧，设置本机速度为：
+// output.next_velocity.north_mps / up_mps / east_mps
+
+static_cast<void>(client.close_session(reset.session_id, reset.aircraft_id));
+client.shutdown();
+```
+
+`Client::info/reset/step/close_session` 可以由不同 C++线程调用，请求 ID由客户端原子生成；
+同一飞机仍必须由调用方保证 FIFO。客户端会自动处理 JSON字符串转义、有限浮点数、int64、
+请求/响应关联、DLL响应内存释放，并把原生错误和 `BusinessError` 分开。
+
+### 11.2 底层原始 JSON C ABI
 
 完整示例见 [`examples/test_host.cpp`](examples/test_host.cpp)。响应内存必须由同一 DLL 的
 `blue_policy_release_json` 释放：
@@ -378,8 +456,8 @@ std::string call_json(std::string_view request) {
 释放 `data_utf8`。释放函数对空结果和顺序重复释放安全；每次调用必须使用独立结果结构，
 不得让多个线程同时释放同一个结果结构。
 
-建议大项目再封装一个 RAII `BluePolicyClient`，统一处理 DLL加载、初始化、`info`核对、JSON
-序列化、响应释放、业务错误、session映射和最终关闭，不要让业务模块散落调用 C函数。
+新业务优先使用上述强类型客户端。只有已有自己的 JSON 层或需要试验尚未进入强类型封装的
+兼容字段时，才直接使用原始 JSON C ABI。
 
 ## 12. 多机与多线程语义
 

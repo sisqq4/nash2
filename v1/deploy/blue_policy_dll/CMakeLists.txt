@@ -6,7 +6,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(BLUE_POLICY_BUILD_TEST_HOST "Build the native C++ smoke-test host" ON)
+option(BLUE_POLICY_BUILD_TEST_HOST "Build the native C++ tests" ON)
+option(
+    BLUE_POLICY_BUILD_CLIENT_EXAMPLE
+    "Build the reusable typed C++ client example"
+    ON
+)
 set(
     BLUE_POLICY_RUNTIME_SOURCE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/../blue_policy_exe"
@@ -48,6 +53,26 @@ if(MSVC)
     target_compile_options(blue_policy_bridge PRIVATE /W4 /permissive- /EHsc)
 else()
     target_compile_options(blue_policy_bridge PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# Reusable C++17 wrapper for the JSON C ABI. This is a static client library so
+# STL objects and C++ exceptions never cross a DLL boundary. The final host also
+# links the blue_policy_bridge import library through this PUBLIC dependency.
+add_library(blue_policy_client STATIC
+    src/blue_policy_client.cpp
+)
+add_library(BluePolicy::client ALIAS blue_policy_client)
+target_include_directories(blue_policy_client
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(blue_policy_client PUBLIC blue_policy_bridge)
+target_compile_features(blue_policy_client PUBLIC cxx_std_17)
+if(MSVC)
+    target_compile_options(blue_policy_client PRIVATE /W4 /permissive- /EHsc)
+else()
+    target_compile_options(blue_policy_client PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 # Stage the Python entry, frozen runtime, and model beside the native binary.
@@ -126,6 +151,38 @@ if(BLUE_POLICY_BUILD_TEST_HOST)
             "$<TARGET_FILE_DIR:blue_policy_bridge>/python_app"
             "${_python_home}"
     )
+
+    add_executable(blue_policy_client_test tests/test_cpp_client.cpp)
+    target_link_libraries(blue_policy_client_test PRIVATE BluePolicy::client)
+    add_dependencies(blue_policy_client_test blue_policy_stage)
+    if(MSVC)
+        target_compile_options(blue_policy_client_test PRIVATE /W4 /permissive- /EHsc)
+    else()
+        target_compile_options(
+            blue_policy_client_test PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME blue_policy_cpp_client_integration
+        COMMAND blue_policy_client_test
+            "$<TARGET_FILE_DIR:blue_policy_bridge>/python_app"
+            "${_python_home}"
+    )
+endif()
+
+if(BLUE_POLICY_BUILD_CLIENT_EXAMPLE)
+    add_executable(
+        blue_policy_client_example
+        examples/blue_policy_client_example.cpp
+    )
+    target_link_libraries(blue_policy_client_example PRIVATE BluePolicy::client)
+    add_dependencies(blue_policy_client_example blue_policy_stage)
+    if(MSVC)
+        target_compile_options(
+            blue_policy_client_example PRIVATE /W4 /permissive- /EHsc)
+    else()
+        target_compile_options(
+            blue_policy_client_example PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
 endif()
 
 include(GNUInstallDirs)
@@ -135,11 +192,31 @@ install(
     LIBRARY DESTINATION .
     ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
 )
+install(
+    TARGETS blue_policy_client
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+)
 if(WIN32)
     install(FILES ${_python_runtime_files} DESTINATION .)
 endif()
-install(FILES include/blue_policy_api.h DESTINATION include)
+install(
+    FILES include/blue_policy_api.h include/blue_policy_client.hpp
+    DESTINATION include
+)
 install(FILES requirements-inference.txt DESTINATION .)
+install(FILES README.md DESTINATION .)
+install(
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../docs/BLUE_POLICY_DLL_DESIGN.md"
+    DESTINATION docs
+)
+install(
+    FILES examples/blue_policy_client_example.cpp
+    DESTINATION examples
+)
+install(
+    FILES tests/test_cpp_client.cpp
+    DESTINATION tests
+)
 install(
     FILES python_app/blue_policy_entry.py python_app/blue_policy_json.py
     DESTINATION python_app
@@ -160,5 +237,11 @@ install(
     DESTINATION python_app
 )
 if(BLUE_POLICY_BUILD_TEST_HOST)
-    install(TARGETS blue_policy_test_host RUNTIME DESTINATION .)
+    install(
+        TARGETS blue_policy_test_host blue_policy_client_test
+        RUNTIME DESTINATION .
+    )
+endif()
+if(BLUE_POLICY_BUILD_CLIENT_EXAMPLE)
+    install(TARGETS blue_policy_client_example RUNTIME DESTINATION .)
 endif()
